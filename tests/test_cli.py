@@ -1,3 +1,5 @@
+import subprocess
+
 import openai
 import pytest
 import redis.exceptions
@@ -5,6 +7,7 @@ import yaml
 from typer.testing import CliRunner
 
 from agentco import cli
+from agentco.code.graph import InMemoryCodeGraph
 from agentco.memory.backend import InMemoryBackend
 from agentco.store.task_store import TaskStore
 
@@ -54,12 +57,15 @@ def _write_config(tmp_path):
 def env(tmp_path, monkeypatch):
     backend = InMemoryBackend()
     monkeypatch.setattr(cli, "make_backend", lambda cfg: backend)
+    code_graph = InMemoryCodeGraph()
+    monkeypatch.setattr(cli, "make_code_graph", lambda cfg: code_graph)
     config = _write_config(tmp_path)
 
     def run(*args):
         return runner.invoke(cli.app, [*args, "--config", str(config)])
 
     run.backend = backend
+    run.code_graph = code_graph
     run.store = TaskStore(f"sqlite:///{tmp_path}/state.db")
     return run
 
@@ -230,3 +236,55 @@ def test_search_llm_client_error_exits_1(tmp_path, monkeypatch):
     )
     assert result.exit_code == 1
     assert result.stdout.splitlines() == [LLM_LINE]
+
+
+def _git_repo(root, files):
+    root.mkdir(parents=True)
+    subprocess.run(["git", "-C", str(root), "init", "-q"], check=True)
+    for name, content in files.items():
+        (root / name).write_text(content)
+    subprocess.run(["git", "-C", str(root), "add", "-A"], check=True)
+    return root
+
+
+def test_index_cli(env, tmp_path):
+    root = _git_repo(tmp_path / "repo", {"a.py": "def f(): pass\n"})
+    r = env("index", "--repo", "o/r", "--repo-path", str(root))
+    assert r.exit_code == 0
+    assert r.stdout.splitlines() == [
+        "indexed 1, unchanged 0, deleted 0, skipped 0, calls 0"
+    ]
+    r = env("index", "--repo", "o/r", "--repo-path", str(root))
+    assert r.stdout.splitlines() == [
+        "indexed 0, unchanged 1, deleted 0, skipped 0, calls 0"
+    ]
+    assert list(env.code_graph._repos) == [("acme__rnd", "o/r")]
+
+
+def test_index_cli_not_a_repo_exits_1(env, tmp_path):
+    plain = tmp_path / "plain"
+    plain.mkdir()
+    r = env("index", "--repo", "o/r", "--repo-path", str(plain))
+    assert r.exit_code == 1
+    assert r.stdout.splitlines() == [f"{plain} is not a git repository"]
+
+
+def test_index_cli_bad_repo_name_exits_1(env, tmp_path):
+    root = _git_repo(tmp_path / "repo", {"a.py": "def f(): pass\n"})
+    r = env("index", "--repo", "nope", "--repo-path", str(root))
+    assert r.exit_code == 1
+    assert r.stdout.splitlines() == ["repo must look like owner/name, got 'nope'"]
+    assert env.code_graph.upserts == 0
+
+
+@pytest.mark.parametrize("error", DOWN_ERRORS)
+def test_index_cli_falkordb_down_exits_2(tmp_path, monkeypatch, error):
+    monkeypatch.setattr(cli, "make_code_graph", _raise(error))
+    root = _git_repo(tmp_path / "repo", {"a.py": "def f(): pass\n"})
+    config = _write_config(tmp_path)
+    result = runner.invoke(
+        cli.app,
+        ["index", "--repo", "o/r", "--repo-path", str(root), "--config", str(config)],
+    )
+    assert result.exit_code == 2
+    assert result.stdout.splitlines() == ["cannot reach FalkorDB at localhost:6379"]
