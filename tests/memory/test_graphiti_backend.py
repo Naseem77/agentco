@@ -22,7 +22,11 @@ def edge(fact: str, group_id: str, uuid: str = "u") -> SimpleNamespace:
 
 
 def fake_graphiti(edges_by_graph: dict[str, list]) -> MagicMock:
-    """Graphiti double: one driver per database; search_ answers per driver."""
+    """Graphiti double: one driver per database.
+
+    Like graphiti_core's @handle_multiple_group_ids, search_ routes a single
+    group_id to that graph's database regardless of the driver= argument.
+    """
     drivers: dict[str, MagicMock] = {}
 
     def clone(database: str) -> MagicMock:
@@ -31,8 +35,9 @@ def fake_graphiti(edges_by_graph: dict[str, list]) -> MagicMock:
         driver.build_indices_and_constraints = AsyncMock()
         return driver
 
-    async def search_(query, config, group_ids, driver):
-        return SimpleNamespace(edges=list(edges_by_graph.get(driver.database, [])))
+    async def search_(query, config, group_ids, driver=None):
+        assert len(group_ids) == 1
+        return SimpleNamespace(edges=list(edges_by_graph.get(group_ids[0], [])))
 
     graphiti = MagicMock()
     graphiti.driver.clone.side_effect = clone
@@ -69,7 +74,7 @@ async def test_ensure_graph_builds_indices_on_that_graphs_database():
     graphiti.drivers["acme__rnd"].build_indices_and_constraints.assert_awaited_once()
 
 
-async def test_search_queries_each_graphs_own_database():
+async def test_search_queries_one_graph_per_call():
     graphiti = fake_graphiti(
         {
             "acme__rnd": [edge("rnd fact", "acme__rnd")],
@@ -83,14 +88,10 @@ async def test_search_queries_each_graphs_own_database():
         ("rnd fact", "acme__rnd"),
         ("qa fact", "acme__qa"),
     }
-    calls = {
-        c.kwargs["group_ids"][0]: c.kwargs["driver"]
-        for c in graphiti.search_.await_args_list
-    }
-    assert calls == {
-        "acme__rnd": graphiti.drivers["acme__rnd"],
-        "acme__qa": graphiti.drivers["acme__qa"],
-    }
+    assert sorted(c.kwargs["group_ids"] for c in graphiti.search_.await_args_list) == [
+        ["acme__qa"],
+        ["acme__rnd"],
+    ]
     for call in graphiti.search_.await_args_list:
         assert call.args[0] == "fact" or call.kwargs.get("query") == "fact"
         assert len(call.kwargs["group_ids"]) == 1

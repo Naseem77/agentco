@@ -16,10 +16,14 @@ from agentco.memory.scopes import Scope
 class GraphitiBackend:
     """MemoryBackend over Graphiti/FalkorDB.
 
-    Every graph is its own FalkorDB database. Graphiti's add_episode switches to
-    the group_id database itself (on a per-call clone), but search never does: it
-    only filters by group_id inside the driver's current database. So each graph
-    is searched through a driver cloned onto that graph's database, then merged.
+    Every graph is its own FalkorDB database. Graphiti routes a single group_id
+    to that graph itself: add_episode switches to the group_id database on a
+    per-call clone, and search_ is wrapped by @handle_multiple_group_ids, which
+    for one group_id clones the driver onto that group's database and overrides
+    any driver= passed in. So we search one graph per call (a single group_id)
+    and merge the per-graph results ourselves. The driver= we pass is redundant
+    (the wrapper replaces it) and is kept only for the case where the wrapper
+    sees the graph already is the driver's default database.
     """
 
     def __init__(self, graphiti: Graphiti) -> None:

@@ -1,5 +1,4 @@
 from collections.abc import Iterable
-from dataclasses import dataclass
 
 from agentco.memory.backend import Fact, MemoryBackend, MemoryItem
 from agentco.memory.scopes import ROLE_ACCESS, Scope, graph_name
@@ -10,11 +9,30 @@ class AccessDenied(PermissionError):
     pass
 
 
-@dataclass(frozen=True)
+_TOKEN = object()
+
+
 class ScopedMemory:
-    role: Role
-    tenant: str
-    backend: MemoryBackend
+    """A role's view of tenant memory; obtain one via MemoryGate.for_role."""
+
+    __slots__ = ("_backend", "_role", "_tenant")
+
+    def __init__(
+        self, token: object, backend: MemoryBackend, tenant: str, role: Role
+    ) -> None:
+        if token is not _TOKEN:
+            raise TypeError("ScopedMemory is created by MemoryGate.for_role")
+        self._backend = backend
+        self._tenant = tenant
+        self._role = role
+
+    @property
+    def role(self) -> Role:
+        return self._role
+
+    @property
+    def tenant(self) -> str:
+        return self._tenant
 
     @property
     def readable(self) -> frozenset[Scope]:
@@ -24,7 +42,9 @@ class ScopedMemory:
         self, query: str, scopes: Iterable[Scope] | None = None, limit: int = 10
     ) -> list[Fact]:
         requested = (
-            list(self.readable) if scopes is None else [Scope(s) for s in scopes]
+            [s for s in Scope if s in self.readable]
+            if scopes is None
+            else [Scope(s) for s in scopes]
         )
         for scope in requested:
             if scope not in self.readable:
@@ -33,8 +53,8 @@ class ScopedMemory:
                 )
         if not requested:
             return []
-        graphs = [graph_name(self.tenant, scope) for scope in dict.fromkeys(requested)]
-        return await self.backend.search(graphs, query, limit)
+        graphs = [graph_name(self._tenant, scope) for scope in dict.fromkeys(requested)]
+        return await self._backend.search(graphs, query, limit)
 
     async def add(self, scope: Scope, item: MemoryItem) -> None:
         scope = Scope(scope)
@@ -42,7 +62,7 @@ class ScopedMemory:
             raise AccessDenied(
                 f"role {self.role.value} may not write scope {scope.value}"
             )
-        await self.backend.add(graph_name(self.tenant, scope), scope, item)
+        await self._backend.add(graph_name(self._tenant, scope), scope, item)
 
 
 class MemoryGate:
@@ -52,4 +72,4 @@ class MemoryGate:
         self.backend = backend
 
     def for_role(self, role: Role) -> ScopedMemory:
-        return ScopedMemory(Role(role), self.tenant, self.backend)
+        return ScopedMemory(_TOKEN, self.backend, self.tenant, Role(role))
