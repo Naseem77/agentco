@@ -1,4 +1,6 @@
 import subprocess
+from datetime import UTC, datetime
+from pathlib import Path
 
 import openai
 import pytest
@@ -8,10 +10,12 @@ from typer.testing import CliRunner
 
 from agentco import cli
 from agentco.code.graph import InMemoryCodeGraph
+from agentco.github.client import FakeGitHub, GitHubError
 from agentco.memory.backend import InMemoryBackend
 from agentco.store.task_store import TaskStore
 
 runner = CliRunner()
+GITHUB_FIXTURES = Path(__file__).parent / "github" / "fixtures"
 
 
 class FailingBackend(InMemoryBackend):
@@ -59,6 +63,9 @@ def env(tmp_path, monkeypatch):
     monkeypatch.setattr(cli, "make_backend", lambda cfg: backend)
     code_graph = InMemoryCodeGraph()
     monkeypatch.setattr(cli, "make_code_graph", lambda cfg: code_graph)
+    monkeypatch.setattr(
+        cli, "make_github", lambda: FakeGitHub.from_fixtures(GITHUB_FIXTURES)
+    )
     config = _write_config(tmp_path)
 
     def run(*args):
@@ -288,3 +295,243 @@ def test_index_cli_falkordb_down_exits_2(tmp_path, monkeypatch, error):
     )
     assert result.exit_code == 2
     assert result.stdout.splitlines() == ["cannot reach FalkorDB at localhost:6379"]
+
+
+class FailingGitHub:
+    def __init__(self, error: Exception) -> None:
+        self._error = error
+
+    def issues(self, repo, since=None):
+        raise self._error
+
+
+def test_import_dry_run_prints_counts_and_writes_nothing(env):
+    env("init")
+    r = env("import", "--repo", "acme-org/web", "--dry-run")
+    assert r.exit_code == 0
+    assert r.stdout.splitlines()[-7:] == [
+        "issues: 2",
+        "features: 1",
+        "pull requests: 1",
+        "review comments: 2",
+        "already imported: 0",
+        "skipped: bot=3 not_team=1 orphan_reply=1 pr_author=1",
+        "episodes to write: 6 (each runs one Graphiti LLM extraction)",
+    ]
+    assert env.backend.items("acme__rnd") == []
+    assert env.backend.items("acme__product") == []
+    assert env.store.get_meta("import:acme:acme-org/web:cursor") is None
+
+
+def test_import_dry_run_with_nothing_skipped_prints_none(env, monkeypatch):
+    empty = FakeGitHub([], [], [], {})
+    monkeypatch.setattr(cli, "make_github", lambda: empty)
+    r = env("import", "--repo", "acme-org/web", "--dry-run")
+    assert r.stdout.splitlines() == [
+        "issues: 0",
+        "features: 0",
+        "pull requests: 0",
+        "review comments: 0",
+        "already imported: 0",
+        "skipped: none",
+        "episodes to write: 0 (each runs one Graphiti LLM extraction)",
+    ]
+
+
+def test_import_then_rerun(env):
+    env("init")
+    first = env("import", "--repo", "acme-org/web")
+    assert first.exit_code == 0
+    assert first.stdout.splitlines() == [
+        "relinked 0 episodes",
+        "imported 6 episodes (0 linked to code)",
+    ]
+    second = env("import", "--repo", "acme-org/web")
+    assert second.stdout.splitlines()[-1] == "imported 0 episodes (0 linked to code)"
+    assert len(env.backend.items("acme__rnd")) == 5
+    assert len(env.backend.items("acme__product")) == 1
+
+
+def test_import_limit_message(env):
+    env("init")
+    r = env("import", "--repo", "acme-org/web", "--limit", "2")
+    assert r.exit_code == 0
+    assert r.stdout.splitlines()[-1] == (
+        "stopped at --limit 2: imported 2 of 6 episodes; run again to continue"
+    )
+    assert env.store.get_meta("import:acme:acme-org/web:cursor") is None
+
+
+def test_import_creates_graphs_and_state_without_init(env):
+    r = env("import", "--repo", "acme-org/web", "--dry-run")
+    assert r.exit_code == 0
+    assert sorted(env.backend._graphs) == ["acme__product", "acme__rnd"]
+
+
+def test_import_since_is_midnight_utc(env, monkeypatch):
+    seen = []
+    gh = FakeGitHub.from_fixtures(GITHUB_FIXTURES)
+    original = gh.issues
+    monkeypatch.setattr(
+        gh,
+        "issues",
+        lambda repo, since=None: seen.append(since) or original(repo, since),
+    )
+    monkeypatch.setattr(cli, "make_github", lambda: gh)
+    r = env("import", "--repo", "acme-org/web", "--since", "2026-01-02", "--dry-run")
+    assert r.exit_code == 0
+    assert seen == [datetime(2026, 1, 2, tzinfo=UTC)]
+
+
+def test_import_with_repo_path_indexes_first_and_links(env, tmp_path):
+    graph_py = (
+        "class GraphView:\n"
+        "    def load(self, g):\n"
+        "        return g\n"
+        "\n"
+        "    def switch(self, g):\n"
+        "        self.load(g)\n"
+    )
+    root = tmp_path / "web"
+    (root / "src" / "app").mkdir(parents=True)
+    subprocess.run(["git", "-C", str(root), "init", "-q"], check=True)
+    (root / "src" / "app" / "graph.py").write_text(graph_py)
+    subprocess.run(["git", "-C", str(root), "add", "-A"], check=True)
+    r = env("import", "--repo", "acme-org/web", "--repo-path", str(root))
+    assert r.exit_code == 0
+    assert r.stdout.splitlines() == [
+        "indexed 1, unchanged 0, deleted 0, skipped 0, calls 1",
+        "relinked 0 episodes",
+        "imported 6 episodes (1 linked to code)",
+    ]
+    assert len(env.code_graph.links("acme__rnd")) == 1
+
+
+def test_import_dry_run_with_repo_path_does_not_index(env, tmp_path):
+    root = _git_repo(tmp_path / "repo", {"a.py": "def f(): pass\n"})
+    r = env("import", "--repo", "acme-org/web", "--repo-path", str(root), "--dry-run")
+    assert r.exit_code == 0
+    assert r.stdout.splitlines()[0] == "issues: 2"
+    assert env.code_graph.upserts == 0
+
+
+def test_import_repo_path_not_a_repo_exits_1(env, tmp_path):
+    plain = tmp_path / "plain"
+    plain.mkdir()
+    r = env("import", "--repo", "acme-org/web", "--repo-path", str(plain))
+    assert r.exit_code == 1
+    assert r.stdout.splitlines() == [f"{plain} is not a git repository"]
+    assert env.backend.items("acme__rnd") == []
+
+
+def test_import_github_error_exits_3_and_writes_nothing(env, monkeypatch):
+    error = GitHubError("gh api failed: HTTP 404: Not Found")
+    monkeypatch.setattr(cli, "make_github", lambda: FailingGitHub(error))
+    r = env("import", "--repo", "acme-org/missing")
+    assert r.exit_code == 3
+    assert r.stdout.splitlines()[-1] == "gh api failed: HTTP 404: Not Found"
+    assert env.backend.items("acme__rnd") == []
+    assert env.store.get_meta("import:acme:acme-org/missing:cursor") is None
+
+
+def test_import_github_missing_at_construction_exits_3(env, monkeypatch):
+
+    def missing_gh():
+        raise GitHubError("gh CLI not found")
+
+    monkeypatch.setattr(cli, "make_github", missing_gh)
+    r = env("import", "--repo", "acme-org/web")
+    assert r.exit_code == 3
+    assert r.stdout.splitlines() == ["gh CLI not found"]
+
+
+@pytest.mark.parametrize("error", DOWN_ERRORS)
+def test_import_falkordb_down_exits_2_and_keeps_cursor_unset(
+    tmp_path, monkeypatch, error
+):
+    monkeypatch.setattr(cli, "make_backend", lambda cfg: FailingBackend(error))
+    monkeypatch.setattr(cli, "make_code_graph", lambda cfg: InMemoryCodeGraph())
+    monkeypatch.setattr(
+        cli, "make_github", lambda: FakeGitHub.from_fixtures(GITHUB_FIXTURES)
+    )
+    config = _write_config(tmp_path)
+    r = runner.invoke(
+        cli.app, ["import", "--repo", "acme-org/web", "--config", str(config)]
+    )
+    assert r.exit_code == 2
+    assert r.stdout.splitlines() == ["cannot reach FalkorDB at localhost:6379"]
+    store = TaskStore(f"sqlite:///{tmp_path}/state.db")
+    assert store.get_meta("import:acme:acme-org/web:cursor") is None
+
+
+def test_import_llm_client_error_exits_1(tmp_path, monkeypatch):
+    monkeypatch.setattr(cli, "make_backend", _raise(LLM_ERROR))
+    monkeypatch.setattr(cli, "make_code_graph", lambda cfg: InMemoryCodeGraph())
+    monkeypatch.setattr(
+        cli, "make_github", lambda: FakeGitHub.from_fixtures(GITHUB_FIXTURES)
+    )
+    config = _write_config(tmp_path)
+    r = runner.invoke(
+        cli.app, ["import", "--repo", "acme-org/web", "--config", str(config)]
+    )
+    assert r.exit_code == 1
+    assert r.stdout.splitlines() == [LLM_LINE]
+
+
+def test_import_cursor_not_advanced_when_a_write_fails(tmp_path, monkeypatch):
+    class AddFailing(InMemoryBackend):
+        async def add(self, graph, scope, item):
+            raise ConnectionError("x")
+
+    monkeypatch.setattr(cli, "make_backend", lambda cfg: AddFailing())
+    monkeypatch.setattr(cli, "make_code_graph", lambda cfg: InMemoryCodeGraph())
+    monkeypatch.setattr(
+        cli, "make_github", lambda: FakeGitHub.from_fixtures(GITHUB_FIXTURES)
+    )
+    config = _write_config(tmp_path)
+    r = runner.invoke(
+        cli.app, ["import", "--repo", "acme-org/web", "--config", str(config)]
+    )
+    assert r.exit_code == 2
+    store = TaskStore(f"sqlite:///{tmp_path}/state.db")
+    assert store.get_meta("import:acme:acme-org/web:cursor") is None
+
+
+def test_import_cursor_is_captured_before_fetching(env, monkeypatch):
+    start = datetime(2026, 11, 4, 12, 0, tzinfo=UTC)
+    ticks = iter(start.replace(minute=m) for m in range(60))
+
+    class Clock(datetime):
+        @classmethod
+        def now(cls, tz=None):
+            return next(ticks)
+
+    class ClockedGitHub(FakeGitHub):
+        def issues(self, repo, since=None):
+            next(ticks)  # time passes while the run fetches and writes
+            return super().issues(repo, since)
+
+    gh = ClockedGitHub.from_fixtures(GITHUB_FIXTURES)
+    monkeypatch.setattr(cli, "make_github", lambda: gh)
+    monkeypatch.setattr(cli, "datetime", Clock)
+    assert env("import", "--repo", "acme-org/web").exit_code == 0
+    assert env.store.get_meta("import:acme:acme-org/web:cursor") == start.isoformat()
+
+
+@pytest.mark.parametrize(
+    ("args", "message"),
+    [
+        (["--repo", "nope"], "repo must look like owner/name, got 'nope'"),
+        (
+            ["--repo", "o/r", "--since", "yesterday"],
+            "--since must be a date like 2026-01-31, got 'yesterday'",
+        ),
+        (["--repo", "o/r", "--limit", "0"], "--limit must be at least 1, got 0"),
+        (["--repo", "o/r", "--limit", "-3"], "--limit must be at least 1, got -3"),
+    ],
+)
+def test_import_bad_arguments_exit_1(env, args, message):
+    r = env("import", *args)
+    assert r.exit_code == 1
+    assert r.stdout.splitlines() == [message]
+    assert env.backend.items("acme__rnd") == []

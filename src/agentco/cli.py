@@ -11,9 +11,11 @@ import typer
 
 from agentco.code.falkor_graph import build_falkor_code_graph
 from agentco.code.graph import CodeGraphBackend, code_graph_for
-from agentco.code.indexer import index_repo
+from agentco.code.indexer import NotAGitRepo, index_repo
 from agentco.config import ConfigError, TenantConfig, family_warnings, load_config
-from agentco.github.client import validate_repo
+from agentco.github.client import GhCli, GitHub, GitHubError, validate_repo
+from agentco.importer.locate import SymbolLocator
+from agentco.importer.run import ImportOptions, ImportReport, run_import
 from agentco.memory.backend import MemoryBackend
 from agentco.memory.gate import MemoryGate
 from agentco.memory.graphiti_backend import build_graphiti_backend
@@ -27,6 +29,9 @@ make_backend: Callable[[TenantConfig], MemoryBackend] = build_graphiti_backend
 
 # Seam: CLI tests replace this with an in-memory code graph.
 make_code_graph: Callable[[TenantConfig], CodeGraphBackend] = build_falkor_code_graph
+
+# Seam: CLI tests replace this with an in-memory GitHub.
+make_github: Callable[[], GitHub] = GhCli
 
 app = typer.Typer(no_args_is_help=True, help="A company of AI agents.")
 memory_app = typer.Typer(no_args_is_help=True, help="Query company memory.")
@@ -138,3 +143,113 @@ def index(
         f"indexed {report.indexed}, unchanged {report.unchanged}, "
         f"deleted {report.deleted}, skipped {report.skipped}, calls {report.calls}"
     )
+
+
+def _fail(message: str, code: int = 1) -> typer.Exit:
+    typer.echo(message)
+    return typer.Exit(code)
+
+
+def _parse_since(since: str | None) -> datetime | None:
+    if since is None:
+        return None
+    try:
+        return datetime.strptime(since, "%Y-%m-%d").replace(tzinfo=UTC)
+    except ValueError:
+        raise _fail(f"--since must be a date like 2026-01-31, got {since!r}") from None
+
+
+def _dry_run_lines(report: ImportReport) -> list[str]:
+    skipped = " ".join(f"{k}={v}" for k, v in sorted(report.skipped.items()))
+    return [
+        f"issues: {report.issues}",
+        f"features: {report.features}",
+        f"pull requests: {report.pulls}",
+        f"review comments: {report.reviews}",
+        f"already imported: {report.already}",
+        f"skipped: {skipped or 'none'}",
+        f"episodes to write: {report.planned} (each runs one Graphiti LLM extraction)",
+    ]
+
+
+@app.command("import")
+def import_(
+    repo: Annotated[str, typer.Option("--repo", help="GitHub repo as OWNER/NAME.")],
+    repo_path: Annotated[
+        Path | None,
+        typer.Option("--repo-path", help="Local checkout: index it and link comments."),
+    ] = None,
+    since: Annotated[
+        str | None,
+        typer.Option("--since", help="Only import items created on/after YYYY-MM-DD."),
+    ] = None,
+    limit: Annotated[
+        int | None,
+        typer.Option("--limit", help="Import at most N items this run (N >= 1)."),
+    ] = None,
+    dry_run: Annotated[
+        bool,
+        typer.Option("--dry-run", help="Count what would be imported; write nothing."),
+    ] = False,
+    config: Path = ConfigOption,
+) -> None:
+    """Import a repo's GitHub issues, PRs and review comments into memory (resumable)."""
+    try:
+        validate_repo(repo)
+    except ValueError as e:
+        raise _fail(str(e)) from e
+    since_at = _parse_since(since)
+    if limit is not None and limit < 1:
+        raise _fail(f"--limit must be at least 1, got {limit}")
+    cfg = _load(config)
+    store = TaskStore(cfg.database_url)
+    store.create_all()
+    # Taken before any fetch so items created during the run are seen next time.
+    started_at = datetime.now(UTC)
+
+    async def _run() -> ImportReport:
+        backend = _build_backend(cfg)
+        gate = MemoryGate(cfg.tenant, backend)
+        await backend.ensure_graph(graph_name(cfg.tenant, Scope.RND))
+        await backend.ensure_graph(graph_name(cfg.tenant, Scope.PRODUCT))
+        code = code_graph_for(cfg.tenant, Role.LIBRARIAN, make_code_graph(cfg))
+        if repo_path is not None and not dry_run:
+            done = await index_repo(repo, repo_path, code)
+            typer.echo(
+                f"indexed {done.indexed}, unchanged {done.unchanged}, "
+                f"deleted {done.deleted}, skipped {done.skipped}, calls {done.calls}"
+            )
+        report = await run_import(
+            repo,
+            make_github(),
+            store,
+            gate.for_role(Role.LIBRARIAN),
+            gate.for_role(Role.PM),
+            SymbolLocator(repo, code, repo_path),
+            code,
+            ImportOptions(since=since_at, limit=limit, dry_run=dry_run),
+            started_at,
+        )
+        return report
+
+    try:
+        with _falkordb_guard(cfg):
+            report = asyncio.run(_run())
+    except NotAGitRepo as e:
+        raise _fail(str(e)) from e
+    except GitHubError as e:
+        raise _fail(str(e), 3) from e
+    if dry_run:
+        for line in _dry_run_lines(report):
+            typer.echo(line)
+        return
+    typer.echo(f"relinked {report.relinked} episodes")
+    if report.complete:
+        typer.echo(
+            f"imported {report.written} episodes ({report.linked} linked to code)"
+        )
+    else:
+        typer.echo(
+            f"stopped at --limit {limit}: imported {report.written} "
+            f"of {report.planned} episodes; run again to continue"
+        )
