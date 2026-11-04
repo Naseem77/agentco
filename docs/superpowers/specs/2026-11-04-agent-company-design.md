@@ -233,16 +233,21 @@ The **Librarian** writes these, merges duplicates, and flags rules that keep get
 Configured per tenant; nothing hard-coded. Example:
 
 ```yaml
-roles:
-  pm:        { model: fast-cheap }
-  triage:    { model: fast-cheap }
-  architect: { model: strongest }
-  senior:    { model: claude-strong }
-  junior:    { model: claude-cheaper }
-  qa:        { model: gpt-family }      # different family from coder
-  lead:      { model: gemini-family }   # third family, or strongest
-  librarian: { model: fast-cheap }
-budgets:
+tenant: acme                  # lowercase letters, digits, hyphens; max 31 chars
+falkordb_host: localhost      # optional (default localhost)
+falkordb_port: 6379           # optional (default 6379)
+database_url: sqlite:///.agentco/state.db   # optional; relative sqlite paths resolve against this file
+roles:                        # every role is required; unknown keys are errors
+  pm:        { model: fast-cheap,     family: anthropic }
+  triage:    { model: fast-cheap,     family: anthropic }
+  architect: { model: strongest,      family: anthropic }
+  senior:    { model: claude-strong,  family: anthropic }
+  junior:    { model: claude-cheaper, family: anthropic }
+  reviewer:  { model: gpt-reviewer,   family: openai }   # checkers (reviewer, qa, lead) must
+  qa:        { model: gpt-family,     family: openai }   # use a different model than senior/junior;
+  lead:      { model: gemini-family,  family: google }   # a shared family only warns
+  librarian: { model: fast-cheap,     family: anthropic }
+budgets:                      # optional; both must be > 0
   per_task_usd: 5
   max_rounds: 3
 ```
