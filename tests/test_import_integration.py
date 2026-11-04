@@ -52,9 +52,9 @@ def dry_run_already(config, repo) -> int:
 
 
 def test_import_smoke(cfg, tmp_path):
-    repo = os.environ.get(
-        "AGENTCO_IT_REPO"
-    )  # a small repo with a few PRs + human review comments
+    # A small repo with a few PRs + human review comments; it must yield more than
+    # 2 episodes, since the run below is capped with --limit 2.
+    repo = os.environ.get("AGENTCO_IT_REPO")
     if (
         not repo
         or not shutil.which("gh")

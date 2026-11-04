@@ -2,6 +2,7 @@ import subprocess
 from datetime import UTC, datetime
 from pathlib import Path
 
+import httpx
 import openai
 import pytest
 import redis.exceptions
@@ -407,6 +408,41 @@ def test_import_with_repo_path_indexes_first_and_links(env, tmp_path):
     assert len(env.code_graph.links("acme__rnd")) == 1
 
 
+def test_import_rerun_after_failed_link_reports_relinked(env, tmp_path):
+    graph_py = (
+        "class GraphView:\n"
+        "    def load(self, g):\n"
+        "        return g\n"
+        "\n"
+        "    def switch(self, g):\n"
+        "        self.load(g)\n"
+    )
+    root = tmp_path / "web"
+    (root / "src" / "app").mkdir(parents=True)
+    subprocess.run(["git", "-C", str(root), "init", "-q"], check=True)
+    (root / "src" / "app" / "graph.py").write_text(graph_py)
+    subprocess.run(["git", "-C", str(root), "add", "-A"], check=True)
+    original = env.code_graph.link_episode
+    calls = 0
+
+    async def flaky(*args, **kwargs):
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            raise ConnectionError("link down")
+        return await original(*args, **kwargs)
+
+    env.code_graph.link_episode = flaky
+    first = env("import", "--repo", "acme-org/web", "--repo-path", str(root))
+    assert first.exit_code == 2
+    second = env("import", "--repo", "acme-org/web", "--repo-path", str(root))
+    assert second.exit_code == 0
+    assert second.stdout.splitlines()[-2:] == [
+        "relinked 1 episodes",
+        "imported 3 episodes (1 linked to code)",
+    ]
+
+
 def test_import_dry_run_with_repo_path_does_not_index(env, tmp_path):
     root = _git_repo(tmp_path / "repo", {"a.py": "def f(): pass\n"})
     r = env("import", "--repo", "acme-org/web", "--repo-path", str(root), "--dry-run")
@@ -478,6 +514,45 @@ def test_import_llm_client_error_exits_1(tmp_path, monkeypatch):
     assert r.stdout.splitlines() == [LLM_LINE]
 
 
+def _openai_auth_error() -> openai.AuthenticationError:
+    response = httpx.Response(401, request=httpx.Request("POST", "https://x/v1"))
+    return openai.AuthenticationError(
+        "Incorrect API key.\nCheck it.", response=response, body=None
+    )
+
+
+@pytest.mark.parametrize(
+    "error",
+    [
+        _openai_auth_error(),
+        openai.APIConnectionError(request=httpx.Request("POST", "https://x/v1")),
+    ],
+)
+def test_import_openai_error_mid_run_exits_1_and_keeps_cursor_unset(
+    tmp_path, monkeypatch, error
+):
+    class AddFailing(InMemoryBackend):
+        async def add(self, graph, scope, item):
+            raise error
+
+    monkeypatch.setattr(cli, "make_backend", lambda cfg: AddFailing())
+    monkeypatch.setattr(cli, "make_code_graph", lambda cfg: InMemoryCodeGraph())
+    monkeypatch.setattr(
+        cli, "make_github", lambda: FakeGitHub.from_fixtures(GITHUB_FIXTURES)
+    )
+    config = _write_config(tmp_path)
+    r = runner.invoke(
+        cli.app, ["import", "--repo", "acme-org/web", "--config", str(config)]
+    )
+    assert r.exit_code == 1
+    assert r.stdout.splitlines() == [
+        f"LLM request failed: {' '.join(str(error).split())}"
+    ]
+    assert isinstance(r.exception, SystemExit)
+    store = TaskStore(f"sqlite:///{tmp_path}/state.db")
+    assert store.get_meta("import:acme:acme-org/web:cursor") is None
+
+
 def test_import_cursor_not_advanced_when_a_write_fails(tmp_path, monkeypatch):
     class AddFailing(InMemoryBackend):
         async def add(self, graph, scope, item):
@@ -528,6 +603,7 @@ def test_import_cursor_is_captured_before_fetching(env, monkeypatch):
         ),
         (["--repo", "o/r", "--limit", "0"], "--limit must be at least 1, got 0"),
         (["--repo", "o/r", "--limit", "-3"], "--limit must be at least 1, got -3"),
+        (["--repo", "o/r", "--limit", "abc"], "--limit must be an integer, got 'abc'"),
     ],
 )
 def test_import_bad_arguments_exit_1(env, args, message):

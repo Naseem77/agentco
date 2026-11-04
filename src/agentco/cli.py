@@ -159,6 +159,18 @@ def _parse_since(since: str | None) -> datetime | None:
         raise _fail(f"--since must be a date like 2026-01-31, got {since!r}") from None
 
 
+def _parse_limit(limit: str | None) -> int | None:
+    if limit is None:
+        return None
+    try:
+        value = int(limit)
+    except ValueError:
+        raise _fail(f"--limit must be an integer, got {limit!r}") from None
+    if value < 1:
+        raise _fail(f"--limit must be at least 1, got {value}")
+    return value
+
+
 def _dry_run_lines(report: ImportReport) -> list[str]:
     skipped = " ".join(f"{k}={v}" for k, v in sorted(report.skipped.items()))
     return [
@@ -184,7 +196,7 @@ def import_(
         typer.Option("--since", help="Only import items created on/after YYYY-MM-DD."),
     ] = None,
     limit: Annotated[
-        int | None,
+        str | None,
         typer.Option("--limit", help="Import at most N items this run (N >= 1)."),
     ] = None,
     dry_run: Annotated[
@@ -199,8 +211,7 @@ def import_(
     except ValueError as e:
         raise _fail(str(e)) from e
     since_at = _parse_since(since)
-    if limit is not None and limit < 1:
-        raise _fail(f"--limit must be at least 1, got {limit}")
+    max_items = _parse_limit(limit)
     cfg = _load(config)
     store = TaskStore(cfg.database_url)
     store.create_all()
@@ -219,7 +230,7 @@ def import_(
                 f"indexed {done.indexed}, unchanged {done.unchanged}, "
                 f"deleted {done.deleted}, skipped {done.skipped}, calls {done.calls}"
             )
-        report = await run_import(
+        return await run_import(
             repo,
             make_github(),
             store,
@@ -227,10 +238,9 @@ def import_(
             gate.for_role(Role.PM),
             SymbolLocator(repo, code, repo_path),
             code,
-            ImportOptions(since=since_at, limit=limit, dry_run=dry_run),
+            ImportOptions(since=since_at, limit=max_items, dry_run=dry_run),
             started_at,
         )
-        return report
 
     try:
         with _falkordb_guard(cfg):
@@ -239,6 +249,8 @@ def import_(
         raise _fail(str(e)) from e
     except GitHubError as e:
         raise _fail(str(e), 3) from e
+    except openai.OpenAIError as e:
+        raise _fail(f"LLM request failed: {' '.join(str(e).split())}") from e
     if dry_run:
         for line in _dry_run_lines(report):
             typer.echo(line)
@@ -250,6 +262,6 @@ def import_(
         )
     else:
         typer.echo(
-            f"stopped at --limit {limit}: imported {report.written} "
+            f"stopped at --limit {max_items}: imported {report.written} "
             f"of {report.planned} episodes; run again to continue"
         )
