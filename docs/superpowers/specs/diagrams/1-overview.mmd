@@ -1,0 +1,56 @@
+flowchart TB
+  subgraph SRC["① Sources"]
+    direction LR
+    GH["GitHub issues / PRs"]
+    CUST["Customer requests"]
+    OTHER["Jira / GitLab (later)"]
+  end
+
+  subgraph AGENTS["③ Agent company"]
+    direction LR
+    PM(("PM"))
+    TRI(("Triage"))
+    ARCH(("Architect"))
+    SEN(("Senior"))
+    JUN(("Junior"))
+    QA(("QA<br/>isolated"))
+    LEAD(("Team Lead<br/>decides done"))
+    LIB(("Librarian"))
+  end
+
+  subgraph ORCH["② Orchestrator (Python) — runs locally or hosted; agents only talk through here"]
+    direction LR
+    GW["Intake<br/>webhooks or local CLI"]
+    SM["Workflow engine<br/>state machine + stop rules"]
+    ROUTER["Model router<br/>model per role"]
+    MEMGATE["Memory gate<br/>who reads which graph"]
+    SANDBOX["Sandboxes<br/>worktree + container"]
+    AUDIT["Audit + cost"]
+  end
+
+  subgraph STORE["④ Storage"]
+    direction LR
+    subgraph FDB["FalkorDB — many graphs via Graphiti group_id"]
+      direction LR
+      GCOMP[("company")]
+      GPROD[("product")]
+      GRND[("rnd")]
+      GQA[("qa")]
+    end
+    PG[("Postgres<br/>workflow state + audit")]
+  end
+
+  HUMAN(("Human<br/>on the loop<br/>+ PR reviewer"))
+
+  SRC ==> GW
+  AGENTS <==> ORCH
+  MEMGATE <==> FDB
+  SM ==> PG
+  AUDIT ==> PG
+  LEAD -- "critical / new only" --> HUMAN
+  HUMAN -- "decision" --> LEAD
+  LEAD == "approved: open PR (last step)" ==> GH
+
+  style QA fill:#fff4e6,stroke:#e8590c,stroke-width:2px
+  style LEAD fill:#ebfbee,stroke:#2f9e44,stroke-width:2px
+  style HUMAN fill:#fff0f6,stroke:#c2255c,stroke-width:2px

@@ -1,0 +1,21 @@
+flowchart TD
+  IN["Work ready on local branch"] --> GATHER["Lead gathers:<br/>• diff + engineer notes<br/>• QA report<br/>• blind review<br/>• engineer track record<br/>• risks on touched modules<br/>• past review rules"]
+  GATHER --> CRIT{"Critical?<br/>(see escalation rules)"}
+  CRIT -->|"yes"| H(("Human"))
+  CRIT -->|"no"| NEW{"New / unknown?<br/>(no similar past case,<br/>conflicting rules)"}
+  NEW -->|"yes"| H
+  NEW -->|"no"| CHECKS{"QA pass AND<br/>blind review OK AND<br/>no rule broken?"}
+  CHECKS -->|"yes"| CONF{"Lead confident?"}
+  CONF -->|"yes"| OK(("Approve<br/>OPEN PR (last step)"))
+  CONF -->|"no"| H
+  CHECKS -->|"no"| CLASS{"Classify each finding"}
+  CLASS -->|"edge case"| SPLIT["Separate task, own PR"]
+  CLASS -->|"trade-off"| H
+  CLASS -->|"only edge cases / style left"| OK
+  CLASS -->|"real bug"| ROUND{"Round < 3?"}
+  ROUND -->|"yes"| BACK(("Back to first floor<br/>with feedback"))
+  ROUND -->|"no, junior"| UP(("Re-assign<br/>to Senior"))
+  ROUND -->|"no, senior"| H
+  BACK --> SECOND{"Same symptom<br/>2nd time?"}
+  SECOND -->|"yes"| RC(("Root cause:<br/>senior states one rule,<br/>applies everywhere"))
+  SECOND -->|"no"| ENG["Engineer fixes;<br/>fix reviewed as new code"]

@@ -1,0 +1,15 @@
+flowchart LR
+  A(("Senior fixes<br/>a hard bug")) --> P["Playbook<br/>(how it was solved)"]
+  B(("Team Lead or<br/>human reviewer<br/>comment")) --> R["Review rule<br/>(never repeat this)"]
+  C(("QA finds bug<br/>that slipped")) --> K["Risk<br/>(linked to module)"]
+  D(("Human decides<br/>something new")) --> E["Escalation rule /<br/>policy"]
+
+  P --> G[("Graphs")]
+  R --> G
+  K --> G
+  E --> G
+
+  G --> J(("Junior gets playbooks<br/>→ handles harder bugs"))
+  G --> F(("Pre-flight check<br/>→ fewer review rounds"))
+  G --> T(("Triage sends more<br/>work to cheap models"))
+  G --> L(("Lead knows what is<br/>'not new' anymore<br/>→ fewer human pings"))
