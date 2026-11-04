@@ -1,0 +1,72 @@
+from pathlib import Path
+
+import yaml
+from pydantic import (
+    BaseModel,
+    ConfigDict,
+    ValidationError,
+    field_validator,
+    model_validator,
+)
+
+CONTRACT_FILE = ".agentco.yml"
+
+
+class RepoContractError(ValueError):
+    pass
+
+
+class RepoContractMissing(FileNotFoundError):
+    pass
+
+
+class Sandbox(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    devcontainer: str | None = None
+    compose: str | None = None
+
+    @model_validator(mode="after")
+    def _exactly_one(self) -> "Sandbox":
+        if (self.devcontainer is None) == (self.compose is None):
+            raise ValueError("sandbox must set exactly one of devcontainer or compose")
+        return self
+
+
+class RepoContract(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    build: str
+    test: str
+    e2e: str | None  # key required; null means the repo has no e2e tests
+    lint: str
+    sandbox: Sandbox
+
+    @field_validator("build", "test", "e2e", "lint")
+    @classmethod
+    def _non_empty(cls, v: str | None) -> str | None:
+        if v is not None and not v.strip():
+            raise ValueError("command must be a non-empty string")
+        return v
+
+
+def load_repo_contract(repo_root: Path) -> RepoContract:
+    path = Path(repo_root) / CONTRACT_FILE
+    try:
+        text = path.read_text(encoding="utf-8")
+    except FileNotFoundError as e:
+        raise RepoContractMissing(f"repo contract {path} not found") from e
+    except UnicodeDecodeError as e:
+        raise RepoContractError(f"repo contract {path} is not valid UTF-8: {e}") from e
+    except OSError as e:
+        raise RepoContractError(f"cannot read repo contract {path}: {e}") from e
+    try:
+        raw = yaml.safe_load(text)
+    except yaml.YAMLError as e:
+        raise RepoContractError(f"invalid YAML in {path}: {e}") from e
+    if not isinstance(raw, dict):
+        raise RepoContractError(f"repo contract {path} must be a YAML mapping")
+    try:
+        return RepoContract.model_validate(raw)
+    except ValidationError as e:
+        raise RepoContractError(f"invalid repo contract {path}: {e}") from e
