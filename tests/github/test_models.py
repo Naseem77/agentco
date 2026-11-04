@@ -2,6 +2,9 @@ import json
 from datetime import UTC, datetime
 from pathlib import Path
 
+import pytest
+
+from agentco.github.errors import GitHubError
 from agentco.github.models import (
     GhIssue,
     GhPull,
@@ -168,3 +171,64 @@ def test_linked_issues_dedupes_keeps_order_and_ignores_non_keywords():
         3,
     )
     assert linked_issues("") == ()
+
+
+def _without(raw: dict, key: str) -> dict:
+    return {k: v for k, v in raw.items() if k != key}
+
+
+def _pull_raw() -> dict:
+    return load("pulls.json")[0][0]
+
+
+@pytest.mark.parametrize(
+    ("raw", "message"),
+    [
+        (_without(raw_issue(), "number"), "malformed GitHub issue: KeyError: 'number'"),
+        (
+            raw_issue(user="alice"),
+            "malformed GitHub issue: TypeError: string indices must be integers, not 'str'",
+        ),
+        (
+            raw_issue(created_at="yesterday"),
+            "malformed GitHub issue: ValueError: Invalid isoformat string: 'yesterday'",
+        ),
+        (
+            raw_issue(labels=[{"id": 1}]),
+            "malformed GitHub issue: KeyError: 'name'",
+        ),
+        (
+            None,
+            "malformed GitHub issue: TypeError: argument of type 'NoneType' is not iterable",
+        ),
+    ],
+)
+def test_parse_issue_wraps_malformed_json(raw, message):
+    with pytest.raises(GitHubError) as err:
+        parse_issue(raw)
+    assert str(err.value) == message
+
+
+def test_parse_pull_wraps_malformed_json():
+    with pytest.raises(GitHubError) as err:
+        parse_pull(_without(_pull_raw(), "base"))
+    assert str(err.value) == "malformed GitHub pull request: KeyError: 'base'"
+
+
+@pytest.mark.parametrize(
+    ("raw", "message"),
+    [
+        (
+            _without(comment(101), "path"),
+            "malformed GitHub review comment: KeyError: 'path'",
+        ),
+        (
+            comment(101) | {"pull_request_url": "nope"},
+            "malformed GitHub review comment: IndexError: list index out of range",
+        ),
+    ],
+)
+def test_parse_review_comment_wraps_malformed_json(raw, message):
+    with pytest.raises(GitHubError) as err:
+        parse_review_comment(raw)
+    assert str(err.value) == message

@@ -5,7 +5,13 @@ from pathlib import Path
 import pytest
 
 from agentco.code.graph import CallEdge, InMemoryCodeGraph, code_graph_for
-from agentco.code.indexer import MAX_FILE_BYTES, IndexReport, NotAGitRepo, index_repo
+from agentco.code.indexer import (
+    MAX_FILE_BYTES,
+    IndexReport,
+    NotAGitRepo,
+    index_repo,
+    repo_root,
+)
 from agentco.memory.gate import AccessDenied
 from agentco.memory.scopes import Scope, graph_name
 from agentco.roles import Role
@@ -295,3 +301,26 @@ async def test_unchanged_run_does_not_rewrite_correct_calls(tmp_path):
     backend.replace_calls = spy
     report = await index_repo("o/r", root, code)
     assert (report.calls, calls) == (0, [])
+
+
+def test_repo_root_resolves_a_subdirectory_to_the_toplevel(tmp_path):
+    root = git_repo(tmp_path / "repo", {"src/app/a.py": "def f(): pass\n"})
+    assert repo_root(root / "src" / "app") == root.resolve()
+    assert repo_root(root) == root.resolve()
+
+
+def test_repo_root_rejects_a_plain_directory(tmp_path):
+    with pytest.raises(NotAGitRepo) as exc:
+        repo_root(tmp_path)
+    assert str(exc.value) == f"{tmp_path} is not a git repository"
+
+
+async def test_indexing_from_a_subdirectory_uses_root_relative_paths(tmp_path):
+    root = git_repo(
+        tmp_path / "repo",
+        {"src/app/a.py": "def f(): pass\n", "top.py": "def g(): pass\n"},
+    )
+    backend = InMemoryCodeGraph()
+    report = await index_repo("o/r", root / "src" / "app", librarian(backend))
+    assert report.indexed == 2
+    assert sorted(await backend.file_hashes(GRAPH, "o/r")) == ["src/app/a.py", "top.py"]

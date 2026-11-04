@@ -336,11 +336,16 @@ async def test_review_without_code_graph_stays_added_then_links_later(world):
     assert world.store.get_meta(REVIEW_101) == "added"
     # file-level comments can never link, so they are finished
     assert world.store.get_meta(f"import:acme:{REPO}:review:106") == "done"
-    assert world.store.get_meta(CURSOR_KEY) == NOW.isoformat()
+    # the cursor stays put, so the next run fetches the waiting review again
+    assert (first.awaiting_code, world.store.get_meta(CURSOR_KEY)) == (1, None)
 
     later = SymbolLocator(REPO, world.code, None)
-    second = await world.run(locator=later, since=datetime(2020, 1, 1, tzinfo=UTC))
+    second = await world.run(locator=later)
     assert (second.written, second.relinked, second.linked) == (0, 1, 1)
+    assert (second.awaiting_code, world.store.get_meta(CURSOR_KEY)) == (
+        0,
+        NOW.isoformat(),
+    )
     assert world.store.get_meta(REVIEW_101) == "done"
     assert names(world.backend, "acme__rnd").count("review:acme-org/web:101") == 1
     assert world.codegraph.links("acme__rnd") == {
@@ -359,8 +364,9 @@ async def test_added_review_is_deferred_not_retried_while_still_no_code(world):
     await world.run(code=None, locator=no_index)
     since = datetime(2020, 1, 1, tzinfo=UTC)
     r = await world.run(code=None, locator=no_index, since=since, limit=1)
-    assert (r.deferred, r.written, r.relinked, r.complete) == (1, 0, 0, True)
+    assert (r.awaiting_code, r.written, r.relinked, r.complete) == (1, 0, 0, True)
     assert (r.reviews, r.link_only) == (0, 0)
+    assert world.store.get_meta(CURSOR_KEY) is None
     assert world.store.get_meta(REVIEW_101) == "added"
 
 

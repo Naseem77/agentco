@@ -53,7 +53,7 @@ class ImportReport:
     relinked: int = 0  # link-only retries finished this run
     linked_by_fallback: int = 0  # links resolved against today's index, not the commit
     link_only: int = 0  # planned retries of episodes an earlier run already added
-    deferred: int = 0  # retries skipped because there is still no code graph to link to
+    awaiting_code: int = 0  # reviews still "added": no code graph to link them to yet
 
     @property
     def planned(self) -> int:
@@ -117,7 +117,8 @@ async def run_import(
     A review episode written while no code graph could link it (none passed, or it has no
     indexed files and there is no checkout) keeps its "added" marker; a later run with
     code available only links it and never writes it again. Until then such retries are
-    `deferred`: they use no `limit` slot.
+    counted in `awaiting_code`: they use no `limit` slot, and the cursor stays put so the
+    next run fetches them again.
     """
     tenant = rnd.tenant
     if not rnd.tenant == product.tenant == (code.tenant if code else rnd.tenant):
@@ -164,7 +165,7 @@ async def run_import(
             report.already += 1
             return
         if link_only and not can_link:
-            report.deferred += 1
+            report.awaiting_code += 1
             return
         pending.append(
             _Pending(
@@ -267,12 +268,14 @@ async def run_import(
         report.linked_by_fallback += int(outcome.by_fallback)
         if outcome.final:
             store.set_meta(work.marker, "done")
+        else:
+            report.awaiting_code += 1
         if not work.link_only:
             report.written += 1
         elif outcome.final:
             report.relinked += 1
 
     report.complete = not cut
-    if report.complete and opts.since is None:
+    if report.complete and opts.since is None and not report.awaiting_code:
         store.set_meta(cursor_key, _utc(now).isoformat())
     return report

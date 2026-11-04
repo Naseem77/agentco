@@ -6,6 +6,7 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import Protocol
 
+from agentco.github.errors import GitHubError
 from agentco.github.models import (
     GhIssue,
     GhPull,
@@ -19,10 +20,6 @@ REPO_RE = re.compile(r"^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$")
 _GH_MISSING = (
     "gh CLI not found; install it from https://cli.github.com and run gh auth login"
 )
-
-
-class GitHubError(RuntimeError):
-    pass
 
 
 def validate_repo(repo: str) -> str:
@@ -71,7 +68,16 @@ def _flatten_pages(output: str) -> list[dict]:
         pages = json.loads(output)
     except json.JSONDecodeError as e:
         raise GitHubError(f"gh api returned invalid JSON: {e}") from e
+    if not isinstance(pages, list) or not all(isinstance(p, list) for p in pages):
+        raise GitHubError("gh api returned unexpected JSON: expected a list of pages")
     return [item for page in pages for item in page]
+
+
+def _filename(raw: dict) -> str:
+    try:
+        return raw["filename"]
+    except (KeyError, TypeError, IndexError) as e:
+        raise GitHubError(f"malformed GitHub pull file: {type(e).__name__}: {e}") from e
 
 
 class GhCli:
@@ -103,7 +109,7 @@ class GhCli:
 
     def pull_files(self, repo: str, number: int) -> list[str]:
         path = f"repos/{validate_repo(repo)}/pulls/{number}/files?per_page=100"
-        return [raw["filename"] for raw in self._get(path)]
+        return [_filename(raw) for raw in self._get(path)]
 
 
 class FakeGitHub:
@@ -130,7 +136,7 @@ class FakeGitHub:
         issues = [i for raw in load("issues.json") if (i := parse_issue(raw))]
         files = {
             int(path.stem.removeprefix("pull_files_")): [
-                raw["filename"] for raw in load(path.name)
+                _filename(raw) for raw in load(path.name)
             ]
             for path in sorted(directory.glob("pull_files_*.json"))
         }

@@ -1,3 +1,4 @@
+import dataclasses
 import subprocess
 from datetime import UTC, datetime
 from pathlib import Path
@@ -7,11 +8,16 @@ import openai
 import pytest
 import redis.exceptions
 import yaml
+from graphiti_core.llm_client.errors import (
+    EmptyResponseError,
+    RateLimitError,
+    RefusalError,
+)
 from typer.testing import CliRunner
 
 from agentco import cli
 from agentco.code.graph import InMemoryCodeGraph
-from agentco.github.client import FakeGitHub, GitHubError
+from agentco.github.client import FakeGitHub, GhCli, GitHubError
 from agentco.memory.backend import InMemoryBackend
 from agentco.store.task_store import TaskStore
 
@@ -306,11 +312,71 @@ class FailingGitHub:
         raise self._error
 
 
+FALLBACK_LINE = (
+    "{n} episodes linked against current code because their commits are not in the "
+    "checkout; fetch PR heads for exact links (see README)"
+)
+
+
+class Boom(AssertionError):
+    pass
+
+
+def _never(cfg):
+    raise Boom("a dry run must not build this")
+
+
+def test_dry_run_needs_no_openai_key_and_builds_no_backend(env, monkeypatch):
+    monkeypatch.delenv("OPENAI_API_KEY", raising=False)
+    monkeypatch.setattr(cli, "make_backend", _never)
+    monkeypatch.setattr(cli, "make_code_graph", _never)
+    r = env("import", "--repo", "acme-org/web", "--dry-run")
+    assert r.exception is None
+    assert r.exit_code == 0
+    assert r.stdout.splitlines()[0] == "issues: 2"
+    assert env.backend._graphs == {}
+    assert env.code_graph.upserts == 0
+
+
+def test_dry_run_with_repo_path_builds_nothing_and_does_not_index(
+    env, tmp_path, monkeypatch
+):
+    root = _git_repo(tmp_path / "repo", {"a.py": "def f(): pass\n"})
+    monkeypatch.setattr(cli, "make_backend", _never)
+    monkeypatch.setattr(cli, "make_code_graph", _never)
+    r = env("import", "--repo", "acme-org/web", "--repo-path", str(root), "--dry-run")
+    assert r.exception is None
+    assert r.exit_code == 0
+
+
+def test_dry_run_reports_link_only_retries_separately(env, tmp_path):
+    assert env("import", "--repo", "acme-org/web").exit_code == 0  # 101 stays added
+    r = env("import", "--repo", "acme-org/web", "--dry-run")
+    assert r.exit_code == 0
+    assert r.stdout.splitlines()[-2:] == [
+        "episodes to write: 0 (each runs one Graphiti LLM extraction)",
+        "link-only retries: 1",
+    ]
+
+
+def test_real_import_ensures_the_code_schema_but_dry_run_does_not(env, monkeypatch):
+    schemas = []
+
+    async def record(graph):
+        schemas.append(graph)
+
+    monkeypatch.setattr(env.code_graph, "ensure_schema", record)
+    assert env("import", "--repo", "acme-org/web", "--dry-run").exit_code == 0
+    assert schemas == []
+    assert env("import", "--repo", "acme-org/web").exit_code == 0
+    assert schemas == ["acme__rnd"]
+
+
 def test_import_dry_run_prints_counts_and_writes_nothing(env):
     env("init")
     r = env("import", "--repo", "acme-org/web", "--dry-run")
     assert r.exit_code == 0
-    assert r.stdout.splitlines()[-7:] == [
+    assert r.stdout.splitlines() == [
         "issues: 2",
         "features: 1",
         "pull requests: 1",
@@ -344,7 +410,7 @@ def test_import_then_rerun(env):
     first = env("import", "--repo", "acme-org/web")
     assert first.exit_code == 0
     assert first.stdout.splitlines() == [
-        "relinked 0 episodes",
+        "1 review episodes await a code graph; import or index with --repo-path to link them",
         "imported 6 episodes (0 linked to code)",
     ]
     second = env("import", "--repo", "acme-org/web")
@@ -364,7 +430,7 @@ def test_import_limit_message(env):
 
 
 def test_import_creates_graphs_and_state_without_init(env):
-    r = env("import", "--repo", "acme-org/web", "--dry-run")
+    r = env("import", "--repo", "acme-org/web")
     assert r.exit_code == 0
     assert sorted(env.backend._graphs) == ["acme__product", "acme__rnd"]
 
@@ -402,7 +468,7 @@ def test_import_with_repo_path_indexes_first_and_links(env, tmp_path):
     assert r.exit_code == 0
     assert r.stdout.splitlines() == [
         "indexed 1, unchanged 0, deleted 0, skipped 0, calls 1",
-        "relinked 0 episodes",
+        FALLBACK_LINE.format(n=1),
         "imported 6 episodes (1 linked to code)",
     ]
     assert len(env.code_graph.links("acme__rnd")) == 1
@@ -437,8 +503,9 @@ def test_import_rerun_after_failed_link_reports_relinked(env, tmp_path):
     assert first.exit_code == 2
     second = env("import", "--repo", "acme-org/web", "--repo-path", str(root))
     assert second.exit_code == 0
-    assert second.stdout.splitlines()[-2:] == [
+    assert second.stdout.splitlines()[-3:] == [
         "relinked 1 episodes",
+        FALLBACK_LINE.format(n=1),
         "imported 3 episodes (1 linked to code)",
     ]
 
@@ -449,6 +516,163 @@ def test_import_dry_run_with_repo_path_does_not_index(env, tmp_path):
     assert r.exit_code == 0
     assert r.stdout.splitlines()[0] == "issues: 2"
     assert env.code_graph.upserts == 0
+    assert env.backend._graphs == {}
+
+
+def _commit(root, message):
+    subprocess.run(["git", "-C", str(root), "add", "-A"], check=True)
+    subprocess.run(
+        [
+            "git",
+            "-C",
+            str(root),
+            "-c",
+            "user.name=t",
+            "-c",
+            "user.email=t@example.com",
+            "-c",
+            "commit.gpgsign=false",
+            "commit",
+            "-qm",
+            message,
+        ],
+        check=True,
+    )
+    out = subprocess.run(
+        ["git", "-C", str(root), "rev-parse", "HEAD"],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    return out.stdout.strip()
+
+
+GRAPH_V1 = (
+    "class GraphView:\n"
+    "    def load(self, g):\n"
+    "        return g\n"
+    "\n"
+    "    def switch(self, g):\n"
+    "        self.load(g)\n"
+)
+GRAPH_V2 = (
+    "class GraphView:\n"
+    "    def load(self, g):\n"
+    "        return g\n"
+    "\n"
+    "    def render(self, g):\n"
+    "        return g\n"
+    "\n"
+    "    def switch(self, g):\n"
+    "        self.load(g)\n"
+)
+
+
+def _comments_made_on(gh, commit):
+    gh._comments = [
+        dataclasses.replace(c, original_commit_id=commit) for c in gh._comments
+    ]
+
+
+def _two_commit_repo(tmp_path):
+    root = tmp_path / "web"
+    (root / "src" / "app").mkdir(parents=True)
+    subprocess.run(["git", "-C", str(root), "init", "-q"], check=True)
+    graph = root / "src" / "app" / "graph.py"
+    graph.write_text(GRAPH_V1)
+    first = _commit(root, "v1")
+    graph.write_text(GRAPH_V2)
+    _commit(root, "v2")
+    return root, first
+
+
+def test_import_links_to_the_symbol_at_the_comments_own_commit(
+    env, tmp_path, monkeypatch
+):
+    root, first = _two_commit_repo(tmp_path)
+    gh = FakeGitHub.from_fixtures(GITHUB_FIXTURES)
+    _comments_made_on(gh, first)
+    monkeypatch.setattr(cli, "make_github", lambda: gh)
+    r = env("import", "--repo", "acme-org/web", "--repo-path", str(root))
+    assert r.exit_code == 0
+    # line 6 is `render` in today's file but `switch` at the comment's commit
+    assert r.stdout.splitlines() == [
+        "indexed 1, unchanged 0, deleted 0, skipped 0, calls 1",
+        "imported 6 episodes (1 linked to code)",
+    ]
+    ((_, path, qualname),) = env.code_graph.links("acme__rnd")
+    assert (path, qualname) == ("src/app/graph.py", "GraphView.switch")
+
+
+def test_import_falls_back_to_current_code_when_the_commit_is_missing(
+    env, tmp_path, monkeypatch
+):
+    root, _ = _two_commit_repo(tmp_path)
+    r = env("import", "--repo", "acme-org/web", "--repo-path", str(root))
+    assert r.exit_code == 0
+    assert r.stdout.splitlines()[1:] == [
+        FALLBACK_LINE.format(n=1),
+        "imported 6 episodes (1 linked to code)",
+    ]
+    ((_, path, qualname),) = env.code_graph.links("acme__rnd")
+    assert (path, qualname) == ("src/app/graph.py", "GraphView.render")
+
+
+def test_import_does_not_guess_for_an_outdated_comment_with_a_missing_commit(
+    env, tmp_path, monkeypatch
+):
+    root, _ = _two_commit_repo(tmp_path)
+    gh = FakeGitHub.from_fixtures(GITHUB_FIXTURES)
+    gh._comments = [dataclasses.replace(c, line=None) for c in gh._comments]
+    monkeypatch.setattr(cli, "make_github", lambda: gh)
+    r = env("import", "--repo", "acme-org/web", "--repo-path", str(root))
+    assert r.exit_code == 0
+    assert r.stdout.splitlines()[1:] == ["imported 6 episodes (0 linked to code)"]
+    assert env.code_graph.links("acme__rnd") == set()
+
+
+def test_reviews_imported_without_code_are_linked_by_a_later_repo_path_run(
+    env, tmp_path
+):
+    first = env("import", "--repo", "acme-org/web")
+    assert first.exit_code == 0
+    assert first.stdout.splitlines()[0] == (
+        "1 review episodes await a code graph; "
+        "import or index with --repo-path to link them"
+    )
+    assert env.store.get_meta("import:acme:acme-org/web:cursor") is None
+    root, _ = _two_commit_repo(tmp_path)
+    before = len(env.backend.items("acme__rnd"))
+    second = env("import", "--repo", "acme-org/web", "--repo-path", str(root))
+    assert second.exit_code == 0
+    assert second.stdout.splitlines() == [
+        "indexed 1, unchanged 0, deleted 0, skipped 0, calls 1",
+        "relinked 1 episodes",
+        FALLBACK_LINE.format(n=1),
+        "imported 0 episodes (1 linked to code)",
+    ]
+    assert len(env.backend.items("acme__rnd")) == before
+    assert env.store.get_meta("import:acme:acme-org/web:cursor") is not None
+
+
+def test_import_repo_path_subdirectory_uses_the_repo_root(env, tmp_path):
+    root, _ = _two_commit_repo(tmp_path)
+    r = env("import", "--repo", "acme-org/web", "--repo-path", str(root / "src"))
+    assert r.exit_code == 0
+    assert r.stdout.splitlines()[0] == (
+        "indexed 1, unchanged 0, deleted 0, skipped 0, calls 1"
+    )
+    assert sorted(path for _, path, _ in env.code_graph.links("acme__rnd")) == [
+        "src/app/graph.py"
+    ]
+
+
+def test_import_dry_run_repo_path_not_a_repo_exits_1_and_writes_nothing(env, tmp_path):
+    plain = tmp_path / "plain"
+    plain.mkdir()
+    r = env("import", "--repo", "acme-org/web", "--repo-path", str(plain), "--dry-run")
+    assert r.exit_code == 1
+    assert r.stdout.splitlines() == [f"{plain} is not a git repository"]
 
 
 def test_import_repo_path_not_a_repo_exits_1(env, tmp_path):
@@ -457,7 +681,7 @@ def test_import_repo_path_not_a_repo_exits_1(env, tmp_path):
     r = env("import", "--repo", "acme-org/web", "--repo-path", str(plain))
     assert r.exit_code == 1
     assert r.stdout.splitlines() == [f"{plain} is not a git repository"]
-    assert env.backend.items("acme__rnd") == []
+    assert env.backend._graphs == {}
 
 
 def test_import_github_error_exits_3_and_writes_nothing(env, monkeypatch):
@@ -587,6 +811,8 @@ def test_import_cursor_is_captured_before_fetching(env, monkeypatch):
             return super().issues(repo, since)
 
     gh = ClockedGitHub.from_fixtures(GITHUB_FIXTURES)
+    # no linkable review, so none waits for a code graph and the cursor may move
+    gh._comments = [dataclasses.replace(c, subject_type="file") for c in gh._comments]
     monkeypatch.setattr(cli, "make_github", lambda: gh)
     monkeypatch.setattr(cli, "datetime", Clock)
     assert env("import", "--repo", "acme-org/web").exit_code == 0
@@ -611,3 +837,124 @@ def test_import_bad_arguments_exit_1(env, args, message):
     assert r.exit_code == 1
     assert r.stdout.splitlines() == [message]
     assert env.backend.items("acme__rnd") == []
+
+
+def _import_with(tmp_path, monkeypatch, backend=None, github=None):
+    monkeypatch.setattr(cli, "make_backend", lambda cfg: backend or InMemoryBackend())
+    monkeypatch.setattr(cli, "make_code_graph", lambda cfg: InMemoryCodeGraph())
+    monkeypatch.setattr(
+        cli,
+        "make_github",
+        lambda: github or FakeGitHub.from_fixtures(GITHUB_FIXTURES),
+    )
+    config = _write_config(tmp_path)
+    return runner.invoke(
+        cli.app, ["import", "--repo", "acme-org/web", "--config", str(config)]
+    )
+
+
+def test_import_falkordb_response_error_exits_2(tmp_path, monkeypatch):
+    error = redis.exceptions.ResponseError("Invalid graph operation\non empty key")
+    r = _import_with(tmp_path, monkeypatch, backend=FailingBackend(error))
+    assert r.exit_code == 2
+    assert r.stdout.splitlines() == [
+        "FalkorDB error: Invalid graph operation on empty key"
+    ]
+    assert isinstance(r.exception, SystemExit)
+
+
+def test_init_falkordb_response_error_exits_2(tmp_path, monkeypatch):
+    error = redis.exceptions.ResponseError("bad query")
+    monkeypatch.setattr(cli, "make_backend", lambda cfg: FailingBackend(error))
+    r = runner.invoke(cli.app, ["init", "--config", str(_write_config(tmp_path))])
+    assert r.exit_code == 2
+    assert r.stdout.splitlines()[-1] == "FalkorDB error: bad query"
+
+
+def test_index_falkordb_response_error_exits_2(tmp_path, monkeypatch):
+    class Failing(InMemoryCodeGraph):
+        async def ensure_schema(self, graph):
+            raise redis.exceptions.ResponseError("bad index")
+
+    monkeypatch.setattr(cli, "make_code_graph", lambda cfg: Failing())
+    root = _git_repo(tmp_path / "repo", {"a.py": "def f(): pass\n"})
+    config = _write_config(tmp_path)
+    r = runner.invoke(
+        cli.app,
+        ["index", "--repo", "o/r", "--repo-path", str(root), "--config", str(config)],
+    )
+    assert r.exit_code == 2
+    assert r.stdout.splitlines() == ["FalkorDB error: bad index"]
+
+
+GRAPHITI_ERRORS = [
+    RateLimitError("Rate limit exceeded.\nPlease retry"),
+    RefusalError("The model refused"),
+    EmptyResponseError("empty"),
+]
+
+
+@pytest.mark.parametrize("error", GRAPHITI_ERRORS, ids=lambda e: type(e).__name__)
+def test_import_graphiti_llm_errors_exit_1_and_keep_cursor_unset(
+    tmp_path, monkeypatch, error
+):
+    class AddFailing(InMemoryBackend):
+        async def add(self, graph, scope, item):
+            raise error
+
+    r = _import_with(tmp_path, monkeypatch, backend=AddFailing())
+    assert r.exit_code == 1
+    assert r.stdout.splitlines() == [
+        f"LLM request failed: {' '.join(str(error).split())}"
+    ]
+    assert isinstance(r.exception, SystemExit)
+    store = TaskStore(f"sqlite:///{tmp_path}/state.db")
+    assert store.get_meta("import:acme:acme-org/web:cursor") is None
+
+
+def _gh_runner(**overrides):
+    def run(argv):
+        endpoint = argv[-1]
+        for name, text in overrides.items():
+            if name in endpoint:
+                return text
+        for name in ("issues", "pulls/comments", "pulls"):
+            if f"/{name}?" in endpoint:
+                return FIXTURE_TEXT[
+                    "pull_comments.json" if name == "pulls/comments" else f"{name}.json"
+                ]
+        raise AssertionError(endpoint)
+
+    return run
+
+
+FIXTURE_TEXT = {p.name: p.read_text() for p in GITHUB_FIXTURES.glob("*.json")}
+
+
+@pytest.mark.parametrize(
+    ("overrides", "line"),
+    [
+        (
+            {"/issues?": '[[{"title": "no number"}]]'},
+            "malformed GitHub issue: KeyError: 'number'",
+        ),
+        (
+            {"/issues?": '{"message": "oops"}'},
+            "gh api returned unexpected JSON: expected a list of pages",
+        ),
+    ],
+)
+def test_import_malformed_gh_json_exits_3_with_one_line(
+    tmp_path, monkeypatch, overrides, line
+):
+    github = cli_github(_gh_runner(**overrides))
+    r = _import_with(tmp_path, monkeypatch, github=github)
+    assert r.exit_code == 3
+    assert r.stdout.splitlines() == [line]
+    assert isinstance(r.exception, SystemExit)
+    store = TaskStore(f"sqlite:///{tmp_path}/state.db")
+    assert store.get_meta("import:acme:acme-org/web:cursor") is None
+
+
+def cli_github(run):
+    return GhCli(runner=run)

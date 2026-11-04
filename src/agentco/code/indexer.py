@@ -24,6 +24,22 @@ class IndexReport:
     calls: int
 
 
+def repo_root(path: Path) -> Path:
+    """Top level of the work tree containing `path` (git paths are root-relative)."""
+    try:
+        result = subprocess.run(
+            ["git", "-C", str(path), "rev-parse", "--show-toplevel"],
+            capture_output=True,
+            check=False,
+        )
+    except FileNotFoundError as e:
+        raise NotAGitRepo("git not found; install git to index a repository") from e
+    top = result.stdout.decode("utf-8", errors="replace").strip()
+    if result.returncode != 0 or not top:
+        raise NotAGitRepo(f"{path} is not a git repository")
+    return Path(top)
+
+
 def tracked_files(root: Path) -> list[str]:
     try:
         result = subprocess.run(
@@ -62,6 +78,7 @@ def _read_indexable(path: Path) -> bytes | None:
 
 
 async def index_repo(repo: str, root: Path, code: ScopedCodeGraph) -> IndexReport:
+    root = repo_root(root)
     tracked = [p for p in tracked_files(root) if language_for(p) is not None]
     await code.ensure_schema()
     known = await code.file_hashes(repo)

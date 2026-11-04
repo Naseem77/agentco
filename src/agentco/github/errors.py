@@ -1,0 +1,2 @@
+class GitHubError(RuntimeError):
+    pass
