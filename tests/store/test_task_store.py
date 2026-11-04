@@ -17,13 +17,6 @@ PATH = [
 ]
 
 
-@pytest.fixture
-def store(tmp_path):
-    s = TaskStore(f"sqlite:///{tmp_path}/s.db")
-    s.create_all()
-    return s
-
-
 def walk(store, to):
     t = store.create_task("acme", "x", "cli")
     for state, actor in PATH:

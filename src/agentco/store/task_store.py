@@ -161,6 +161,28 @@ class TaskStore:
             )
             return _record(row)
 
+    def reassign_to_senior(self, task_id: int) -> TaskRecord:
+        with self._sessions.begin() as session:
+            # Atomic once-only guard: of two concurrent callers, one matches no row.
+            result = session.execute(
+                update(TaskRow)
+                .where(TaskRow.id == task_id, TaskRow.reassigned.is_(False))
+                .values(
+                    assignee=Role.SENIOR.value,
+                    round=0,
+                    reassigned=True,
+                    updated_at=utcnow(),
+                )
+            )
+            if result.rowcount == 0:
+                self._task(session, task_id)  # unknown id -> KeyError
+                raise ValueError(f"task {task_id} was already reassigned; once only")
+            # System decision (stop rules), not an agent action: no actor.
+            self._audit(session, task_id, None, "reassigned", {"to": Role.SENIOR.value})
+            session.flush()
+            session.expire_all()
+            return _record(self._task(session, task_id))
+
     def record_cost(
         self, task_id: int, actor: Role, usd: float, detail: dict
     ) -> TaskRecord:
