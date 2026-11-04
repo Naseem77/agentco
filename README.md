@@ -52,7 +52,8 @@ extraction calls and is one-time; an interrupted run resumes where it stopped.
 
 Prerequisites: the `init` setup above (FalkorDB running, `OPENAI_API_KEY` set for Graphiti),
 `git`, and the [GitHub CLI](https://cli.github.com) **2.48 or newer** (needed for
-`gh api --slurp`), authenticated with `gh auth login`.
+`gh api --slurp`), authenticated with `gh auth login`. A `--dry-run` needs neither FalkorDB
+nor `OPENAI_API_KEY`, only `gh`.
 
 ```bash
 uv run agentco index --repo owner/name --repo-path .                 # code structure → code graph
@@ -63,19 +64,55 @@ uv run agentco import --repo owner/name --repo-path .                # the real 
 `index` stores the checkout's functions, classes and call edges (git-tracked files only) in
 the tenant's `rnd` graph and is incremental: unchanged files are not re-parsed. Its counts
 `skipped` (working-tree files that were not indexed) and `deleted` (graph entries removed)
-can overlap, so a file may appear in both.
+can overlap, so a file may appear in both. `--repo-path` may be any directory inside the
+checkout; it is resolved to the repository root, and a directory outside a git repository
+is rejected (exit 1).
 
 `import` reads issues, pull requests and review comments through `gh`, oldest first, and
 writes each one as an episode: issues and PRs to `rnd`, feature requests also to `product`.
-With `--repo-path` it runs `index` first and links review comments to the function they were
-written against. **Each episode is one Graphiti extraction (several LLM calls)**, so run
-`--dry-run` first and bound the work with `--limit N` (at least 1) or `--since YYYY-MM-DD`.
-Re-running is safe: imported items are remembered, and an interrupted or `--limit`ed run
-resumes with the next-oldest items. Review threads started by a bot, by the PR's own author or by a
-non-member are not imported.
+**Each episode is one Graphiti extraction (several LLM calls)**, so run `--dry-run` first
+and bound the work with `--limit N` (at least 1) or `--since YYYY-MM-DD`.
 
-Exit codes: 1 bad arguments, config or LLM client (e.g. `OPENAI_API_KEY` missing), 2 FalkorDB
-unreachable, 3 `gh` missing, not logged in, or the repo not found.
+`--dry-run` imports nothing: it contacts only GitHub, creates no graphs, does not index and
+builds neither the memory backend nor the code graph. It reads the "already imported"
+markers from the local state database (`database_url`), which it creates if missing. It
+reports the episodes that would be written (each one LLM extraction) and, separately, any
+link-only retries (episodes already written whose code link is still pending; no LLM call).
+
+Re-running is safe: imported items are remembered, and an interrupted or `--limit`ed run
+resumes with the next-oldest items. Review threads started by a bot, by the PR's own author
+or by a non-member are not imported, and neither are issues or PRs authored by bots.
+`--since` only filters by creation date; it never sets the resume cursor, so a run with
+`--since` does not make later plain runs skip anything.
+
+### Linking review comments to code
+
+With `--repo-path`, `import` **indexes the checkout first and only then contacts GitHub**.
+If `gh` fails (exit 3), the code graph has already been updated; that is harmless, since
+indexing is incremental.
+
+Each review comment is linked to the function or class it was written against, using the
+file as it was at the comment's own commit:
+
+- **Commit-accurate**: when the commit is in the checkout, the link is exact even if the
+  code has moved since. Review commits of PRs that were merged or force-pushed are often
+  missing from a clone; fetch the PR heads first:
+  `git fetch origin '+refs/pull/*/head:refs/remotes/origin/pr/*'`
+- **Best effort**: when the commit is missing, a comment on a line that still exists is
+  resolved against the *current* code, which can point at a different function if the file
+  changed. The run then prints `N episodes linked against current code because their
+  commits are not in the checkout`. A comment whose line no longer exists (outdated) and
+  whose commit is missing is not linked at all rather than guessed.
+
+Reviews imported while no code graph was available (no `--repo-path` and an empty index)
+stay pending: the next `import --repo-path ...` (or one after `agentco index`) links them
+without writing the episodes again, and prints `relinked N episodes` (only when N > 0). The
+resume cursor is held back while such reviews are pending, and the run reports
+`N review episodes await a code graph`.
+
+Exit codes: 1 bad arguments, config, a non-git `--repo-path` or an LLM error (e.g.
+`OPENAI_API_KEY` missing, rate limit, refusal), 2 FalkorDB unreachable or rejecting a
+query, 3 `gh` missing, not logged in, the repo not found, or `gh` returning unexpected JSON.
 
 ## Tests
 

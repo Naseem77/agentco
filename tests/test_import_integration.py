@@ -1,3 +1,4 @@
+import asyncio
 import os
 import shutil
 import subprocess
@@ -7,6 +8,7 @@ import yaml
 from typer.testing import CliRunner
 
 from agentco import cli
+from agentco.code.falkor_graph import build_falkor_code_graph
 
 pytestmark = pytest.mark.integration
 
@@ -22,6 +24,24 @@ ROLES = [
     "lead",
     "librarian",
 ]
+
+
+async def _delete_tenant_graphs(cfg) -> None:
+    db = build_falkor_code_graph(cfg).db
+    try:
+        for name in await db.list_graphs():
+            name = name.decode() if isinstance(name, bytes) else name
+            if name.startswith(f"{cfg.tenant}__"):
+                await db.select_graph(name).delete()
+    finally:
+        await db.aclose()
+
+
+@pytest.fixture
+def tenant_graphs(cfg):
+    """The test's `<tenant>__*` graphs are removed even when the test fails."""
+    yield cfg
+    asyncio.run(_delete_tenant_graphs(cfg))
 
 
 def write_config(tmp_path, cfg):
@@ -51,7 +71,8 @@ def dry_run_already(config, repo) -> int:
     return int(line.removeprefix("already imported: "))
 
 
-def test_import_smoke(cfg, tmp_path):
+def test_import_smoke(tenant_graphs, tmp_path):
+    cfg = tenant_graphs
     # A small repo with a few PRs + human review comments; it must yield more than
     # 2 episodes, since the run below is capped with --limit 2.
     repo = os.environ.get("AGENTCO_IT_REPO")
