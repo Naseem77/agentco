@@ -1,5 +1,5 @@
 from collections import Counter
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import UTC, datetime
 from pathlib import Path
 
@@ -239,3 +239,76 @@ async def test_wrong_role_cannot_import(world):
         await world.run(rnd=world.gate.for_role(Role.QA))
     assert world.backend.items("acme__rnd") == []
     assert world.store.get_meta(CURSOR_KEY) is None
+
+
+async def test_failed_link_does_not_duplicate_the_episode_on_rerun(world):
+    original = world.codegraph.link_episode
+    calls = 0
+
+    async def flaky(*args, **kwargs):
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            raise RuntimeError("link boom")
+        return await original(*args, **kwargs)
+
+    world.codegraph.link_episode = flaky
+    review_key = f"import:acme:{REPO}:review:101"
+    with pytest.raises(RuntimeError, match="link boom"):
+        await world.run()
+    assert world.store.get_meta(review_key) == "added"
+    assert world.codegraph.links("acme__rnd") == set()
+    assert world.store.get_meta(CURSOR_KEY) is None
+
+    r = await world.run()
+    assert world.store.get_meta(review_key) == "done"
+    assert names(world.backend, "acme__rnd").count("review:acme-org/web:101") == 1
+    assert sorted(names(world.backend, "acme__rnd")) == sorted(ALL_RND)
+    assert world.codegraph.links("acme__rnd") == {
+        ("review:acme-org/web:101", "src/app/graph.py", "GraphView.switch")
+    }
+    assert (r.written, r.relinked, r.linked) == (3, 1, 1)
+    assert r.reviews == 2
+
+
+async def test_legacy_marker_value_counts_as_done(world):
+    world.store.set_meta(f"import:acme:{REPO}:review:101", "1")
+    r = await world.run(since=datetime(2020, 1, 1, tzinfo=UTC))
+    assert (r.written, r.relinked, r.already) == (5, 0, 1)
+    assert "review:acme-org/web:101" not in names(world.backend, "acme__rnd")
+    assert world.codegraph.links("acme__rnd") == set()
+
+
+async def test_dry_run_does_not_touch_added_markers(world):
+    key = f"import:acme:{REPO}:review:101"
+    world.store.set_meta(key, "added")
+    r = await world.run(dry_run=True)
+    assert (r.reviews, r.written, r.already) == (2, 0, 0)
+    assert world.store.get_meta(key) == "added"
+    assert world.backend.items("acme__rnd") == []
+    assert world.codegraph.links("acme__rnd") == set()
+
+
+async def test_human_review_on_bot_pr_is_imported_but_bot_pr_is_not(world):
+    comment = replace(
+        next(c for c in world.gh.review_comments(REPO) if c.id == 101),
+        id=201,
+        pr_number=5,
+        created_at=datetime(2026, 1, 4, 9, 30, tzinfo=UTC),
+        updated_at=datetime(2026, 1, 4, 9, 30, tzinfo=UTC),
+    )
+    world.gh._comments.append(comment)
+    r = await world.run()
+    rnd_names = names(world.backend, "acme__rnd")
+    assert "review:acme-org/web:201" in rnd_names
+    assert "pr:acme-org/web#5" not in rnd_names
+    assert (r.reviews, r.pulls, r.written) == (3, 1, 7)
+    assert r.skipped == Counter(bot=3, pr_author=1, not_team=1, orphan_reply=1)
+
+
+@pytest.mark.parametrize("limit", [0, -1])
+async def test_limit_below_one_is_rejected(world, limit):
+    with pytest.raises(ValueError, match="limit must be at least 1"):
+        await world.run(limit=limit)
+    assert world.backend.items("acme__rnd") == []
+    assert world.gh.calls == []

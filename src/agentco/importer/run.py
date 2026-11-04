@@ -1,8 +1,10 @@
 """Resumable, idempotent import of a repo's GitHub history into tenant memory.
 
 Each written item gets a marker in the task store, so a crashed or `--limit`ed run
-continues where it stopped and never writes an episode twice. The cursor only moves
-after a run that finished everything it found.
+continues where it stopped and never writes an episode twice. Review episodes use a
+two-phase marker: "added" right after the memory write, "done" after the code link.
+A run that finds "added" only retries the (idempotent) link. Any other marker value
+means done. The cursor only moves after a run that finished everything it found.
 """
 
 import asyncio
@@ -48,6 +50,7 @@ class ImportReport:
     written: int = 0
     linked: int = 0
     complete: bool = True
+    relinked: int = 0  # link-only retries of episodes added by an earlier run
 
     @property
     def planned(self) -> int:
@@ -60,8 +63,9 @@ class _Pending:
     kind: int
     ident: int
     marker: str
-    # writes the episode; returns the number of code links made
+    # writes the episode (or only retries its code link); returns the links made
     write: Callable[[], Awaitable[int]]
+    link_only: bool = False
 
     @property
     def order(self) -> tuple[datetime, int, int]:
@@ -85,8 +89,18 @@ async def run_import(
     opts: ImportOptions,
     now: datetime,
 ) -> ImportReport:
+    """Import issues, features, PRs and review threads, oldest first.
+
+    `limit` (None = unlimited, otherwise >= 1) caps the items handled this run; link-only
+    retries count toward it but are reported as `relinked`, not `written`.
+    Bot-authored issues/PRs are skipped, but a human team-member review on a bot-authored
+    PR is still imported (threads resolve against every fetched PR); only the PR episode
+    itself is left out.
+    """
     tenant = rnd.tenant
     cursor_key = f"import:{tenant}:{repo}:cursor"
+    if opts.limit is not None and opts.limit < 1:
+        raise ValueError("limit must be at least 1")
     report = ImportReport()
 
     fetch_since = opts.since
@@ -111,13 +125,24 @@ async def run_import(
         kind: int,
         kind_name: str,
         ident: int,
-        write: Callable[[], Awaitable[int]],
+        write: Callable[[bool], Awaitable[int]],
     ) -> None:
         key = marker(kind_name, ident)
-        if store.get_meta(key) is not None:
+        state = store.get_meta(key)
+        link_only = state == "added"
+        if state is not None and not link_only:
             report.already += 1
             return
-        pending.append(_Pending(_utc(created_at), kind, ident, key, write))
+        pending.append(
+            _Pending(
+                _utc(created_at),
+                kind,
+                ident,
+                key,
+                lambda: write(link_only),
+                link_only,
+            )
+        )
         if kind == _ISSUE:
             report.issues += 1
         elif kind == _FEATURE:
@@ -128,7 +153,7 @@ async def run_import(
             report.reviews += 1
 
     def add_to(scope_memory: ScopedMemory, scope: Scope, item: MemoryItem):
-        async def write() -> int:
+        async def write(link_only: bool) -> int:
             await scope_memory.add(scope, item)
             return 0
 
@@ -163,7 +188,7 @@ async def run_import(
         if not created_ok(pr.created_at):
             continue
 
-        async def write_pr(pr=pr) -> int:
+        async def write_pr(link_only: bool, pr=pr) -> int:
             files = await asyncio.to_thread(gh.pull_files, repo, pr.number)
             await rnd.add(Scope.RND, pull_item(repo, pr, files))
             return 0
@@ -178,10 +203,12 @@ async def run_import(
             continue
         pr = pulls_by_number[thread.root.pr_number]
 
-        async def write_review(thread=thread, pr=pr) -> int:
+        async def write_review(link_only: bool, thread=thread, pr=pr) -> int:
             symbol = await locator.locate(thread.root, pr)
             item = review_item(repo, thread, pr, symbol)
-            await rnd.add(Scope.RND, item)
+            if not link_only:
+                await rnd.add(Scope.RND, item)
+                store.set_meta(marker("review", thread.root.id), "added")
             if symbol is None or code is None:
                 return 0
             linked = await code.link_episode(
@@ -199,7 +226,10 @@ async def run_import(
     for work in pending[: opts.limit]:
         report.linked += await work.write()
         store.set_meta(work.marker, "done")
-        report.written += 1
+        if work.link_only:
+            report.relinked += 1
+        else:
+            report.written += 1
 
     report.complete = not cut
     if report.complete and opts.since is None:
