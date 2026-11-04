@@ -4,6 +4,7 @@ import secrets
 import pytest
 
 from agentco.config import TenantConfig
+from agentco.store.task_store import TaskStore
 
 
 @pytest.fixture
@@ -18,3 +19,10 @@ def cfg() -> TenantConfig:
         falkordb_port=int(os.environ.get("FALKORDB_PORT", "6379")),
         roles={},
     )
+
+
+@pytest.fixture
+def store(tmp_path):
+    s = TaskStore(f"sqlite:///{tmp_path}/s.db")
+    s.create_all()
+    return s

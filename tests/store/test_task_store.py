@@ -17,13 +17,6 @@ PATH = [
 ]
 
 
-@pytest.fixture
-def store(tmp_path):
-    s = TaskStore(f"sqlite:///{tmp_path}/s.db")
-    s.create_all()
-    return s
-
-
 def walk(store, to):
     t = store.create_task("acme", "x", "cli")
     for state, actor in PATH:
@@ -125,11 +118,17 @@ def test_assign_sets_assignee_and_audits(store):
     assert [e.action for e in store.audit(t.id)] == ["created", "assign"]
 
 
-def test_reassign_marks_reassigned(store):
+def test_assign_changes_assignee_but_not_reassigned_flag(store):
     t = store.create_task("acme", "x", "cli")
     store.assign(t.id, Role.JUNIOR)
     t = store.assign(t.id, Role.SENIOR)
-    assert t.assignee == Role.SENIOR and t.reassigned is True
+    assert t.assignee == Role.SENIOR and t.reassigned is False
+    assert store.get(t.id).reassigned is False
+
+
+def test_assign_unknown_task_raises_key_error(store):
+    with pytest.raises(KeyError):
+        store.assign(999, Role.JUNIOR)
 
 
 def test_meta_roundtrip(store):

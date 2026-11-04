@@ -152,14 +152,45 @@ class TaskStore:
         with self._sessions.begin() as session:
             row = self._task(session, task_id)
             previous = row.assignee
-            if previous is not None and previous != role.value:
-                row.reassigned = True
             row.assignee = role.value
             row.updated_at = utcnow()
             self._audit(
                 session, task_id, role, "assign", {"from": previous, "to": role.value}
             )
             return _record(row)
+
+    def reassign_to_senior(self, task_id: int) -> TaskRecord:
+        with self._sessions.begin() as session:
+            # Atomic once-only guard: of two concurrent callers, one matches no row.
+            result = session.execute(
+                update(TaskRow)
+                .where(
+                    TaskRow.id == task_id,
+                    TaskRow.reassigned.is_(False),
+                    TaskRow.assignee == Role.JUNIOR.value,
+                )
+                .values(
+                    assignee=Role.SENIOR.value,
+                    round=0,
+                    reassigned=True,
+                    updated_at=utcnow(),
+                )
+            )
+            if result.rowcount == 0:
+                row = self._task(session, task_id)  # unknown id -> KeyError
+                if row.reassigned:
+                    raise ValueError(
+                        f"task {task_id} was already reassigned; once only"
+                    )
+                raise ValueError(
+                    f"task {task_id} is not junior (assignee: {row.assignee}); "
+                    "only a junior task can be handed to senior"
+                )
+            # System decision (stop rules), not an agent action: no actor.
+            self._audit(session, task_id, None, "reassigned", {"to": Role.SENIOR.value})
+            session.flush()
+            session.expire_all()
+            return _record(self._task(session, task_id))
 
     def record_cost(
         self, task_id: int, actor: Role, usd: float, detail: dict
