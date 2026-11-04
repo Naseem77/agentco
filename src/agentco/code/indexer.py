@@ -95,9 +95,10 @@ async def index_repo(repo: str, root: Path, code: ScopedCodeGraph) -> IndexRepor
     for path in gone:
         await code.delete_file(repo, path)
 
+    # Compared on every run so a crash between the upserts and replace_calls heals itself.
     calls = 0
-    if indexed or gone:
-        edges = resolve_calls(await code.all_symbols(repo))
+    edges = resolve_calls(await code.all_symbols(repo))
+    if indexed or gone or edges != await code.call_edges(repo):
         await code.replace_calls(repo, edges)
         calls = len(edges)
     return IndexReport(indexed, unchanged, len(gone), skipped, calls)

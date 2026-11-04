@@ -234,3 +234,64 @@ async def test_conflicted_file_is_indexed_once(tmp_path):
 
     assert report == IndexReport(indexed=1, unchanged=0, deleted=0, skipped=0, calls=0)
     assert backend.upserts == 1
+
+
+async def test_interrupted_reindex_then_revert_is_reindexed(tmp_path):
+    root = git_repo(tmp_path / "repo", {"a.py": "def f():\n    pass\n"})
+    backend = InMemoryCodeGraph()
+    code = librarian(backend)
+    await index_repo("o/r", root, code)
+
+    (root / "a.py").write_text("def g():\n    pass\n")
+    backend.interrupt_upserts = True
+    with pytest.raises(RuntimeError):
+        await index_repo("o/r", root, code)
+    backend.interrupt_upserts = False
+
+    (root / "a.py").write_text("def f():\n    pass\n")
+    report = await index_repo("o/r", root, code)
+    assert report == IndexReport(indexed=1, unchanged=0, deleted=0, skipped=0, calls=0)
+    assert [s.qualname for s in await backend.symbols_in(GRAPH, "o/r", "a.py")] == ["f"]
+
+
+async def test_crash_before_replace_calls_is_repaired_by_the_next_run(tmp_path):
+    root = git_repo(
+        tmp_path / "repo", {"a.py": "def f():\n    g()\n\n\ndef g():\n    pass\n"}
+    )
+    backend = InMemoryCodeGraph()
+    code = librarian(backend)
+    original = backend.replace_calls
+
+    async def crash(graph, repo, edges):
+        raise RuntimeError("crashed after the upserts")
+
+    backend.replace_calls = crash
+    with pytest.raises(RuntimeError):
+        await index_repo("o/r", root, code)
+    assert await backend.call_edges(GRAPH, "o/r") == []
+
+    backend.replace_calls = original
+    report = await index_repo("o/r", root, code)
+    assert report == IndexReport(indexed=0, unchanged=1, deleted=0, skipped=0, calls=1)
+    assert await backend.call_edges(GRAPH, "o/r") == [
+        CallEdge("a.py", "f", "a.py", "g")
+    ]
+
+
+async def test_unchanged_run_does_not_rewrite_correct_calls(tmp_path):
+    root = git_repo(
+        tmp_path / "repo", {"a.py": "def f():\n    g()\n\n\ndef g(): pass\n"}
+    )
+    backend = InMemoryCodeGraph()
+    code = librarian(backend)
+    await index_repo("o/r", root, code)
+    calls = []
+    original = backend.replace_calls
+
+    async def spy(graph, repo, edges):
+        calls.append(edges)
+        await original(graph, repo, edges)
+
+    backend.replace_calls = spy
+    report = await index_repo("o/r", root, code)
+    assert (report.calls, calls) == (0, [])

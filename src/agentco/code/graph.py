@@ -50,14 +50,16 @@ class _Repo:
     files: dict[str, FileStructure]
     calls: list[CallEdge]
     links: set[tuple[str, str, str]]  # (episode, path, qualname)
+    unfinished: set[str]  # paths whose last upsert was interrupted before its hash
 
 
 class InMemoryCodeGraph:
     def __init__(self) -> None:
         self._repos: dict[tuple[str, str], _Repo] = defaultdict(
-            lambda: _Repo({}, [], set())
+            lambda: _Repo({}, [], set(), set())
         )
         self.upserts = 0
+        self.interrupt_upserts = False  # test hook: upserts stop before the hash is set
 
     def _repo(self, graph: str, repo: str) -> _Repo:
         return self._repos[(graph, repo)]
@@ -74,11 +76,15 @@ class InMemoryCodeGraph:
         return None
 
     async def file_hashes(self, graph: str, repo: str) -> dict[str, str]:
-        return {p: fs.hash for p, fs in self._repo(graph, repo).files.items()}
+        state = self._repo(graph, repo)
+        return {
+            p: fs.hash for p, fs in state.files.items() if p not in state.unfinished
+        }
 
     async def upsert_file(self, graph: str, repo: str, fs: FileStructure) -> None:
         self.upserts += 1
         state = self._repo(graph, repo)
+        state.unfinished.add(fs.path)  # like a DB: no hash until the upsert is done
         state.files[fs.path] = fs
         present = {(fs.path, s.qualname) for s in fs.symbols}
         state.links = {
@@ -93,10 +99,14 @@ class InMemoryCodeGraph:
             if (e.caller_path != fs.path or (e.caller_path, e.caller) in present)
             and (e.callee_path != fs.path or (e.callee_path, e.callee) in present)
         ]
+        if self.interrupt_upserts:
+            raise RuntimeError("upsert interrupted")
+        state.unfinished.discard(fs.path)
 
     async def delete_file(self, graph: str, repo: str, path: str) -> None:
         state = self._repo(graph, repo)
         state.files.pop(path, None)
+        state.unfinished.discard(path)
         state.links = {link for link in state.links if link[1] != path}
         state.calls = [
             e for e in state.calls if path not in (e.caller_path, e.callee_path)
@@ -107,7 +117,12 @@ class InMemoryCodeGraph:
         return list(fs.symbols) if fs else []
 
     async def all_symbols(self, graph: str, repo: str) -> dict[str, list[Symbol]]:
-        return {p: list(fs.symbols) for p, fs in self._repo(graph, repo).files.items()}
+        state = self._repo(graph, repo)
+        return {
+            p: list(fs.symbols)
+            for p, fs in state.files.items()
+            if p not in state.unfinished
+        }
 
     async def replace_calls(self, graph: str, repo: str, edges: list[CallEdge]) -> None:
         self._repo(graph, repo).calls = sorted(set(edges))
