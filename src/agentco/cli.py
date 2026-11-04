@@ -9,7 +9,11 @@ import openai
 import redis.exceptions
 import typer
 
+from agentco.code.falkor_graph import build_falkor_code_graph
+from agentco.code.graph import CodeGraphBackend, code_graph_for
+from agentco.code.indexer import index_repo
 from agentco.config import ConfigError, TenantConfig, family_warnings, load_config
+from agentco.github.client import validate_repo
 from agentco.memory.backend import MemoryBackend
 from agentco.memory.gate import MemoryGate
 from agentco.memory.graphiti_backend import build_graphiti_backend
@@ -20,6 +24,9 @@ from agentco.store.task_store import TaskStore
 
 # Seam: CLI tests replace this with an in-memory backend.
 make_backend: Callable[[TenantConfig], MemoryBackend] = build_graphiti_backend
+
+# Seam: CLI tests replace this with an in-memory code graph.
+make_code_graph: Callable[[TenantConfig], CodeGraphBackend] = build_falkor_code_graph
 
 app = typer.Typer(no_args_is_help=True, help="A company of AI agents.")
 memory_app = typer.Typer(no_args_is_help=True, help="Query company memory.")
@@ -104,3 +111,27 @@ def task_new(title: str, config: Path = ConfigOption) -> None:
     store = TaskStore(cfg.database_url)
     store.create_all()
     typer.echo(store.create_task(cfg.tenant, title, source="cli").id)
+
+
+@app.command()
+def index(
+    repo: Annotated[str, typer.Option("--repo", help="GitHub repo as OWNER/NAME.")],
+    repo_path: Annotated[
+        Path, typer.Option("--repo-path", help="Local checkout to index.")
+    ],
+    config: Path = ConfigOption,
+) -> None:
+    """Index a checkout's code structure into the code graph (incremental)."""
+    cfg = _load(config)
+    try:
+        validate_repo(repo)
+        with _falkordb_guard(cfg):
+            code = code_graph_for(cfg.tenant, Role.LIBRARIAN, make_code_graph(cfg))
+            report = asyncio.run(index_repo(repo, repo_path, code))
+    except ValueError as e:
+        typer.echo(str(e))
+        raise typer.Exit(1) from e
+    typer.echo(
+        f"indexed {report.indexed}, unchanged {report.unchanged}, "
+        f"deleted {report.deleted}, skipped {report.skipped}, calls {report.calls}"
+    )
