@@ -2,7 +2,7 @@ import pytest
 
 from agentco.config import Budgets
 from agentco.roles import Role
-from agentco.store.models import TaskRecord
+from agentco.store.models import TaskRecord, TaskRow
 from agentco.workflow.states import TaskState
 from agentco.workflow.stop_rules import StopDecision, apply_stop_rules
 
@@ -80,3 +80,34 @@ def test_reassign_twice_raises_and_writes_no_audit(store):
 def test_reassign_unknown_task_raises_key_error(store):
     with pytest.raises(KeyError):
         store.reassign_to_senior(999)
+
+
+def _stuck_at_round_3(store, task_id):
+    with store._sessions.begin() as session:
+        session.get(TaskRow, task_id).round = 3
+
+
+@pytest.mark.parametrize(
+    "path",
+    [[Role.TRIAGE, Role.JUNIOR], [Role.JUNIOR, Role.SENIOR, Role.JUNIOR]],
+)
+def test_prior_assign_changes_do_not_skip_senior_handoff(store, path):
+    t = store.create_task("acme", "x", "cli")
+    for role in path:
+        store.assign(t.id, role)
+    _stuck_at_round_3(store, t.id)
+    task = store.get(t.id)
+    assert task.assignee == Role.JUNIOR and task.reassigned is False
+    assert apply_stop_rules(task, B) is StopDecision.REASSIGN_SENIOR
+
+
+@pytest.mark.parametrize("role", [Role.SENIOR, None, Role.LEAD])
+def test_reassign_requires_junior_assignee_and_writes_no_audit(store, role):
+    t = store.create_task("acme", "x", "cli")
+    if role is not None:
+        store.assign(t.id, role)
+    audit_len = len(store.audit(t.id))
+    with pytest.raises(ValueError, match="not junior"):
+        store.reassign_to_senior(t.id)
+    assert len(store.audit(t.id)) == audit_len
+    assert store.get(t.id).reassigned is False
