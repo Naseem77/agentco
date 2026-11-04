@@ -77,8 +77,8 @@ def memory_search(
 ) -> None:
     """Search the graphs a role may read; prints graph<TAB>fact per result."""
     cfg = _load(config)
-    mem = MemoryGate(cfg.tenant, make_backend(cfg)).for_role(role)
     with _falkordb_guard(cfg):
+        mem = MemoryGate(cfg.tenant, make_backend(cfg)).for_role(role)
         facts = asyncio.run(mem.search(query))
     for fact in facts:
         typer.echo(f"{fact.graph}\t{fact.text}")

@@ -108,6 +108,58 @@ def test_init_backend_down_exits_2_and_does_not_mark_seeded(
     assert store.get_meta("seed_version") is None
 
 
+def _raise(error):
+    def factory(cfg):
+        raise error
+
+    return factory
+
+
+class SearchFailingBackend(InMemoryBackend):
+    def __init__(self, error: Exception) -> None:
+        super().__init__()
+        self._error = error
+
+    async def search(self, graphs, query, limit):
+        raise self._error
+
+
+DOWN_ERRORS = [ConnectionError("x"), redis.exceptions.ConnectionError("x")]
+
+
+@pytest.mark.parametrize("error", DOWN_ERRORS)
+def test_init_backend_construction_down_exits_2(tmp_path, monkeypatch, error):
+    monkeypatch.setattr(cli, "make_backend", _raise(error))
+    config = _write_config(tmp_path)
+    result = runner.invoke(cli.app, ["init", "--config", str(config)])
+    assert result.exit_code == 2
+    assert result.stdout.splitlines()[-1] == "cannot reach FalkorDB at localhost:6379"
+    store = TaskStore(f"sqlite:///{tmp_path}/state.db")
+    assert store.get_meta("seed_version") is None
+
+
+@pytest.mark.parametrize("error", DOWN_ERRORS)
+def test_search_backend_construction_down_exits_2(tmp_path, monkeypatch, error):
+    monkeypatch.setattr(cli, "make_backend", _raise(error))
+    config = _write_config(tmp_path)
+    result = runner.invoke(
+        cli.app, ["memory", "search", "x", "--as", "qa", "--config", str(config)]
+    )
+    assert result.exit_code == 2
+    assert result.stdout.splitlines() == ["cannot reach FalkorDB at localhost:6379"]
+
+
+@pytest.mark.parametrize("error", DOWN_ERRORS)
+def test_search_backend_down_exits_2(tmp_path, monkeypatch, error):
+    monkeypatch.setattr(cli, "make_backend", lambda cfg: SearchFailingBackend(error))
+    config = _write_config(tmp_path)
+    result = runner.invoke(
+        cli.app, ["memory", "search", "x", "--as", "qa", "--config", str(config)]
+    )
+    assert result.exit_code == 2
+    assert result.stdout.splitlines() == ["cannot reach FalkorDB at localhost:6379"]
+
+
 def test_init_bad_config_exits_1(tmp_path):
     bad = tmp_path / "bad.yml"
     bad.write_text("- not a mapping\n")
