@@ -93,3 +93,8 @@ def test_non_mapping_yaml_is_config_error(tmp_path):
 def test_invalid_schema_is_config_error(tmp_path):
     with pytest.raises(ConfigError):
         load_config(write(tmp_path, EXAMPLE.replace("tenant: acme\n", "")))
+
+
+def test_config_rejects_bad_tenant(tmp_path):
+    with pytest.raises(ConfigError, match="tenant"):
+        load_config(write(tmp_path, EXAMPLE.replace("tenant: acme", "tenant: acme__x")))
