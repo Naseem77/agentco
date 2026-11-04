@@ -1,0 +1,26 @@
+[project]
+name = "agentco"
+version = "0.1.0"
+description = "A company of AI agents with per-role access to Graphiti/FalkorDB graphs"
+authors = [
+    { name = "Naseem Ali", email = "34807727+Naseem77@users.noreply.github.com" }
+]
+requires-python = ">=3.12"
+dependencies = [
+    "graphiti-core[falkordb]>=0.30,<0.31",
+    "sqlalchemy>=2",
+    "pydantic>=2",
+    "pyyaml",
+    "typer",
+]
+
+[build-system]
+requires = ["uv_build>=0.12.23,<0.13.0"]
+build-backend = "uv_build"
+
+[dependency-groups]
+dev = ["pytest", "pytest-asyncio", "ruff"]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+markers = ["integration: needs FalkorDB + LLM key"]
