@@ -1,6 +1,6 @@
 from pathlib import Path
 
-from sqlalchemy import create_engine, select
+from sqlalchemy import create_engine, select, update
 from sqlalchemy.engine import make_url
 from sqlalchemy.orm import Session, sessionmaker
 
@@ -47,7 +47,10 @@ class TaskStore:
             ":memory:",
         ):
             Path(db.database).parent.mkdir(parents=True, exist_ok=True)
-        self._engine = create_engine(url)
+        self._engine = create_engine(
+            url,
+            connect_args={"timeout": 30} if db.get_backend_name() == "sqlite" else {},
+        )
         self._sessions = sessionmaker(self._engine, expire_on_commit=False)
 
     def create_all(self) -> None:
@@ -58,6 +61,9 @@ class TaskStore:
         if row is None:
             raise KeyError(f"unknown task {task_id}")
         return row
+
+    def _current_state(self, session: Session, task_id: int) -> TaskState:
+        return TaskState(self._task(session, task_id).state)
 
     @staticmethod
     def _audit(
@@ -113,14 +119,24 @@ class TaskStore:
         self, task_id: int, to: TaskState, actor: Role, reason: str
     ) -> TaskRecord:
         with self._sessions.begin() as session:
-            row = self._task(session, task_id)
-            current = TaskState(row.state)
+            current = self._current_state(session, task_id)
             if to not in ALLOWED_TRANSITIONS[current]:
                 raise InvalidTransition(f"{current.value} -> {to.value} is not allowed")
-            if (current, to) in BACK_TO_FIRST_FLOOR:
-                row.round += 1
-            row.state = to.value
-            row.updated_at = utcnow()
+            # Compare-and-set on the state we validated against; a concurrent
+            # transition makes this match no rows.
+            result = session.execute(
+                update(TaskRow)
+                .where(TaskRow.id == task_id, TaskRow.state == current.value)
+                .values(
+                    state=to.value,
+                    round=TaskRow.round + int((current, to) in BACK_TO_FIRST_FLOOR),
+                    updated_at=utcnow(),
+                )
+            )
+            if result.rowcount == 0:
+                raise InvalidTransition(
+                    f"task {task_id} is no longer in state {current.value}"
+                )
             self._audit(
                 session,
                 task_id,
@@ -128,7 +144,9 @@ class TaskStore:
                 "transition",
                 {"from": current.value, "to": to.value, "reason": reason},
             )
-            return _record(row)
+            session.flush()
+            session.expire_all()
+            return _record(self._task(session, task_id))
 
     def assign(self, task_id: int, role: Role) -> TaskRecord:
         with self._sessions.begin() as session:
@@ -149,11 +167,17 @@ class TaskStore:
         if usd < 0:
             raise ValueError("usd must be non-negative")
         with self._sessions.begin() as session:
-            row = self._task(session, task_id)
-            row.cost_usd += usd
-            row.updated_at = utcnow()
+            result = session.execute(
+                update(TaskRow)
+                .where(TaskRow.id == task_id)
+                .values(cost_usd=TaskRow.cost_usd + usd, updated_at=utcnow())
+            )
+            if result.rowcount == 0:
+                raise KeyError(f"unknown task {task_id}")
             self._audit(session, task_id, actor, "cost", detail, usd)
-            return _record(row)
+            session.flush()
+            session.expire_all()
+            return _record(self._task(session, task_id))
 
     def audit(self, task_id: int) -> list[AuditEntry]:
         with self._sessions() as session:

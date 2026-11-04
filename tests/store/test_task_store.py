@@ -1,3 +1,5 @@
+import threading
+
 import pytest
 
 from agentco.roles import Role
@@ -161,3 +163,54 @@ def test_persists_across_instances(tmp_path):
     a.create_all()
     t = a.create_task("acme", "x", "cli")
     assert TaskStore(url).get(t.id).title == "x"
+
+
+def test_stale_state_transition_loses_compare_and_set(tmp_path, monkeypatch):
+    url = f"sqlite:///{tmp_path}/s.db"
+    first, second = TaskStore(url), TaskStore(url)
+    first.create_all()
+    t = first.create_task("acme", "x", "cli")
+    for state, actor in PATH[:6]:
+        first.transition(t.id, state, actor, "walk")
+    assert first.get(t.id).state == TaskState.LEAD_DECISION
+
+    # `second` read LEAD_DECISION before `first` moved the task on.
+    stale = second.get(t.id).state
+    first.transition(t.id, TaskState.TRIAGE, Role.LEAD, "QA failed")
+    monkeypatch.setattr(TaskStore, "_current_state", lambda self, s, i: stale)
+
+    with pytest.raises(InvalidTransition):
+        second.transition(t.id, TaskState.TRIAGE, Role.LEAD, "QA failed")
+
+    after = first.get(t.id)
+    assert (after.state, after.round) == (TaskState.TRIAGE, 1)
+    moves = [e for e in first.audit(t.id) if e.action == "transition"]
+    assert sum(e.detail["reason"] == "QA failed" for e in moves) == 1
+
+
+def test_concurrent_record_cost_sums_exactly(tmp_path):
+    url = f"sqlite:///{tmp_path}/s.db"
+    seed = TaskStore(url)
+    seed.create_all()
+    t = seed.create_task("acme", "x", "cli")
+    threads, per_thread, usd = 8, 10, 0.25
+    errors = []
+
+    def work():
+        try:
+            s = TaskStore(url)
+            for _ in range(per_thread):
+                s.record_cost(t.id, Role.PM, usd, {})
+        except Exception as e:  # noqa: BLE001
+            errors.append(e)
+
+    ts = [threading.Thread(target=work) for _ in range(threads)]
+    for th in ts:
+        th.start()
+    for th in ts:
+        th.join()
+
+    assert errors == []
+    assert seed.get(t.id).cost_usd == pytest.approx(threads * per_thread * usd)
+    costs = [e for e in seed.audit(t.id) if e.action == "cost"]
+    assert len(costs) == threads * per_thread
