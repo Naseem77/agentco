@@ -36,18 +36,28 @@ def tracked_files(root: Path) -> list[str]:
     if result.returncode != 0:
         raise NotAGitRepo(f"{root} is not a git repository")
     names = result.stdout.decode("utf-8", errors="replace").split("\0")
-    return [name for name in names if name]
+    # Unmerged paths are listed once per index stage.
+    return list(dict.fromkeys(name for name in names if name))
+
+
+class _Unreadable(Exception):
+    """The file may still be indexable (permissions, EIO, ...); keep its graph data."""
 
 
 def _read_indexable(path: Path) -> bytes | None:
-    """File bytes, or None for anything that is not a regular file within the size cap."""
+    """File bytes; None if missing, not a regular file, or over the size cap.
+
+    Raises _Unreadable for any other OS error.
+    """
     try:
         info = path.lstat()
         if not stat.S_ISREG(info.st_mode) or info.st_size > MAX_FILE_BYTES:
             return None
         data = path.read_bytes()
-    except OSError:
+    except (FileNotFoundError, NotADirectoryError):
         return None
+    except OSError as e:
+        raise _Unreadable from e
     return data if len(data) <= MAX_FILE_BYTES else None
 
 
@@ -59,7 +69,12 @@ async def index_repo(repo: str, root: Path, code: ScopedCodeGraph) -> IndexRepor
     indexed = unchanged = skipped = 0
     present: set[str] = set()
     for path in tracked:
-        data = _read_indexable(root / path)
+        try:
+            data = _read_indexable(root / path)
+        except _Unreadable:
+            present.add(path)
+            skipped += 1
+            continue
         if data is None:
             skipped += 1
             continue

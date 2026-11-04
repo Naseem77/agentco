@@ -121,7 +121,10 @@ def index(
     ],
     config: Path = ConfigOption,
 ) -> None:
-    """Index a checkout's code structure into the code graph (incremental)."""
+    """Index a checkout's code structure into the code graph (incremental).
+
+    Note: skipped counts working-tree files and deleted counts graph removals, so a file can be in both.
+    """
     cfg = _load(config)
     try:
         validate_repo(repo)

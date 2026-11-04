@@ -1,5 +1,6 @@
 import os
 import subprocess
+from pathlib import Path
 
 import pytest
 
@@ -178,3 +179,58 @@ async def test_role_without_rnd_write_is_denied(tmp_path):
         await index_repo("o/r", root, code_graph_for("acme", Role.QA, backend))
     assert str(exc.value) == "role qa may not write scope rnd"
     assert backend.upserts == 0
+
+
+async def test_unreadable_file_keeps_graph_data(tmp_path, monkeypatch):
+    root = git_repo(tmp_path / "repo", {"a.py": "def f(): pass\n", "b.py": "x = 1\n"})
+    backend = InMemoryCodeGraph()
+    code = librarian(backend)
+    await index_repo("o/r", root, code)
+    assert await code.link_episode("o/r", "ep1", "a.py", "f") is True
+
+    real_read_bytes = Path.read_bytes
+
+    def read_bytes(self):
+        if self.name == "a.py":
+            raise PermissionError(13, "Permission denied")
+        return real_read_bytes(self)
+
+    monkeypatch.setattr(Path, "read_bytes", read_bytes)
+    report = await index_repo("o/r", root, code)
+
+    assert report == IndexReport(indexed=0, unchanged=1, deleted=0, skipped=1, calls=0)
+    assert sorted(await backend.file_hashes(GRAPH, "o/r")) == ["a.py", "b.py"]
+    assert [s.name for s in await backend.symbols_in(GRAPH, "o/r", "a.py")] == ["f"]
+    assert backend.links(GRAPH) == {("ep1", "a.py", "f")}
+
+
+def conflicted_repo(root):
+    git_repo(root, {"a.py": "def f(): pass\n"})
+    ident = ["-c", "user.name=t", "-c", "user.email=t@t"]
+    git(root, *ident, "commit", "-q", "-m", "base")
+    git(root, "checkout", "-q", "-b", "other")
+    (root / "a.py").write_text("def other(): pass\n")
+    git(root, *ident, "commit", "-q", "-am", "other")
+    git(root, "checkout", "-q", "-")
+    (root / "a.py").write_text("def mine(): pass\n")
+    git(root, *ident, "commit", "-q", "-am", "mine")
+    merge = subprocess.run(
+        ["git", "-C", str(root), *ident, "merge", "other"],
+        capture_output=True,
+        check=False,
+    )
+    assert merge.returncode != 0
+    staged = subprocess.run(
+        ["git", "-C", str(root), "ls-files", "-z"], capture_output=True, check=True
+    )
+    assert staged.stdout == b"a.py\0a.py\0a.py\0"
+    return root
+
+
+async def test_conflicted_file_is_indexed_once(tmp_path):
+    root = conflicted_repo(tmp_path / "repo")
+    backend = InMemoryCodeGraph()
+    report = await index_repo("o/r", root, librarian(backend))
+
+    assert report == IndexReport(indexed=1, unchanged=0, deleted=0, skipped=0, calls=0)
+    assert backend.upserts == 1
