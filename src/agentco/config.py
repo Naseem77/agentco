@@ -1,7 +1,8 @@
 from pathlib import Path
 
 import yaml
-from pydantic import BaseModel, ValidationError, field_validator
+from pydantic import BaseModel, ConfigDict, Field, ValidationError, field_validator
+from sqlalchemy.engine import make_url
 
 from agentco.memory.scopes import TENANT_RE
 from agentco.roles import Role
@@ -15,16 +16,22 @@ class ConfigError(ValueError):
 
 
 class RoleModel(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
     model: str
     family: str
 
 
 class Budgets(BaseModel):
-    per_task_usd: float = 5
-    max_rounds: int = 3
+    model_config = ConfigDict(extra="forbid")
+
+    per_task_usd: float = Field(5, gt=0, allow_inf_nan=False)
+    max_rounds: int = Field(3, gt=0)
 
 
 class TenantConfig(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
     tenant: str
     falkordb_host: str = "localhost"
     falkordb_port: int = 6379
@@ -40,9 +47,22 @@ class TenantConfig(BaseModel):
         return v
 
 
+def _anchor_sqlite_url(url: str, base: Path) -> str:
+    db = make_url(url)
+    if db.get_backend_name() != "sqlite" or db.database in (None, "", ":memory:"):
+        return url
+    if Path(db.database).is_absolute():
+        return url
+    anchored = db.set(database=str(base / db.database))
+    return anchored.render_as_string(hide_password=False)
+
+
 def load_config(path: Path) -> TenantConfig:
+    path = Path(path)
     try:
-        raw = yaml.safe_load(Path(path).read_text())
+        raw = yaml.safe_load(path.read_text(encoding="utf-8"))
+    except UnicodeDecodeError as e:
+        raise ConfigError(f"config {path} is not valid UTF-8: {e}") from e
     except OSError as e:
         raise ConfigError(f"cannot read config {path}: {e}") from e
     except yaml.YAMLError as e:
@@ -53,6 +73,7 @@ def load_config(path: Path) -> TenantConfig:
         cfg = TenantConfig.model_validate(raw)
     except ValidationError as e:
         raise ConfigError(f"invalid config {path}: {e}") from e
+    cfg.database_url = _anchor_sqlite_url(cfg.database_url, path.resolve().parent)
 
     missing = [r.value for r in Role if r is not Role.HUMAN and r not in cfg.roles]
     if missing:
