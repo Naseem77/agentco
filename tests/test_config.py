@@ -48,7 +48,7 @@ def test_loads_example_config(tmp_path):
     assert cfg.roles[Role.QA].family == "openai"
     assert cfg.budgets.per_task_usd == 5 and cfg.budgets.max_rounds == 3
     assert cfg.falkordb_host == "localhost" and cfg.falkordb_port == 6379
-    assert cfg.database_url == "sqlite:///.agentco/state.db"
+    assert cfg.database_url == f"sqlite:///{tmp_path.resolve()}/.agentco/state.db"
     assert family_warnings(cfg) == []
 
 
@@ -95,6 +95,106 @@ def test_invalid_schema_is_config_error(tmp_path):
         load_config(write(tmp_path, EXAMPLE.replace("tenant: acme\n", "")))
 
 
+def error_locs(exc_info) -> list[tuple]:
+    return [e["loc"] for e in exc_info.value.__cause__.errors()]
+
+
 def test_config_rejects_bad_tenant(tmp_path):
-    with pytest.raises(ConfigError, match="tenant"):
+    with pytest.raises(ConfigError) as exc:
         load_config(write(tmp_path, EXAMPLE.replace("tenant: acme", "tenant: acme__x")))
+    assert error_locs(exc) == [("tenant",)]
+
+
+def test_tenant_length_boundary(tmp_path):
+    ok = "a" * 31
+    cfg = load_config(write(tmp_path, EXAMPLE.replace("tenant: acme", f"tenant: {ok}")))
+    assert cfg.tenant == ok
+    with pytest.raises(ConfigError) as exc:
+        load_config(
+            write(tmp_path, EXAMPLE.replace("tenant: acme", f"tenant: {'a' * 32}"))
+        )
+    assert error_locs(exc) == [("tenant",)]
+
+
+@pytest.mark.parametrize("bad", ['"acme\\n"', "Acme"])
+def test_tenant_rejects_trailing_newline_and_uppercase(tmp_path, bad):
+    with pytest.raises(ConfigError) as exc:
+        load_config(write(tmp_path, EXAMPLE.replace("tenant: acme", f"tenant: {bad}")))
+    assert error_locs(exc) == [("tenant",)]
+
+
+def test_unknown_top_level_key_is_error(tmp_path):
+    with pytest.raises(ConfigError) as exc:
+        load_config(write(tmp_path, EXAMPLE + "falkordb_hots: example\n"))
+    assert error_locs(exc) == [("falkordb_hots",)]
+
+
+def test_unknown_budget_key_is_error(tmp_path):
+    with pytest.raises(ConfigError) as exc:
+        load_config(write(tmp_path, EXAMPLE.replace("max_rounds", "max_round")))
+    assert error_locs(exc) == [("budgets", "max_round")]
+
+
+def test_unknown_role_model_key_is_error(tmp_path):
+    text = EXAMPLE.replace(
+        "pm:        { model: fast-cheap, family: anthropic }",
+        "pm:        { model: fast-cheap, family: anthropic, famly: x }",
+    )
+    with pytest.raises(ConfigError) as exc:
+        load_config(write(tmp_path, text))
+    assert error_locs(exc) == [("roles", "pm", "famly")]
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("per_task_usd", "0"),
+        ("per_task_usd", "-1"),
+        ("per_task_usd", ".nan"),
+        ("per_task_usd", ".inf"),
+        ("max_rounds", "0"),
+        ("max_rounds", "-2"),
+    ],
+)
+def test_budgets_must_be_positive_and_finite(tmp_path, field, value):
+    text = EXAMPLE.split("budgets:")[0] + f"budgets:\n  {field}: {value}\n"
+    with pytest.raises(ConfigError) as exc:
+        load_config(write(tmp_path, text))
+    assert error_locs(exc) == [("budgets", field)]
+
+
+def test_non_utf8_config_is_config_error(tmp_path):
+    path = tmp_path / "tenant.yaml"
+    path.write_bytes(b"tenant: \xff\xfe\n")
+    with pytest.raises(ConfigError) as exc:
+        load_config(path)
+    assert isinstance(exc.value.__cause__, UnicodeDecodeError)
+    assert str(exc.value).startswith(f"config {path} is not valid UTF-8: ")
+
+
+def test_relative_sqlite_url_resolves_against_config_dir(tmp_path):
+    cfg = load_config(write(tmp_path, EXAMPLE))
+    assert cfg.database_url == f"sqlite:///{tmp_path.resolve()}/.agentco/state.db"
+
+
+def test_relative_sqlite_url_independent_of_cwd(tmp_path, monkeypatch):
+    path = write(tmp_path, EXAMPLE)
+    elsewhere = tmp_path / "elsewhere"
+    elsewhere.mkdir()
+    monkeypatch.chdir(elsewhere)
+    cfg = load_config(path)
+    assert cfg.database_url == f"sqlite:///{tmp_path.resolve()}/.agentco/state.db"
+
+
+@pytest.mark.parametrize(
+    "url",
+    [
+        "sqlite:////var/lib/agentco/state.db",
+        "sqlite://",
+        "sqlite:///:memory:",
+        "postgresql://user:pw@db.example/agentco",
+    ],
+)
+def test_other_database_urls_unchanged(tmp_path, url):
+    cfg = load_config(write(tmp_path, EXAMPLE + f'database_url: "{url}"\n'))
+    assert cfg.database_url == url
