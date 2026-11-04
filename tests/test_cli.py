@@ -1,3 +1,4 @@
+import openai
 import pytest
 import redis.exceptions
 import yaml
@@ -94,7 +95,12 @@ def test_init_twice_says_already_seeded(env):
 
 
 @pytest.mark.parametrize(
-    "error", [ConnectionError("x"), redis.exceptions.ConnectionError("x")]
+    "error",
+    [
+        ConnectionError("x"),
+        redis.exceptions.ConnectionError("x"),
+        redis.exceptions.TimeoutError("x"),
+    ],
 )
 def test_init_backend_down_exits_2_and_does_not_mark_seeded(
     tmp_path, monkeypatch, error
@@ -124,7 +130,13 @@ class SearchFailingBackend(InMemoryBackend):
         raise self._error
 
 
-DOWN_ERRORS = [ConnectionError("x"), redis.exceptions.ConnectionError("x")]
+DOWN_ERRORS = [
+    ConnectionError("x"),
+    redis.exceptions.ConnectionError("x"),
+    redis.exceptions.TimeoutError("x"),
+]
+LLM_ERROR = openai.OpenAIError("Missing credentials.\nSet OPENAI_API_KEY.")
+LLM_LINE = "cannot create LLM client: Missing credentials. Set OPENAI_API_KEY."
 
 
 @pytest.mark.parametrize("error", DOWN_ERRORS)
@@ -198,3 +210,23 @@ def test_task_new_prints_id(env):
         "cli",
         "acme",
     )
+
+
+def test_init_llm_client_error_exits_1_and_does_not_mark_seeded(tmp_path, monkeypatch):
+    monkeypatch.setattr(cli, "make_backend", _raise(LLM_ERROR))
+    config = _write_config(tmp_path)
+    result = runner.invoke(cli.app, ["init", "--config", str(config)])
+    assert result.exit_code == 1
+    assert result.stdout.splitlines() == [LLM_LINE]
+    store = TaskStore(f"sqlite:///{tmp_path}/state.db")
+    assert store.get_meta("seed_version") is None
+
+
+def test_search_llm_client_error_exits_1(tmp_path, monkeypatch):
+    monkeypatch.setattr(cli, "make_backend", _raise(LLM_ERROR))
+    config = _write_config(tmp_path)
+    result = runner.invoke(
+        cli.app, ["memory", "search", "x", "--as", "qa", "--config", str(config)]
+    )
+    assert result.exit_code == 1
+    assert result.stdout.splitlines() == [LLM_LINE]

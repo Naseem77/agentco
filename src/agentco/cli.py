@@ -5,6 +5,7 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import Annotated
 
+import openai
 import redis.exceptions
 import typer
 
@@ -43,9 +44,21 @@ def _load(config: Path) -> TenantConfig:
 def _falkordb_guard(cfg: TenantConfig) -> Iterator[None]:
     try:
         yield
-    except (ConnectionError, redis.exceptions.ConnectionError) as e:
+    except (
+        ConnectionError,
+        redis.exceptions.ConnectionError,
+        redis.exceptions.TimeoutError,
+    ) as e:
         typer.echo(f"cannot reach FalkorDB at {cfg.falkordb_host}:{cfg.falkordb_port}")
         raise typer.Exit(2) from e
+
+
+def _build_backend(cfg: TenantConfig) -> MemoryBackend:
+    try:
+        return make_backend(cfg)
+    except openai.OpenAIError as e:
+        typer.echo(f"cannot create LLM client: {' '.join(str(e).split())}")
+        raise typer.Exit(1) from e
 
 
 @app.command()
@@ -58,7 +71,7 @@ def init(config: Path = ConfigOption) -> None:
     store.create_all()
 
     async def _run() -> bool:
-        backend = make_backend(cfg)
+        backend = _build_backend(cfg)
         for scope in Scope:
             await backend.ensure_graph(graph_name(cfg.tenant, scope))
         mem = MemoryGate(cfg.tenant, backend).for_role(Role.HUMAN)
@@ -78,7 +91,7 @@ def memory_search(
     """Search the graphs a role may read; prints graph<TAB>fact per result."""
     cfg = _load(config)
     with _falkordb_guard(cfg):
-        mem = MemoryGate(cfg.tenant, make_backend(cfg)).for_role(role)
+        mem = MemoryGate(cfg.tenant, _build_backend(cfg)).for_role(role)
         facts = asyncio.run(mem.search(query))
     for fact in facts:
         typer.echo(f"{fact.graph}\t{fact.text}")
