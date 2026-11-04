@@ -142,19 +142,35 @@ DEFAULT_ESCALATION_RULES: list[tuple[str, str, str]] = [
 ]
 
 
+def _seed_items(now: datetime) -> list[MemoryItem]:
+    # graphiti feeds only the body (not the type/category) to text extraction,
+    # so the body itself must say what kind of statement it is.
+    policies = [
+        MemoryItem(
+            f"policy:{slug}", f"Company policy ({slug}): {text}", "seed policy", now
+        )
+        for slug, text in SEED_POLICIES
+    ]
+    rules = [
+        MemoryItem(
+            f"escalation:{slug}",
+            f"Escalation rule (category={category}): {text}",
+            f"seed escalation rule ({category})",
+            now,
+        )
+        for slug, category, text in DEFAULT_ESCALATION_RULES
+    ]
+    return policies + rules
+
+
 async def seed_company(mem: ScopedMemory, store: TaskStore, now: datetime) -> bool:
     if store.get_meta("seed_version") == SEED_VERSION:
         return False
-    for slug, text in SEED_POLICIES:
-        await mem.add(
-            Scope.COMPANY, MemoryItem(f"policy:{slug}", text, "seed policy", now)
-        )
-    for slug, category, text in DEFAULT_ESCALATION_RULES:
-        await mem.add(
-            Scope.COMPANY,
-            MemoryItem(
-                f"escalation:{slug}", text, f"seed escalation rule ({category})", now
-            ),
-        )
+    for item in _seed_items(now):
+        marker = f"seed:{SEED_VERSION}:{item.name}"
+        if store.get_meta(marker) is not None:
+            continue
+        await mem.add(Scope.COMPANY, item)
+        store.set_meta(marker, "done")
     store.set_meta("seed_version", SEED_VERSION)
     return True
