@@ -23,10 +23,14 @@ class ScopedMemory:
     async def search(
         self, query: str, scopes: Iterable[Scope] | None = None, limit: int = 10
     ) -> list[Fact]:
-        requested = list(self.readable) if scopes is None else [Scope(s) for s in scopes]
+        requested = (
+            list(self.readable) if scopes is None else [Scope(s) for s in scopes]
+        )
         for scope in requested:
             if scope not in self.readable:
-                raise AccessDenied(f"role {self.role.value} may not read scope {scope.value}")
+                raise AccessDenied(
+                    f"role {self.role.value} may not read scope {scope.value}"
+                )
         if not requested:
             return []
         graphs = [graph_name(self.tenant, scope) for scope in dict.fromkeys(requested)]
@@ -35,7 +39,9 @@ class ScopedMemory:
     async def add(self, scope: Scope, item: MemoryItem) -> None:
         scope = Scope(scope)
         if scope not in ROLE_ACCESS[self.role].write:
-            raise AccessDenied(f"role {self.role.value} may not write scope {scope.value}")
+            raise AccessDenied(
+                f"role {self.role.value} may not write scope {scope.value}"
+            )
         await self.backend.add(graph_name(self.tenant, scope), scope, item)
 
 

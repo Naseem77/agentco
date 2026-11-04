@@ -23,7 +23,9 @@ class Access(NamedTuple):
 
 def graph_name(tenant: str, scope: Scope) -> str:
     if not TENANT_RE.fullmatch(tenant):
-        raise ValueError(f"invalid tenant name {tenant!r}: must match {TENANT_RE.pattern}")
+        raise ValueError(
+            f"invalid tenant name {tenant!r}: must match {TENANT_RE.pattern}"
+        )
     return f"{tenant}__{Scope(scope).value}"
 
 

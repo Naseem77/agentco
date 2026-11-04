@@ -23,7 +23,9 @@ async def test_qa_cannot_read_rnd():
 async def test_default_scopes_are_role_readable_only():
     backend = InMemoryBackend()
     gate = MemoryGate("acme", backend)
-    await gate.for_role(Role.LIBRARIAN).add(Scope.RND, item("engineer note: retry loop"))
+    await gate.for_role(Role.LIBRARIAN).add(
+        Scope.RND, item("engineer note: retry loop")
+    )
     await gate.for_role(Role.LIBRARIAN).add(Scope.QA, item("qa: retry loop flaky"))
     facts = await gate.for_role(Role.QA).search("retry")
     assert {f.graph for f in facts} == {"acme__qa"}
@@ -42,8 +44,14 @@ async def test_write_outside_role_denied():
 
 async def test_tenants_never_mix():
     backend = InMemoryBackend()
-    await MemoryGate("acme", backend).for_role(Role.LIBRARIAN).add(Scope.RND, item("acme secret"))
-    assert await MemoryGate("globex", backend).for_role(Role.LEAD).search("secret") == []
+    await (
+        MemoryGate("acme", backend)
+        .for_role(Role.LIBRARIAN)
+        .add(Scope.RND, item("acme secret"))
+    )
+    assert (
+        await MemoryGate("globex", backend).for_role(Role.LEAD).search("secret") == []
+    )
 
 
 async def test_denied_read_never_reaches_backend():
