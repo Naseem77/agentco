@@ -6,6 +6,7 @@ from collections.abc import Callable
 from pathlib import Path
 
 from agentco.code.graph import ScopedCodeGraph
+from agentco.code.indexer import MAX_FILE_BYTES
 from agentco.code.parse import (
     FileStructure,
     Symbol,
@@ -15,22 +16,26 @@ from agentco.code.parse import (
 )
 from agentco.github.models import GhPull, GhReviewComment
 
+GIT_SHOW_TIMEOUT_SECONDS = 10
 GitShow = Callable[[Path, str, str], bytes | None]
 
 
 def git_show(checkout: Path, commit: str, path: str) -> bytes | None:
     """File content at a commit, or None when git cannot produce it."""
-    if commit.startswith("-"):
+    if not commit.strip() or commit.startswith("-"):
         return None
     try:
         proc = subprocess.run(
             ["git", "-C", str(checkout), "show", f"{commit}:{path}"],
             capture_output=True,
             check=False,
+            timeout=GIT_SHOW_TIMEOUT_SECONDS,
         )
-    except OSError:
+    except (OSError, subprocess.SubprocessError):
         return None
-    return proc.stdout if proc.returncode == 0 else None
+    if proc.returncode != 0 or len(proc.stdout) > MAX_FILE_BYTES:
+        return None
+    return proc.stdout
 
 
 class SymbolLocator:

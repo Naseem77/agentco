@@ -75,9 +75,11 @@ def review_threads(
         root_id = _root_of(c, by_id)
         if root_id is None:
             skipped["orphan_reply"] += 1
+        elif root_id in skipped_roots:
+            skipped["skipped_root"] += 1
         elif root_id in roots and not c.author.is_bot:
             replies[root_id].append(c)
-        # replies under a skipped root, and bot replies, are dropped silently
+        # bot replies under a kept root are dropped silently
 
     threads = [
         ReviewThread(
@@ -112,13 +114,18 @@ def _cut(text: str, limit: int = TEXT_LIMIT) -> str:
     return text if len(text) <= limit else text[:limit] + _TRUNCATED
 
 
+def _indent(text: str) -> str:
+    """Indent every line so untrusted text cannot start a line at column 0."""
+    return "\n".join(f"  {line}" for line in text.splitlines())
+
+
 def _labels(issue: GhIssue) -> str:
     return ", ".join(issue.labels) or "none"
 
 
 def _with_body(head: str, body: str) -> str:
     body = body.strip()
-    return f"{head}\n\n{_cut(body)}" if body else head
+    return f"{head}\n\n{_indent(_cut(body))}" if body else head
 
 
 def issue_item(repo: str, issue: GhIssue) -> MemoryItem:
@@ -197,7 +204,7 @@ def review_item(
             f"(origin=human, module_path={module_of(root.path)})."
         ),
         _code_line(root, symbol),
-        f"Comment: {_cut(root.body)}",
+        f"Comment: {_indent(_cut(root.body)).lstrip()}",
     ]
     if thread.replies:
         lines.append("Discussion:")

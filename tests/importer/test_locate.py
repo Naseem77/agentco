@@ -1,10 +1,12 @@
 import subprocess
 from dataclasses import replace
 from pathlib import Path
+from unittest import mock
 
 from helpers import GRAPH_AT_H1, REPO, comment_101, pr3, thread_106
 
 from agentco.code.graph import InMemoryCodeGraph, ScopedCodeGraph, code_graph_for
+from agentco.code.indexer import MAX_FILE_BYTES
 from agentco.code.parse import parse_source
 from agentco.importer.locate import SymbolLocator, git_show
 from agentco.roles import Role
@@ -152,3 +154,32 @@ def test_git_show_real_repo(tmp_path):
     assert git_show(repo, first, "missing.py") is None
     assert git_show(repo, "--output=x", "a.py") is None
     assert git_show(tmp_path / "nope", first, "a.py") is None
+
+
+def test_git_show_blank_commit_is_none(tmp_path):
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    _git(repo, "init", "-q")
+    (repo / "a.py").write_bytes(b"one = 1\n")
+    _git(repo, "add", "a.py")
+    assert git_show(repo, "", "a.py") is None
+    assert git_show(repo, "  ", "a.py") is None
+
+
+def test_git_show_timeout_is_none():
+    err = subprocess.TimeoutExpired(["git"], 10)
+    with mock.patch("agentco.importer.locate.subprocess.run", side_effect=err) as run:
+        assert git_show(Path("/c"), "h1", "a.py") is None
+    assert run.call_args.kwargs["timeout"] == 10
+
+
+def test_git_show_oversized_blob_is_none():
+    def fake(argv, **kwargs):
+        size = MAX_FILE_BYTES + 1
+        return subprocess.CompletedProcess(argv, 0, stdout=b"x" * size, stderr=b"")
+
+    with mock.patch("agentco.importer.locate.subprocess.run", side_effect=fake):
+        assert git_show(Path("/c"), "h1", "a.py") is None
+    ok = subprocess.CompletedProcess([], 0, stdout=b"x" * MAX_FILE_BYTES, stderr=b"")
+    with mock.patch("agentco.importer.locate.subprocess.run", return_value=ok):
+        assert git_show(Path("/c"), "h1", "a.py") == b"x" * MAX_FILE_BYTES
