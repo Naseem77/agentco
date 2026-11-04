@@ -1,0 +1,59 @@
+[
+  [
+    {
+      "number": 1,
+      "title": "Graph switch flickers",
+      "body": "Switching graphs flashes the old one for a frame.",
+      "user": {"login": "alice", "type": "User"},
+      "state": "closed",
+      "state_reason": "completed",
+      "labels": [{"name": "bug"}],
+      "created_at": "2026-01-01T09:00:00Z",
+      "updated_at": "2026-01-01T09:00:00Z",
+      "closed_at": "2026-01-03T12:00:00Z",
+      "html_url": "https://github.com/acme-org/web/issues/1"
+    },
+    {
+      "number": 2,
+      "title": "Export graph as PNG",
+      "body": "Users want to export the current graph as an image.",
+      "user": {"login": "bob", "type": "User"},
+      "state": "open",
+      "state_reason": null,
+      "labels": [{"name": "enhancement"}],
+      "created_at": "2026-01-06T09:00:00Z",
+      "updated_at": "2026-01-06T09:00:00Z",
+      "closed_at": null,
+      "html_url": "https://github.com/acme-org/web/issues/2"
+    },
+    {
+      "number": 3,
+      "title": "Debounce graph switch",
+      "body": "Fixes #1",
+      "user": {"login": "carol", "type": "User"},
+      "state": "closed",
+      "state_reason": null,
+      "labels": [],
+      "created_at": "2026-01-03T09:00:00Z",
+      "updated_at": "2026-01-03T09:00:00Z",
+      "closed_at": "2026-01-03T12:00:00Z",
+      "html_url": "https://github.com/acme-org/web/pull/3",
+      "pull_request": {"url": "https://api.github.com/repos/acme-org/web/pulls/3"}
+    }
+  ],
+  [
+    {
+      "number": 4,
+      "title": "Dependency dashboard",
+      "body": "This issue lists Renovate updates.",
+      "user": {"login": "dependabot[bot]", "type": "Bot"},
+      "state": "open",
+      "state_reason": null,
+      "labels": [],
+      "created_at": "2026-01-02T09:00:00Z",
+      "updated_at": "2026-01-02T09:00:00Z",
+      "closed_at": null,
+      "html_url": "https://github.com/acme-org/web/issues/4"
+    }
+  ]
+]

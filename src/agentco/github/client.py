@@ -1,0 +1,168 @@
+import json
+import re
+import subprocess
+from collections.abc import Callable
+from datetime import UTC, datetime
+from pathlib import Path
+from typing import Protocol
+
+from agentco.github.models import (
+    GhIssue,
+    GhPull,
+    GhReviewComment,
+    parse_issue,
+    parse_pull,
+    parse_review_comment,
+)
+
+REPO_RE = re.compile(r"^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$")
+_GH_MISSING = (
+    "gh CLI not found; install it from https://cli.github.com and run gh auth login"
+)
+
+
+class GitHubError(RuntimeError):
+    pass
+
+
+def validate_repo(repo: str) -> str:
+    if not REPO_RE.match(repo) or any(part in (".", "..") for part in repo.split("/")):
+        raise ValueError(f"repo must look like owner/name, got {repo!r}")
+    return repo
+
+
+class GitHub(Protocol):
+    def issues(self, repo: str, since: datetime | None = None) -> list[GhIssue]: ...
+
+    def pulls(self, repo: str) -> list[GhPull]: ...
+
+    def review_comments(
+        self, repo: str, since: datetime | None = None
+    ) -> list[GhReviewComment]: ...
+
+    def pull_files(self, repo: str, number: int) -> list[str]: ...
+
+
+Runner = Callable[[list[str]], str]
+
+
+def _subprocess_runner(argv: list[str]) -> str:
+    try:
+        proc = subprocess.run(argv, capture_output=True, text=True, check=False)
+    except FileNotFoundError as e:
+        raise GitHubError(_GH_MISSING) from e
+    if proc.returncode != 0:
+        raise GitHubError(f"gh api failed: {proc.stderr.strip()}")
+    return proc.stdout
+
+
+def _utc(moment: datetime) -> datetime:
+    if moment.tzinfo is None:
+        return moment.replace(tzinfo=UTC)
+    return moment.astimezone(UTC)
+
+
+def _since_param(since: datetime) -> str:
+    return _utc(since).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def _flatten_pages(output: str) -> list[dict]:
+    try:
+        pages = json.loads(output)
+    except json.JSONDecodeError as e:
+        raise GitHubError(f"gh api returned invalid JSON: {e}") from e
+    return [item for page in pages for item in page]
+
+
+class GhCli:
+    def __init__(self, runner: Runner | None = None) -> None:
+        self._runner = runner or _subprocess_runner
+
+    def _get(self, path: str) -> list[dict]:
+        return _flatten_pages(
+            self._runner(["gh", "api", "--paginate", "--slurp", path])
+        )
+
+    def issues(self, repo: str, since: datetime | None = None) -> list[GhIssue]:
+        path = f"repos/{validate_repo(repo)}/issues?state=all&per_page=100&sort=created&direction=asc"
+        if since is not None:
+            path += f"&since={_since_param(since)}"
+        return [i for raw in self._get(path) if (i := parse_issue(raw))]
+
+    def pulls(self, repo: str) -> list[GhPull]:
+        path = f"repos/{validate_repo(repo)}/pulls?state=all&per_page=100&sort=created&direction=asc"
+        return [parse_pull(raw) for raw in self._get(path)]
+
+    def review_comments(
+        self, repo: str, since: datetime | None = None
+    ) -> list[GhReviewComment]:
+        path = f"repos/{validate_repo(repo)}/pulls/comments?per_page=100&sort=created&direction=asc"
+        if since is not None:
+            path += f"&since={_since_param(since)}"
+        return [parse_review_comment(raw) for raw in self._get(path)]
+
+    def pull_files(self, repo: str, number: int) -> list[str]:
+        path = f"repos/{validate_repo(repo)}/pulls/{number}/files?per_page=100"
+        return [raw["filename"] for raw in self._get(path)]
+
+
+class FakeGitHub:
+    """In-memory GitHub for tests; filters on `since` like the API does."""
+
+    def __init__(
+        self,
+        issues: list[GhIssue],
+        pulls: list[GhPull],
+        comments: list[GhReviewComment],
+        files: dict[int, list[str]],
+    ) -> None:
+        self._issues = issues
+        self._pulls = pulls
+        self._comments = comments
+        self._files = files
+        self.calls: list[tuple[str, object]] = []
+
+    @classmethod
+    def from_fixtures(cls, directory: Path) -> "FakeGitHub":
+        def load(name: str) -> list[dict]:
+            return _flatten_pages((directory / name).read_text())
+
+        issues = [i for raw in load("issues.json") if (i := parse_issue(raw))]
+        files = {
+            int(path.stem.removeprefix("pull_files_")): [
+                raw["filename"] for raw in load(path.name)
+            ]
+            for path in sorted(directory.glob("pull_files_*.json"))
+        }
+        return cls(
+            issues,
+            [parse_pull(raw) for raw in load("pulls.json")],
+            [parse_review_comment(raw) for raw in load("pull_comments.json")],
+            files,
+        )
+
+    def issues(self, repo: str, since: datetime | None = None) -> list[GhIssue]:
+        validate_repo(repo)
+        self.calls.append(("issues", since))
+        return [i for i in self._issues if _updated_since(i.updated_at, since)]
+
+    def pulls(self, repo: str) -> list[GhPull]:
+        validate_repo(repo)
+        self.calls.append(("pulls", None))
+        return list(self._pulls)
+
+    def review_comments(
+        self, repo: str, since: datetime | None = None
+    ) -> list[GhReviewComment]:
+        validate_repo(repo)
+        self.calls.append(("review_comments", since))
+        return [c for c in self._comments if _updated_since(c.updated_at, since)]
+
+    def pull_files(self, repo: str, number: int) -> list[str]:
+        validate_repo(repo)
+        self.calls.append(("pull_files", number))
+        return list(self._files.get(number, []))
+
+
+def _updated_since(updated_at: datetime, since: datetime | None) -> bool:
+    return since is None or _utc(updated_at) >= _utc(since)
