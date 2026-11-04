@@ -80,11 +80,13 @@ class FalkorCodeGraph:
         return {path: digest for path, digest in rows}
 
     async def upsert_file(self, graph: str, repo: str, fs: FileStructure) -> None:
-        # The hash is written last so an interrupted upsert is retried, not skipped.
+        # The old hash is cleared first and the new one written last, so an interrupted
+        # upsert is retried even if the file is later reverted to its old content.
         scope = {"repo": repo, "path": fs.path}
         await self._run(
             graph,
-            f"MERGE {_FILE} SET f:File, f.name = $name, f.language = $language",
+            f"MERGE {_FILE} SET f:File, f.name = $name, f.language = $language, "
+            "f.hash = null",
             {**scope, "name": fs.path.rsplit("/", 1)[-1], "language": fs.language},
         )
         # Symbols still present are updated in place, never deleted, so ABOUT edges stay.

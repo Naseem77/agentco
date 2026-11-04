@@ -133,6 +133,16 @@ async def test_upsert_file_runs_steps_in_order_and_commits_hash_last():
     assert "SET f.hash = $hash" in steps[7]
 
 
+async def test_upsert_file_clears_the_old_hash_before_touching_symbols():
+    b, graph, _ = backend()
+    await b.upsert_file("g", REPO, structure())
+    first, _ = graph.calls[0]
+    assert first == (
+        "MERGE (f:Code {repo: $repo, path: $path, kind: 'File'}) "
+        "SET f:File, f.name = $name, f.language = $language, f.hash = null"
+    )
+
+
 async def test_upsert_file_sets_hash_only_after_symbols_are_written():
     b, graph, _ = backend()
     fs = structure()

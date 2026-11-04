@@ -8,15 +8,21 @@ from typing import Annotated
 import openai
 import redis.exceptions
 import typer
+from graphiti_core.llm_client.errors import (
+    EmptyResponseError,
+    RateLimitError,
+    RefusalError,
+)
 
 from agentco.code.falkor_graph import build_falkor_code_graph
 from agentco.code.graph import CodeGraphBackend, code_graph_for
-from agentco.code.indexer import NotAGitRepo, index_repo
+from agentco.code.indexer import NotAGitRepo, index_repo, repo_root
 from agentco.config import ConfigError, TenantConfig, family_warnings, load_config
-from agentco.github.client import GhCli, GitHub, GitHubError, validate_repo
+from agentco.github.client import GhCli, GitHub, validate_repo
+from agentco.github.errors import GitHubError
 from agentco.importer.locate import SymbolLocator
 from agentco.importer.run import ImportOptions, ImportReport, run_import
-from agentco.memory.backend import MemoryBackend
+from agentco.memory.backend import Fact, MemoryBackend, MemoryItem
 from agentco.memory.gate import MemoryGate
 from agentco.memory.graphiti_backend import build_graphiti_backend
 from agentco.memory.scopes import Scope, graph_name
@@ -63,13 +69,37 @@ def _falkordb_guard(cfg: TenantConfig) -> Iterator[None]:
     ) as e:
         typer.echo(f"cannot reach FalkorDB at {cfg.falkordb_host}:{cfg.falkordb_port}")
         raise typer.Exit(2) from e
+    except redis.exceptions.ResponseError as e:
+        typer.echo(f"FalkorDB error: {_one_line(e)}")
+        raise typer.Exit(2) from e
+
+
+def _one_line(error: object) -> str:
+    return " ".join(str(error).split())
+
+
+# Raised by the OpenAI client and by Graphiti's own LLM wrappers while extracting.
+LLM_ERRORS = (openai.OpenAIError, RateLimitError, RefusalError, EmptyResponseError)
+
+
+class _DryRunBackend:
+    """Stands in for the memory backend: a dry run reads markers and writes nothing."""
+
+    async def add(self, graph: str, scope: Scope, item: MemoryItem) -> None:
+        raise AssertionError("a dry run must not write memory")
+
+    async def search(self, graphs: list[str], query: str, limit: int) -> list[Fact]:
+        raise AssertionError("a dry run must not search memory")
+
+    async def ensure_graph(self, graph: str) -> None:
+        raise AssertionError("a dry run must not create graphs")
 
 
 def _build_backend(cfg: TenantConfig) -> MemoryBackend:
     try:
         return make_backend(cfg)
     except openai.OpenAIError as e:
-        typer.echo(f"cannot create LLM client: {' '.join(str(e).split())}")
+        typer.echo(f"cannot create LLM client: {_one_line(e)}")
         raise typer.Exit(1) from e
 
 
@@ -173,15 +203,45 @@ def _parse_limit(limit: str | None) -> int | None:
 
 def _dry_run_lines(report: ImportReport) -> list[str]:
     skipped = " ".join(f"{k}={v}" for k, v in sorted(report.skipped.items()))
-    return [
+    lines = [
         f"issues: {report.issues}",
         f"features: {report.features}",
         f"pull requests: {report.pulls}",
         f"review comments: {report.reviews}",
         f"already imported: {report.already}",
         f"skipped: {skipped or 'none'}",
-        f"episodes to write: {report.planned} (each runs one Graphiti LLM extraction)",
+        f"episodes to write: {report.to_write} (each runs one Graphiti LLM extraction)",
     ]
+    if report.link_only:
+        lines.append(f"link-only retries: {report.link_only}")
+    return lines
+
+
+def _result_lines(report: ImportReport, max_items: int | None) -> list[str]:
+    lines = []
+    if report.relinked:
+        lines.append(f"relinked {report.relinked} episodes")
+    if report.linked_by_fallback:
+        lines.append(
+            f"{report.linked_by_fallback} episodes linked against current code because "
+            "their commits are not in the checkout; fetch PR heads for exact links "
+            "(see README)"
+        )
+    if report.awaiting_code:
+        lines.append(
+            f"{report.awaiting_code} review episodes await a code graph; "
+            "import or index with --repo-path to link them"
+        )
+    if report.complete:
+        lines.append(
+            f"imported {report.written} episodes ({report.linked} linked to code)"
+        )
+    else:
+        lines.append(
+            f"stopped at --limit {max_items}: imported {report.written} "
+            f"of {report.to_write} episodes; run again to continue"
+        )
+    return lines
 
 
 @app.command("import")
@@ -212,6 +272,10 @@ def import_(
         raise _fail(str(e)) from e
     since_at = _parse_since(since)
     max_items = _parse_limit(limit)
+    try:
+        checkout = repo_root(repo_path) if repo_path is not None else None
+    except NotAGitRepo as e:
+        raise _fail(str(e)) from e
     cfg = _load(config)
     store = TaskStore(cfg.database_url)
     store.create_all()
@@ -219,24 +283,29 @@ def import_(
     started_at = datetime.now(UTC)
 
     async def _run() -> ImportReport:
-        backend = _build_backend(cfg)
-        gate = MemoryGate(cfg.tenant, backend)
-        await backend.ensure_graph(graph_name(cfg.tenant, Scope.RND))
-        await backend.ensure_graph(graph_name(cfg.tenant, Scope.PRODUCT))
-        code = code_graph_for(cfg.tenant, Role.LIBRARIAN, make_code_graph(cfg))
-        if repo_path is not None and not dry_run:
-            done = await index_repo(repo, repo_path, code)
-            typer.echo(
-                f"indexed {done.indexed}, unchanged {done.unchanged}, "
-                f"deleted {done.deleted}, skipped {done.skipped}, calls {done.calls}"
-            )
+        if dry_run:
+            gate = MemoryGate(cfg.tenant, _DryRunBackend())
+            code = None
+        else:
+            backend = _build_backend(cfg)
+            gate = MemoryGate(cfg.tenant, backend)
+            await backend.ensure_graph(graph_name(cfg.tenant, Scope.RND))
+            await backend.ensure_graph(graph_name(cfg.tenant, Scope.PRODUCT))
+            code = code_graph_for(cfg.tenant, Role.LIBRARIAN, make_code_graph(cfg))
+            await code.ensure_schema()
+            if checkout is not None:
+                done = await index_repo(repo, checkout, code)
+                typer.echo(
+                    f"indexed {done.indexed}, unchanged {done.unchanged}, "
+                    f"deleted {done.deleted}, skipped {done.skipped}, calls {done.calls}"
+                )
         return await run_import(
             repo,
             make_github(),
             store,
             gate.for_role(Role.LIBRARIAN),
             gate.for_role(Role.PM),
-            SymbolLocator(repo, code, repo_path),
+            SymbolLocator(repo, code, checkout),
             code,
             ImportOptions(since=since_at, limit=max_items, dry_run=dry_run),
             started_at,
@@ -249,19 +318,8 @@ def import_(
         raise _fail(str(e)) from e
     except GitHubError as e:
         raise _fail(str(e), 3) from e
-    except openai.OpenAIError as e:
-        raise _fail(f"LLM request failed: {' '.join(str(e).split())}") from e
-    if dry_run:
-        for line in _dry_run_lines(report):
-            typer.echo(line)
-        return
-    typer.echo(f"relinked {report.relinked} episodes")
-    if report.complete:
-        typer.echo(
-            f"imported {report.written} episodes ({report.linked} linked to code)"
-        )
-    else:
-        typer.echo(
-            f"stopped at --limit {max_items}: imported {report.written} "
-            f"of {report.planned} episodes; run again to continue"
-        )
+    except LLM_ERRORS as e:
+        raise _fail(f"LLM request failed: {_one_line(e)}") from e
+    lines = _dry_run_lines(report) if dry_run else _result_lines(report, max_items)
+    for line in lines:
+        typer.echo(line)

@@ -23,7 +23,7 @@ from agentco.importer.episodes import (
     review_item,
     review_threads,
 )
-from agentco.importer.locate import SymbolLocator
+from agentco.importer.locate import SymbolLocator, linkable
 from agentco.memory.backend import MemoryItem
 from agentco.memory.gate import ScopedMemory
 from agentco.memory.scopes import Scope
@@ -50,11 +50,28 @@ class ImportReport:
     written: int = 0
     linked: int = 0
     complete: bool = True
-    relinked: int = 0  # link-only retries of episodes added by an earlier run
+    relinked: int = 0  # link-only retries finished this run
+    linked_by_fallback: int = 0  # links resolved against today's index, not the commit
+    link_only: int = 0  # planned retries of episodes an earlier run already added
+    awaiting_code: int = 0  # reviews still "added": no code graph to link them to yet
 
     @property
     def planned(self) -> int:
         return self.issues + self.features + self.pulls + self.reviews
+
+    @property
+    def to_write(self) -> int:
+        """Planned episodes that need a Graphiti extraction (not link-only retries)."""
+        return self.planned - self.link_only
+
+
+@dataclass(frozen=True)
+class _Outcome:
+    linked: int = 0
+    by_fallback: bool = False
+    final: bool = (
+        True  # False keeps a review's marker at "added" so a later run links it
+    )
 
 
 @dataclass(frozen=True)
@@ -63,8 +80,8 @@ class _Pending:
     kind: int
     ident: int
     marker: str
-    # writes the episode (or only retries its code link); returns the links made
-    write: Callable[[], Awaitable[int]]
+    # writes the episode (or only retries its code link)
+    write: Callable[[], Awaitable[_Outcome]]
     link_only: bool = False
 
     @property
@@ -96,12 +113,26 @@ async def run_import(
     Bot-authored issues/PRs are skipped, but a human team-member review on a bot-authored
     PR is still imported (threads resolve against every fetched PR); only the PR episode
     itself is left out.
+
+    A review episode written while no code graph could link it (none passed, or it has no
+    indexed files and there is no checkout) keeps its "added" marker; a later run with
+    code available only links it and never writes it again. Until then such retries are
+    counted in `awaiting_code`: they use no `limit` slot, and the cursor stays put so the
+    next run fetches them again.
     """
     tenant = rnd.tenant
+    if not rnd.tenant == product.tenant == (code.tenant if code else rnd.tenant):
+        raise ValueError("rnd, product and code must belong to one tenant")
     cursor_key = f"import:{tenant}:{repo}:cursor"
     if opts.limit is not None and opts.limit < 1:
         raise ValueError("limit must be at least 1")
     report = ImportReport()
+
+    # Dry runs never touch the code graph, so they assume linking would work.
+    can_link = opts.dry_run or (
+        code is not None
+        and (locator.has_checkout or bool(await code.file_hashes(repo)))
+    )
 
     fetch_since = opts.since
     if fetch_since is None:
@@ -125,13 +156,16 @@ async def run_import(
         kind: int,
         kind_name: str,
         ident: int,
-        write: Callable[[bool], Awaitable[int]],
+        write: Callable[[bool], Awaitable[_Outcome]],
     ) -> None:
         key = marker(kind_name, ident)
         state = store.get_meta(key)
         link_only = state == "added"
         if state is not None and not link_only:
             report.already += 1
+            return
+        if link_only and not can_link:
+            report.awaiting_code += 1
             return
         pending.append(
             _Pending(
@@ -151,11 +185,13 @@ async def run_import(
             report.pulls += 1
         else:
             report.reviews += 1
+        if link_only:
+            report.link_only += 1
 
     def add_to(scope_memory: ScopedMemory, scope: Scope, item: MemoryItem):
-        async def write(link_only: bool) -> int:
+        async def write(link_only: bool) -> _Outcome:
             await scope_memory.add(scope, item)
-            return 0
+            return _Outcome()
 
         return write
 
@@ -188,10 +224,10 @@ async def run_import(
         if not created_ok(pr.created_at):
             continue
 
-        async def write_pr(link_only: bool, pr=pr) -> int:
+        async def write_pr(link_only: bool, pr=pr) -> _Outcome:
             files = await asyncio.to_thread(gh.pull_files, repo, pr.number)
             await rnd.add(Scope.RND, pull_item(repo, pr, files))
-            return 0
+            return _Outcome()
 
         plan(pr.created_at, _PR, "pr", pr.number, write_pr)
 
@@ -203,18 +239,21 @@ async def run_import(
             continue
         pr = pulls_by_number[thread.root.pr_number]
 
-        async def write_review(link_only: bool, thread=thread, pr=pr) -> int:
-            symbol = await locator.locate(thread.root, pr)
+        async def write_review(link_only: bool, thread=thread, pr=pr) -> _Outcome:
+            located = await locator.resolve(thread.root, pr)
+            symbol = located.symbol
             item = review_item(repo, thread, pr, symbol)
             if not link_only:
                 await rnd.add(Scope.RND, item)
                 store.set_meta(marker("review", thread.root.id), "added")
-            if symbol is None or code is None:
-                return 0
+            if code is None or not can_link:
+                return _Outcome(final=not linkable(thread.root))
+            if symbol is None:
+                return _Outcome()
             linked = await code.link_episode(
                 repo, item.name, thread.root.path, symbol.qualname
             )
-            return int(linked)
+            return _Outcome(int(linked), by_fallback=linked and located.by_fallback)
 
         plan(thread.root.created_at, _REVIEW, "review", thread.root.id, write_review)
 
@@ -224,14 +263,19 @@ async def run_import(
     pending.sort(key=lambda p: p.order)
     cut = opts.limit is not None and len(pending) > opts.limit
     for work in pending[: opts.limit]:
-        report.linked += await work.write()
-        store.set_meta(work.marker, "done")
-        if work.link_only:
-            report.relinked += 1
+        outcome = await work.write()
+        report.linked += outcome.linked
+        report.linked_by_fallback += int(outcome.by_fallback)
+        if outcome.final:
+            store.set_meta(work.marker, "done")
         else:
+            report.awaiting_code += 1
+        if not work.link_only:
             report.written += 1
+        elif outcome.final:
+            report.relinked += 1
 
     report.complete = not cut
-    if report.complete and opts.since is None:
+    if report.complete and opts.since is None and not report.awaiting_code:
         store.set_meta(cursor_key, _utc(now).isoformat())
     return report

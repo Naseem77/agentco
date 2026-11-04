@@ -133,6 +133,25 @@ def test_gh_cli_invalid_json_is_github_error():
         GhCli(lambda argv: "not json").pulls("o/r")
 
 
+@pytest.mark.parametrize("output", ['{"message": "Not Found"}', "[1]", '[{"a": 1}]'])
+def test_gh_cli_unexpected_json_shape_is_github_error(output):
+    with pytest.raises(GitHubError) as err:
+        GhCli(lambda argv: output).pulls("o/r")
+    assert str(err.value) == "gh api returned unexpected JSON: expected a list of pages"
+
+
+def test_gh_cli_pull_files_without_filename_is_github_error():
+    with pytest.raises(GitHubError) as err:
+        GhCli(lambda argv: '[[{"name": "x"}]]').pull_files("o/r", 3)
+    assert str(err.value) == "malformed GitHub pull file: KeyError: 'filename'"
+
+
+def test_gh_cli_malformed_item_is_github_error():
+    with pytest.raises(GitHubError) as err:
+        GhCli(lambda argv: '[[{"number": 1}]]').pulls("o/r")
+    assert str(err.value) == "malformed GitHub pull request: KeyError: 'state'"
+
+
 def test_gh_missing_is_github_error(monkeypatch):
     monkeypatch.setattr(subprocess, "run", raising(FileNotFoundError("gh")))
     with pytest.raises(GitHubError) as err:

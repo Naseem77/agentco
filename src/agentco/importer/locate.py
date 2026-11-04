@@ -3,6 +3,7 @@
 import asyncio
 import subprocess
 from collections.abc import Callable
+from dataclasses import dataclass
 from pathlib import Path
 
 from agentco.code.graph import ScopedCodeGraph
@@ -38,8 +39,31 @@ def git_show(checkout: Path, commit: str, path: str) -> bytes | None:
     return proc.stdout
 
 
+def linkable(comment: GhReviewComment) -> bool:
+    """Whether the comment points at a line of a language we index."""
+    line = comment.original_line or comment.line
+    return (
+        comment.subject_type != "file"
+        and line is not None
+        and language_for(comment.path) is not None
+    )
+
+
+@dataclass(frozen=True)
+class Located:
+    symbol: Symbol | None
+    by_fallback: bool = (
+        False  # resolved against today's index, not the comment's commit
+    )
+
+
 class SymbolLocator:
-    """Finds the function or class a comment points at, using the comment's own commit."""
+    """Finds the function or class a comment points at, using the comment's own commit.
+
+    When that commit is not in the checkout, a comment on a line that still exists
+    (`line` set) is resolved against the current index as a best effort; an outdated
+    comment (`line` is None) is left unresolved rather than guessed.
+    """
 
     def __init__(
         self,
@@ -54,24 +78,29 @@ class SymbolLocator:
         self._show = show
         self._parsed: dict[tuple[str, str], FileStructure | None] = {}
 
+    @property
+    def has_checkout(self) -> bool:
+        return self._checkout is not None
+
     async def locate(self, comment: GhReviewComment, pr: GhPull) -> Symbol | None:
+        return (await self.resolve(comment, pr)).symbol
+
+    async def resolve(self, comment: GhReviewComment, pr: GhPull) -> Located:
+        if not linkable(comment):
+            return Located(None)
         line = comment.original_line or comment.line
-        if comment.subject_type == "file" or line is None:
-            return None
-        if language_for(comment.path) is None:
-            return None
+        assert line is not None
         if self._checkout is not None:
             commit = (
                 pr.base_sha if comment.side == "LEFT" else comment.original_commit_id
             )
             structure = await self._structure_at(commit, comment.path)
             if structure is not None:
-                return innermost(structure.symbols, line)
-        if self._code is None:
-            return None
-        return await self._code.enclosing(
-            self._repo, comment.path, comment.line or line
-        )
+                return Located(innermost(structure.symbols, line))
+        if self._code is None or comment.line is None:
+            return Located(None)
+        symbol = await self._code.enclosing(self._repo, comment.path, comment.line)
+        return Located(symbol, by_fallback=symbol is not None)
 
     async def _structure_at(self, commit: str, path: str) -> FileStructure | None:
         key = (commit, path)

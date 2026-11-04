@@ -1,7 +1,11 @@
 import re
+from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import datetime
+from functools import wraps
 from typing import Literal
+
+from agentco.github.errors import GitHubError
 
 _CLOSING_RE = re.compile(r"(?i)\b(?:close[sd]?|fix(?:e[sd])?|resolve[sd]?)\s+#(\d+)")
 
@@ -65,6 +69,24 @@ class GhReviewComment:
     url: str
 
 
+def _malformed[**P, R](what: str) -> Callable[[Callable[P, R]], Callable[P, R]]:
+    """Report JSON of an unexpected shape as a GitHubError, not a bare KeyError."""
+
+    def decorate(parse: Callable[P, R]) -> Callable[P, R]:
+        @wraps(parse)
+        def checked(*args: P.args, **kwargs: P.kwargs) -> R:
+            try:
+                return parse(*args, **kwargs)
+            except (KeyError, TypeError, ValueError, IndexError, AttributeError) as e:
+                raise GitHubError(
+                    f"malformed GitHub {what}: {type(e).__name__}: {e}"
+                ) from e
+
+        return checked
+
+    return decorate
+
+
 def parse_user(raw: dict | None) -> GhUser:
     if not raw:
         return GhUser("ghost", False)
@@ -88,6 +110,7 @@ def linked_issues(text: str) -> tuple[int, ...]:
     return tuple(dict.fromkeys(int(m) for m in _CLOSING_RE.findall(text)))
 
 
+@_malformed("issue")
 def parse_issue(raw: dict) -> GhIssue | None:
     """None for pull requests, which the issues endpoint also lists."""
     if "pull_request" in raw:
@@ -107,6 +130,7 @@ def parse_issue(raw: dict) -> GhIssue | None:
     )
 
 
+@_malformed("pull request")
 def parse_pull(raw: dict) -> GhPull:
     body = raw.get("body") or ""
     return GhPull(
@@ -126,6 +150,7 @@ def parse_pull(raw: dict) -> GhPull:
     )
 
 
+@_malformed("review comment")
 def parse_review_comment(raw: dict) -> GhReviewComment:
     return GhReviewComment(
         id=raw["id"],

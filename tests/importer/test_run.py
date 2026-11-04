@@ -45,6 +45,7 @@ class World:
             "product": self.product,
             "now": NOW,
             "code": self.code,
+            "locator": self.locator,
         } | overrides
         return await run_import(
             REPO,
@@ -52,7 +53,7 @@ class World:
             self.store,
             args["rnd"],
             args["product"],
-            self.locator,
+            args["locator"],
             args["code"],
             ImportOptions(**opts),
             args["now"],
@@ -310,5 +311,82 @@ async def test_human_review_on_bot_pr_is_imported_but_bot_pr_is_not(world):
 async def test_limit_below_one_is_rejected(world, limit):
     with pytest.raises(ValueError, match="limit must be at least 1"):
         await world.run(limit=limit)
+    assert world.backend.items("acme__rnd") == []
+    assert world.gh.calls == []
+
+
+REVIEW_101 = f"import:acme:{REPO}:review:101"
+
+
+async def test_fallback_links_are_counted(world):
+    world.locator = SymbolLocator(REPO, world.code, Path("/checkout"), lambda *_: None)
+    r = await world.run()
+    assert (r.linked, r.linked_by_fallback) == (1, 1)
+
+
+async def test_commit_accurate_links_are_not_fallbacks(world):
+    r = await world.run()
+    assert (r.linked, r.linked_by_fallback) == (1, 0)
+
+
+async def test_review_without_code_graph_stays_added_then_links_later(world):
+    no_index = SymbolLocator(REPO, None, None)
+    first = await world.run(code=None, locator=no_index)
+    assert (first.written, first.linked) == (6, 0)
+    assert world.store.get_meta(REVIEW_101) == "added"
+    # file-level comments can never link, so they are finished
+    assert world.store.get_meta(f"import:acme:{REPO}:review:106") == "done"
+    # the cursor stays put, so the next run fetches the waiting review again
+    assert (first.awaiting_code, world.store.get_meta(CURSOR_KEY)) == (1, None)
+
+    later = SymbolLocator(REPO, world.code, None)
+    second = await world.run(locator=later)
+    assert (second.written, second.relinked, second.linked) == (0, 1, 1)
+    assert (second.awaiting_code, world.store.get_meta(CURSOR_KEY)) == (
+        0,
+        NOW.isoformat(),
+    )
+    assert world.store.get_meta(REVIEW_101) == "done"
+    assert names(world.backend, "acme__rnd").count("review:acme-org/web:101") == 1
+    assert world.codegraph.links("acme__rnd") == {
+        ("review:acme-org/web:101", "src/app/graph.py", "GraphView.switch")
+    }
+
+
+async def test_empty_index_without_checkout_also_keeps_review_added(world):
+    empty = code_graph_for("acme", Role.LIBRARIAN, InMemoryCodeGraph())
+    await world.run(code=empty, locator=SymbolLocator(REPO, empty, None))
+    assert world.store.get_meta(REVIEW_101) == "added"
+
+
+async def test_added_review_is_deferred_not_retried_while_still_no_code(world):
+    no_index = SymbolLocator(REPO, None, None)
+    await world.run(code=None, locator=no_index)
+    since = datetime(2020, 1, 1, tzinfo=UTC)
+    r = await world.run(code=None, locator=no_index, since=since, limit=1)
+    assert (r.awaiting_code, r.written, r.relinked, r.complete) == (1, 0, 0, True)
+    assert (r.reviews, r.link_only) == (0, 0)
+    assert world.store.get_meta(CURSOR_KEY) is None
+    assert world.store.get_meta(REVIEW_101) == "added"
+
+
+async def test_link_only_retries_are_counted_apart_from_new_episodes(world):
+    world.store.set_meta(REVIEW_101, "added")
+    r = await world.run(dry_run=True)
+    assert (r.planned, r.link_only, r.to_write) == (6, 1, 5)
+
+
+async def test_run_import_rejects_mixed_tenants(world):
+    other = MemoryGate("other", world.backend)
+    with pytest.raises(
+        ValueError, match="^rnd, product and code must belong to one tenant$"
+    ):
+        await world.run(product=other.for_role(Role.PM))
+    with pytest.raises(
+        ValueError, match="^rnd, product and code must belong to one tenant$"
+    ):
+        await world.run(
+            code=code_graph_for("other", Role.LIBRARIAN, InMemoryCodeGraph())
+        )
     assert world.backend.items("acme__rnd") == []
     assert world.gh.calls == []

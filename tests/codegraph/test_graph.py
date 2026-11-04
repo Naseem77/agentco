@@ -208,3 +208,19 @@ async def test_links_are_per_graph():
     assert await b.link_episode("g2", "r", "ep", "a.py", "f") is False
     assert b.links("g1") == {("ep", "a.py", "f")}
     assert b.links("g2") == set()
+
+
+async def test_interrupted_upsert_does_not_leave_the_old_hash():
+    b = InMemoryCodeGraph()
+    v1, v2 = fs("a.py", "def f(): pass"), fs("a.py", "def g(): pass")
+    await b.upsert_file("g", "r", v1)
+    assert await b.file_hashes("g", "r") == {"a.py": v1.hash}
+    b.interrupt_upserts = True
+    with pytest.raises(RuntimeError) as exc:
+        await b.upsert_file("g", "r", v2)
+    assert str(exc.value) == "upsert interrupted"
+    assert await b.file_hashes("g", "r") == {}
+    assert await b.all_symbols("g", "r") == {}
+    b.interrupt_upserts = False
+    await b.upsert_file("g", "r", v1)
+    assert await b.file_hashes("g", "r") == {"a.py": v1.hash}
