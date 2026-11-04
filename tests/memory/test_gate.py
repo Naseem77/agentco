@@ -1,9 +1,10 @@
+import dataclasses
 from datetime import UTC, datetime
 
 import pytest
 
 from agentco.memory.backend import InMemoryBackend, MemoryItem
-from agentco.memory.gate import AccessDenied, MemoryGate
+from agentco.memory.gate import AccessDenied, MemoryGate, ScopedMemory
 from agentco.memory.scopes import Scope
 from agentco.roles import Role
 
@@ -49,6 +50,8 @@ async def test_tenants_never_mix():
         .for_role(Role.LIBRARIAN)
         .add(Scope.RND, item("acme secret"))
     )
+    own = await MemoryGate("acme", backend).for_role(Role.LEAD).search("secret")
+    assert [f.text for f in own] == ["acme secret"]
     assert (
         await MemoryGate("globex", backend).for_role(Role.LEAD).search("secret") == []
     )
@@ -81,3 +84,32 @@ async def test_limit_and_case_insensitive_search():
 def test_invalid_tenant_rejected():
     with pytest.raises(ValueError):
         MemoryGate("Bad Tenant", InMemoryBackend())
+
+
+async def test_default_search_follows_declared_scope_order():
+    seen: list[str] = []
+
+    class Spy(InMemoryBackend):
+        async def search(self, graphs, query, limit):
+            seen.extend(graphs)
+            return []
+
+    await MemoryGate("acme", Spy()).for_role(Role.LEAD).search("x")
+    assert seen == ["acme__company", "acme__product", "acme__rnd", "acme__qa"]
+
+
+def test_scoped_memory_is_sealed():
+    mem = MemoryGate("acme", InMemoryBackend()).for_role(Role.QA)
+    assert not hasattr(mem, "backend")
+    with pytest.raises(TypeError):
+        dataclasses.replace(mem, role=Role.LEAD)
+    with pytest.raises(AttributeError):
+        mem.role = Role.LEAD
+    with pytest.raises(AttributeError):
+        mem.tenant = "globex"
+    assert mem.role is Role.QA and mem.tenant == "acme"
+
+
+def test_scoped_memory_cannot_be_constructed_directly():
+    with pytest.raises(TypeError):
+        ScopedMemory(object(), InMemoryBackend(), "acme", Role.LEAD)
