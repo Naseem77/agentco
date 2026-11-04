@@ -86,6 +86,13 @@ class InMemoryCodeGraph:
             for link in state.links
             if link[1] != fs.path or (link[1], link[2]) in present
         }
+        # edges touching a symbol removed from this file go with it, as in a DB backend
+        state.calls = [
+            e
+            for e in state.calls
+            if (e.caller_path != fs.path or (e.caller_path, e.caller) in present)
+            and (e.callee_path != fs.path or (e.callee_path, e.callee) in present)
+        ]
 
     async def delete_file(self, graph: str, repo: str, path: str) -> None:
         state = self._repo(graph, repo)

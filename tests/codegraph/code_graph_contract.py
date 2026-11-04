@@ -9,6 +9,28 @@ REPO = "o/r"
 PATH = "src/app/graph.py"
 UTIL = "src/app/util.py"
 UTIL_SRC = b"def show(g):\n    return g\n"
+OTHER_REPO = "o/other"
+A = "src/a.py"
+B = "src/b.py"
+A_V1 = b"""def f():
+    g()
+
+
+def g():
+    h()
+
+
+def h():
+    pass
+"""
+A_V2 = b"""def f():
+    h()
+
+
+def h():
+    pass
+"""
+B_SRC = b"def u():\n    f()\n"
 
 V1 = b"""class GraphView:
     def load(self, g):
@@ -89,3 +111,57 @@ async def check_contract(
     await backend.delete_file(graph, REPO, UTIL)
     assert await backend.file_hashes(graph, REPO) == {}
     assert await backend.all_symbols(graph, REPO) == {}
+
+    await check_reupsert_and_isolation(backend, graph)
+
+
+async def check_reupsert_and_isolation(backend: CodeGraphBackend, graph: str) -> None:
+    a1 = parse_source(A, A_V1)
+    a2 = parse_source(A, A_V2)
+    b = parse_source(B, B_SRC)
+    assert a1 is not None and a2 is not None and b is not None
+
+    await backend.upsert_file(graph, REPO, a1)
+    await backend.upsert_file(graph, REPO, b)
+    f_g = CallEdge(A, "f", A, "g")
+    g_h = CallEdge(A, "g", A, "h")
+    f_h = CallEdge(A, "f", A, "h")
+    u_g = CallEdge(B, "u", A, "g")
+    u_h = CallEdge(B, "u", A, "h")
+    await backend.replace_calls(graph, REPO, [f_g, g_h, f_h, u_g, u_h])
+    assert await backend.call_edges(graph, REPO) == sorted([f_g, g_h, f_h, u_g, u_h])
+
+    # removing g drops edges where g is the caller or the callee, in any file
+    await backend.upsert_file(graph, REPO, a2)
+    assert await backend.call_edges(graph, REPO) == sorted([f_h, u_h])
+
+    # upserting the same structure again changes nothing
+    symbols = await backend.all_symbols(graph, REPO)
+    await backend.upsert_file(graph, REPO, a2)
+    await backend.upsert_file(graph, REPO, a2)
+    assert await backend.all_symbols(graph, REPO) == symbols
+    assert [s.qualname for s in symbols[A]] == ["f", "h"]
+    assert await backend.file_hashes(graph, REPO) == {A: a2.hash, B: b.hash}
+    assert await backend.call_edges(graph, REPO) == sorted([f_h, u_h])
+
+    # a second repo with the same path is independent of the first
+    other = parse_source(A, b"def only_here():\n    pass\n")
+    assert other is not None
+    await backend.upsert_file(graph, OTHER_REPO, other)
+    assert await backend.file_hashes(graph, OTHER_REPO) == {A: other.hash}
+    assert [s.qualname for s in await backend.symbols_in(graph, OTHER_REPO, A)] == [
+        "only_here"
+    ]
+    assert await backend.call_edges(graph, OTHER_REPO) == []
+    assert await backend.symbols_in(graph, REPO, A) == list(a2.symbols)
+    assert await backend.file_hashes(graph, REPO) == {A: a2.hash, B: b.hash}
+
+    await backend.delete_file(graph, OTHER_REPO, A)
+    assert await backend.all_symbols(graph, OTHER_REPO) == {}
+    assert await backend.symbols_in(graph, REPO, A) == list(a2.symbols)
+    assert await backend.call_edges(graph, REPO) == sorted([f_h, u_h])
+
+    await backend.delete_file(graph, REPO, A)
+    await backend.delete_file(graph, REPO, B)
+    assert await backend.all_symbols(graph, REPO) == {}
+    assert await backend.call_edges(graph, REPO) == []
