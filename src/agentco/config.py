@@ -1,8 +1,9 @@
 from pathlib import Path
 
 import yaml
-from pydantic import BaseModel, ValidationError
+from pydantic import BaseModel, ValidationError, field_validator
 
+from agentco.memory.scopes import TENANT_RE
 from agentco.roles import Role
 
 CODER_ROLES = (Role.SENIOR, Role.JUNIOR)
@@ -30,6 +31,13 @@ class TenantConfig(BaseModel):
     database_url: str = "sqlite:///.agentco/state.db"
     roles: dict[Role, RoleModel]
     budgets: Budgets = Budgets()
+
+    @field_validator("tenant")
+    @classmethod
+    def _valid_tenant(cls, v: str) -> str:
+        if not TENANT_RE.fullmatch(v):
+            raise ValueError(f"tenant {v!r} must match {TENANT_RE.pattern}")
+        return v
 
 
 def load_config(path: Path) -> TenantConfig:
