@@ -1,3 +1,4 @@
+import math
 from pathlib import Path
 
 from sqlalchemy import create_engine, select, update
@@ -195,8 +196,8 @@ class TaskStore:
     def record_cost(
         self, task_id: int, actor: Role, usd: float, detail: dict
     ) -> TaskRecord:
-        if usd < 0:
-            raise ValueError("usd must be non-negative")
+        if not math.isfinite(usd) or usd < 0:
+            raise ValueError("usd must be a finite, non-negative number")
         with self._sessions.begin() as session:
             result = session.execute(
                 update(TaskRow)

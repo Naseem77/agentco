@@ -103,10 +103,12 @@ def test_cost_accumulates(store):
     assert t.cost_usd == pytest.approx(0.3)
 
 
-def test_negative_cost_rejected_without_audit(store):
+@pytest.mark.parametrize("bad", [-1, float("nan"), float("inf"), float("-inf")])
+def test_invalid_cost_rejected_without_audit(store, bad):
     t = store.create_task("acme", "x", "cli")
-    with pytest.raises(ValueError):
-        store.record_cost(t.id, Role.PM, -1, {})
+    with pytest.raises(ValueError) as exc:
+        store.record_cost(t.id, Role.PM, bad, {})
+    assert str(exc.value) == "usd must be a finite, non-negative number"
     assert store.get(t.id).cost_usd == 0
     assert [e.action for e in store.audit(t.id)] == ["created"]
 
