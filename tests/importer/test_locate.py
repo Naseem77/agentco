@@ -68,20 +68,41 @@ async def test_original_line_wins_over_line():
     assert (await loc.locate(only_line, pr3())).qualname == "GraphView.load"
 
 
-async def test_falls_back_to_index_when_commit_missing():
+async def test_falls_back_to_index_when_commit_missing_and_comment_current():
     code = _code()
     await code.upsert_file(REPO, parse_source("src/app/graph.py", GRAPH_AT_H1))
     calls = []
 
     def show(checkout, commit, path):
         calls.append(commit)
-        return GRAPH_AT_H1 if commit == "never" else None
 
     loc = SymbolLocator(REPO, code, Path("/checkout"), show)
-    assert (await loc.locate(comment_101(), pr3())).qualname == "GraphView.switch"
+    found = await loc.resolve(comment_101(), pr3())
+    assert (found.symbol.qualname, found.by_fallback) == ("GraphView.switch", True)
     assert calls == ["h1"]
-    line_gone = replace(comment_101(), line=None, original_line=6)
-    assert (await loc.locate(line_gone, pr3())).qualname == "GraphView.switch"
+
+
+async def test_outdated_comment_with_missing_commit_is_not_guessed():
+    code = _code()
+    await code.upsert_file(REPO, parse_source("src/app/graph.py", GRAPH_AT_H1))
+    loc = SymbolLocator(REPO, code, Path("/checkout"), lambda *_: None)
+    outdated = replace(comment_101(), line=None, original_line=6)
+    found = await loc.resolve(outdated, pr3())
+    assert (found.symbol, found.by_fallback) == (None, False)
+    assert await loc.locate(outdated, pr3()) is None
+
+
+async def test_commit_accurate_symbol_is_not_a_fallback():
+    loc = SymbolLocator(REPO, _code(), Path("/c"), lambda *_: GRAPH_AT_H1)
+    found = await loc.resolve(comment_101(), pr3())
+    assert (found.symbol.qualname, found.by_fallback) == ("GraphView.switch", False)
+
+
+async def test_outdated_comment_without_checkout_is_none():
+    code = _code()
+    await code.upsert_file(REPO, parse_source("src/app/graph.py", GRAPH_AT_H1))
+    outdated = replace(comment_101(), line=None, original_line=6)
+    assert await SymbolLocator(REPO, code, None).locate(outdated, pr3()) is None
 
 
 async def test_index_fallback_without_checkout_does_not_call_show():

@@ -26,8 +26,13 @@ _FILE_LIMIT = 50
 _TRUNCATED = " …[truncated]"
 
 
+def _one_line(text: str) -> str:
+    """Collapse every whitespace run, including all Unicode line separators."""
+    return " ".join(text.split())
+
+
 def module_of(path: str) -> str:
-    return dirname(path) or "."
+    return _one_line(dirname(path)) or "."
 
 
 @dataclass(frozen=True)
@@ -120,7 +125,7 @@ def _indent(text: str) -> str:
 
 
 def _labels(issue: GhIssue) -> str:
-    return ", ".join(issue.labels) or "none"
+    return ", ".join(_one_line(label) for label in issue.labels) or "none"
 
 
 def _with_body(head: str, body: str) -> str:
@@ -131,8 +136,9 @@ def _with_body(head: str, body: str) -> str:
 def issue_item(repo: str, issue: GhIssue) -> MemoryItem:
     state = issue.state + (f", {issue.state_reason}" if issue.state_reason else "")
     head = (
-        f"GitHub issue #{issue.number} in {repo}: {issue.title} "
-        f"(state: {state}; labels: {_labels(issue)}; opened by @{issue.author.login})."
+        f"GitHub issue #{issue.number} in {repo}: {_one_line(issue.title)} "
+        f"(state: {state}; labels: {_labels(issue)}; "
+        f"opened by @{_one_line(issue.author.login)})."
     )
     return MemoryItem(
         name=f"issue:{repo}#{issue.number}",
@@ -144,7 +150,8 @@ def issue_item(repo: str, issue: GhIssue) -> MemoryItem:
 
 def feature_item(repo: str, issue: GhIssue) -> MemoryItem:
     head = (
-        f"Feature request from GitHub issue #{issue.number} in {repo}: {issue.title} "
+        f"Feature request from GitHub issue #{issue.number} in {repo}: "
+        f"{_one_line(issue.title)} "
         f"(state: {issue.state}; labels: {_labels(issue)})."
     )
     return MemoryItem(
@@ -169,11 +176,12 @@ def pull_item(repo: str, pr: GhPull, files: list[str]) -> MemoryItem:
     if pr.closes_issues:
         status += "; closes issues " + ", ".join(f"#{n}" for n in pr.closes_issues)
     modules = ", ".join(dict.fromkeys(module_of(f) for f in files)) or "none"
-    shown = ", ".join(files[:_FILE_LIMIT]) or "none"
+    shown = ", ".join(_one_line(f) for f in files[:_FILE_LIMIT]) or "none"
     if len(files) > _FILE_LIMIT:
         shown += f" (+{len(files) - _FILE_LIMIT} more)"
     head = (
-        f"Pull request #{pr.number} in {repo} by @{pr.author.login}: {pr.title} "
+        f"Pull request #{pr.number} in {repo} by @{_one_line(pr.author.login)}: "
+        f"{_one_line(pr.title)} "
         f"({status}).\nModules touched: {modules}\nFiles: {shown}"
     )
     return MemoryItem(
@@ -186,11 +194,13 @@ def pull_item(repo: str, pr: GhPull, files: list[str]) -> MemoryItem:
 
 def _code_line(root: GhReviewComment, symbol: Symbol | None) -> str:
     line = root.original_line or root.line
+    path = _one_line(root.path)
     if root.subject_type == "file" or line is None:
-        return f"Code: {root.path} (file-level)"
+        return f"Code: {path} (file-level)"
     if symbol is None:
-        return f"Code: {root.path}:{line}"
-    return f"Code: {root.path}:{line} in {symbol.kind.lower()} {symbol.qualname}"
+        return f"Code: {path}:{line}"
+    qualname = _one_line(symbol.qualname)
+    return f"Code: {path}:{line} in {symbol.kind.lower()} {qualname}"
 
 
 def review_item(
@@ -199,8 +209,8 @@ def review_item(
     root = thread.root
     lines = [
         (
-            f"Review rule from human reviewer @{root.author.login} "
-            f"({root.association}) on pull request #{pr.number} in {repo} "
+            f"Review rule from human reviewer @{_one_line(root.author.login)} "
+            f"({_one_line(root.association)}) on pull request #{pr.number} in {repo} "
             f"(origin=human, module_path={module_of(root.path)})."
         ),
         _code_line(root, symbol),
@@ -209,13 +219,13 @@ def review_item(
     if thread.replies:
         lines.append("Discussion:")
         lines.extend(
-            f"@{r.author.login}: {_cut(' '.join(r.body.split()), _REPLY_TEXT_LIMIT)}"
+            f"@{_one_line(r.author.login)}: {_cut(_one_line(r.body), _REPLY_TEXT_LIMIT)}"
             for r in thread.replies[:_REPLY_LIMIT]
         )
     hunk = root.diff_hunk.splitlines()[-HUNK_LINES:]
     if hunk:
         lines.append(f"Diff hunk (last {HUNK_LINES} lines):")
-        lines.extend(hunk)
+        lines.append(_indent("\n".join(hunk)))
     return MemoryItem(
         name=f"review:{repo}:{root.id}",
         body="\n".join(lines),
