@@ -2142,3 +2142,77 @@ def test_cli_metrics_bad_config_exits_1(tmp_path):
         cli.app, ["metrics", "--config", str(tmp_path / "missing.yml")]
     )
     assert result.exit_code == 1
+
+
+def _pool_repo(make_repo, name="repo", **contract):
+    files = {**FILES, ".agentco.yml": yaml.safe_dump(CONTRACT | contract)}
+    return make_repo(files, name)
+
+
+def test_cli_pool_fill_disabled_and_no_setup(env, make_repo, tmp_path):
+    repo = _pool_repo(make_repo)
+    result = env("pool", "fill", "--repo-path", str(repo))
+    assert (result.exit_code, result.stdout) == (
+        0,
+        "no setup command; nothing to warm\n",
+    )
+    assert not (repo / ".agentco/pool").exists()
+
+    repo = _pool_repo(make_repo, setup="make setup", name="second")
+    config = tmp_path / "agentco.config.yml"
+    raw = yaml.safe_load(config.read_text())
+    config.write_text(yaml.safe_dump(raw | {"pool": {"size": 0}}))
+    result = env("pool", "fill", "--repo-path", str(repo))
+    assert (result.exit_code, result.stdout) == (0, "pool disabled\n")
+    assert not env.seams.runner.calls
+
+
+def test_cli_pool_fill_warms_entries_and_task_run_claims_one(env, make_repo, tmp_path):
+    repo = _pool_repo(make_repo, setup="make setup")
+    config = tmp_path / "agentco.config.yml"
+    raw = yaml.safe_load(config.read_text())
+    config.write_text(yaml.safe_dump(raw | {"pool": {"size": 1}}))
+
+    result = env("pool", "fill", "--repo-path", str(repo), "--host")
+    assert (result.exit_code, result.stdout) == (0, "pool: added 1\n")
+    assert env.seams.runner.calls == ["make setup"]
+    assert [host for _, _, host in env.seams.runner_args] == [True]
+
+    asyncio.run(
+        env.backend.add(
+            "acme__rnd",
+            Scope.RND,
+            MemoryItem("calc", SEED_FACT, "test", datetime.now(UTC)),
+        )
+    )
+    env.seams.script(happy())
+    task_id = _new_task(env)
+    result = _run_task(env, repo, str(task_id))
+
+    assert result.exit_code == 0, result.stdout
+    assert env.seams.runner.calls.count("make setup") == 1  # the task skipped it
+    assert env.store.get_meta(f"task:{task_id}:setup") == "pool"
+    assert env.store.get_meta(f"pool:acme:hit:{task_id}") is not None
+
+
+def test_cli_pool_fill_reports_a_failing_setup(env, make_repo):
+    repo = _pool_repo(make_repo, setup="make setup")
+    env.seams.runner.codes["make setup"] = 2
+    result = env("pool", "fill", "--repo-path", str(repo))
+    assert result.exit_code == 4
+    assert "pool: added 0" in result.stdout and "setup" in result.stdout
+    assert not list((repo / ".agentco/pool").glob("*.json"))
+
+
+def test_task_run_without_setup_passes_no_pool(env, repo, monkeypatch):
+    seen = []
+    real = cli.TaskContext
+
+    def spy(**kwargs):
+        seen.append(kwargs.get("pool", "unset"))
+        return real(**kwargs)
+
+    monkeypatch.setattr(cli, "TaskContext", spy)
+    _over_budget(env)
+    _run_task(env, repo, str(_new_task(env)))
+    assert seen == [None]

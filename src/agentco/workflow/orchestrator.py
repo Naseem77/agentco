@@ -40,10 +40,13 @@ from agentco.llm.runtime import AgentRuntime
 from agentco.memory.gate import MemoryGate
 from agentco.repo_contract import RepoContract
 from agentco.roles import Role
+from agentco.sandbox.pool import PoolSetupFailed, WorktreePool, run_setup
 from agentco.sandbox.runner import CommandRunner
 from agentco.sandbox.worktree import (
     GitError,
     Worktree,
+    _run,
+    branch_name,
     changed_lines,
     commit_all,
     count_commits,
@@ -94,6 +97,7 @@ class TaskContext:
     contract: RepoContract
     runner: CommandRunner
     main: str = "main"
+    pool: WorktreePool | None = None
 
 
 class Orchestrator:
@@ -301,9 +305,70 @@ class _Run:
         if base is None:
             base = await self._refresh_base()
         async with _repo_lock(self.ctx.repo_root):
-            return await asyncio.to_thread(
-                create_worktree, self.ctx.repo_root, self.task_id, base
+            return await self._acquire_worktree(base)
+
+    async def _acquire_worktree(self, base: str) -> Worktree:
+        """The task's worktree: its pool entry, else a plain one (setup runs there).
+
+        Only a task that is starting fresh may claim a pool entry. One whose
+        worktree, local branch or PR exists already is resuming, and an entry
+        starts from `main`, not from that work.
+        """
+        ctx, pool = self.ctx, self.ctx.pool
+        if pool is not None:
+            owned = await asyncio.to_thread(pool.owned_by, self.task_id, base)
+            if owned is not None:
+                await self._note_pool_hit(pool)
+                return owned
+        if pool is not None and not await self._resuming():
+            claimed = await asyncio.to_thread(pool.claim, self.task_id, base)
+            if claimed is not None:
+                wt, entry = claimed
+                self._set("setup", "pool")
+                self.store.set_meta(self._pool_key("hit"), str(entry.setup_s))
+                return wt
+        wt = await asyncio.to_thread(create_worktree, ctx.repo_root, self.task_id, base)
+        await self._setup(wt)
+        return wt
+
+    async def _resuming(self) -> bool:
+        default_path = self.ctx.repo_root / ".agentco" / "worktrees" / str(self.task_id)
+        return (
+            default_path.exists()
+            or self._is_pr_round()
+            or await asyncio.to_thread(self._local_branch_exists)
+        )
+
+    def _pool_key(self, kind: str) -> str:
+        return f"pool:{self.ctx.cfg.tenant}:{kind}:{self.task_id}"
+
+    def _local_branch_exists(self) -> bool:
+        ref = f"refs/heads/{branch_name(self.task_id)}"
+        proc = _run(self.ctx.repo_root, "rev-parse", "--verify", "--quiet", ref)
+        return proc.returncode == 0
+
+    async def _note_pool_hit(self, pool: WorktreePool) -> None:
+        """Record a claim whose bookkeeping a crash cut off."""
+        if self._meta("setup") is not None:
+            return
+        entry = await asyncio.to_thread(pool.entry_of, self.task_id)
+        self._set("setup", "pool")
+        if entry is not None:
+            self.store.set_meta(self._pool_key("hit"), str(entry.setup_s))
+
+    async def _setup(self, wt: Worktree) -> None:
+        setup = self.ctx.contract.setup
+        if setup is None or self._meta("setup") == "done":
+            return  # "pool" here means the claimed entry is gone: set up this one
+        timeout = self.ctx.cfg.pool.setup_timeout_s
+        try:
+            seconds = await asyncio.to_thread(
+                run_setup, self.ctx.runner, self.ctx.contract, wt.path, timeout
             )
+        except PoolSetupFailed as e:
+            raise StepFailed(self.task().state, f"setup failed: {e}") from e
+        self._set("setup", "done")
+        self.store.set_meta(self._pool_key("miss"), str(seconds))
 
     async def _refresh_base(self) -> str:
         async with _repo_lock(self.ctx.repo_root):

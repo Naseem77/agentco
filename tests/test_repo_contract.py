@@ -140,3 +140,12 @@ def test_non_utf8(tmp_path):
     (tmp_path / ".agentco.yml").write_bytes(b"build: \xff\xfe\n")
     with pytest.raises(RepoContractError, match="UTF-8"):
         load_repo_contract(tmp_path)
+
+
+def test_contract_setup_optional(tmp_path):
+    write_contract(tmp_path)
+    assert load_repo_contract(tmp_path).setup is None
+    write_contract(tmp_path, setup="uv sync")
+    assert load_repo_contract(tmp_path).setup == "uv sync"
+    write_contract(tmp_path, setup="  ")
+    assert contract_errors(tmp_path)[0][0] == ("setup",)

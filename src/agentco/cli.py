@@ -48,8 +48,9 @@ from agentco.repo_contract import (
     load_repo_contract,
 )
 from agentco.roles import Role
+from agentco.sandbox.pool import WorktreePool, run_setup
 from agentco.sandbox.runner import CommandRunner, runner_for
-from agentco.sandbox.worktree import GitError
+from agentco.sandbox.worktree import GitError, refresh_main
 from agentco.store.models import ArtifactKind, TaskRecord
 from agentco.store.task_store import TaskStore
 from agentco.webhook import IntakeTrigger, make_server
@@ -79,7 +80,9 @@ app = typer.Typer(no_args_is_help=True, help="A company of AI agents.")
 memory_app = typer.Typer(no_args_is_help=True, help="Query company memory.")
 task_app = typer.Typer(no_args_is_help=True, help="Manage tasks.")
 app.add_typer(memory_app, name="memory")
+pool_app = typer.Typer(no_args_is_help=True, help="Warm worktrees.")
 app.add_typer(task_app, name="task")
+app.add_typer(pool_app, name="pool")
 
 ConfigOption = typer.Option(
     Path("agentco.config.yml"), "--config", help="Path to the tenant config."
@@ -556,6 +559,12 @@ def task_run(
     for task in tasks:
         _remember_target(store, task.id, repo, main)
 
+    pool = (
+        WorktreePool(checkout, cfg.pool.size)
+        if cfg.pool.size > 0 and contract.setup
+        else None
+    )
+
     async def _run() -> tuple[list[TaskRecord | BaseException], list[LearnReport]]:
         async with _started(make_runtime(cfg)) as runtime:
             gate = MemoryGate(cfg.tenant, _build_backend(cfg))
@@ -570,6 +579,7 @@ def task_run(
                 contract=contract,
                 runner=make_command_runner(contract, checkout, host),
                 main=main,
+                pool=pool,
             )
             outcomes = await run_many([(ctx, t.id) for t in tasks], cfg.concurrency)
             finished = [r.id for r in outcomes if isinstance(r, TaskRecord)]
@@ -600,6 +610,49 @@ def task_run(
     _echo_warnings(learned)
     if code:
         raise typer.Exit(code)
+
+
+@pool_app.command("fill")
+def pool_fill(
+    repo_path: Annotated[
+        Path, typer.Option("--repo-path", help="Local checkout to keep warm.")
+    ] = Path("."),
+    main: Annotated[str, typer.Option("--main", help="The base branch.")] = "main",
+    host: Annotated[
+        bool,
+        typer.Option("--host", help="Run setup on this machine, not in the sandbox."),
+    ] = False,
+    config: Path = ConfigOption,
+) -> None:
+    """Prepare worktrees ahead of time by running the contract's `setup`."""
+    cfg = _load(config)
+    if cfg.pool.size == 0:
+        typer.echo("pool disabled")
+        return
+    try:
+        checkout = repo_root(repo_path)
+        contract = load_repo_contract(checkout)
+    except (ValueError, NotAGitRepo, RepoContractMissing) as e:
+        raise _fail(str(e)) from e
+    if not contract.setup:
+        typer.echo("no setup command; nothing to warm")
+        return
+    runner = make_command_runner(contract, checkout, host)
+    pool = WorktreePool(checkout, cfg.pool.size)
+
+    def prepare(path: Path) -> float:
+        return run_setup(runner, contract, path, cfg.pool.setup_timeout_s)
+
+    try:
+        base = refresh_main(checkout, main)
+        added = pool.fill(base, prepare)
+    except GitError as e:
+        raise _fail(str(e), 3) from e
+    typer.echo(f"pool: added {added}")
+    for failure in pool.failures:
+        typer.echo(f"setup failed: {_one_line(failure)}")
+    if pool.failures:
+        raise typer.Exit(4)
 
 
 def _escalation_of(store: TaskStore, task_id: int) -> dict:
