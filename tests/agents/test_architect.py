@@ -1,13 +1,16 @@
 import json
 
 import pytest
+import yaml
 from pydantic import ValidationError
 
 from agentco.agents.architect import (
     MAX_SUB_TASKS,
     ADRReply,
+    ContractProposal,
     SubTask,
     adr_markdown,
+    propose_contract,
     run_architect,
 )
 from agentco.agents.prompts import load_prompt
@@ -137,3 +140,103 @@ def test_adr_markdown_lists_subtasks():
 
 def test_architect_prompt_loads():
     assert "sub-task" in load_prompt(Role.ARCHITECT)
+
+
+CONTRACT = {
+    "build": "make build",
+    "test": "pytest",
+    "e2e": None,
+    "lint": "ruff check",
+    "sandbox": {"devcontainer": ".devcontainer"},
+}
+
+
+def contract_json(contract: dict | None = None, rationale: str = "from the Makefile"):
+    return json.dumps(
+        {
+            "contract_yaml": yaml.safe_dump(contract or CONTRACT),
+            "rationale": rationale,
+        }
+    )
+
+
+async def test_propose_contract_is_read_only_and_stores_artifact(
+    store, loop_cfg, tmp_path
+):
+    rt, task, asker, gate = make(store, loop_cfg, [contract_json()])
+
+    proposal = await propose_contract(asker, loop_cfg, gate, task, tmp_path)
+
+    [call] = rt.calls
+    assert call.model == loop_cfg.roles[Role.ARCHITECT].model
+    assert call.edits is False and call.workdir == tmp_path
+    assert call.system.startswith(load_prompt(Role.ARCHITECT, "contract"))
+    assert "memory_add" not in {t.name for t in call.tools}
+    art = store.latest_artifact(task.id, ArtifactKind.CONTRACT)
+    assert art.role is Role.ARCHITECT
+    assert art.body == {
+        "contract_yaml": proposal.contract_yaml,
+        "rationale": "from the Makefile",
+    }
+
+
+async def test_propose_contract_passes_note_and_previous_draft(
+    store, loop_cfg, tmp_path
+):
+    rt, task, asker, gate = make(
+        store, loop_cfg, [contract_json(), contract_json({**CONTRACT, "test": "tox"})]
+    )
+
+    first = await propose_contract(asker, loop_cfg, gate, task, tmp_path)
+    await propose_contract(
+        asker, loop_cfg, gate, task, tmp_path, human_note="we use tox"
+    )
+
+    assert "Human guidance" not in rt.calls[0].prompt
+    assert "Human guidance:\nwe use tox" in rt.calls[1].prompt
+    assert first.contract_yaml in rt.calls[1].prompt
+
+
+@pytest.mark.parametrize(
+    "contract_yaml",
+    [
+        "build: [unclosed",
+        "- a\n- b\n",
+        yaml.safe_dump({**CONTRACT, "surprise": 1}),
+        yaml.safe_dump({k: v for k, v in CONTRACT.items() if k != "e2e"}),
+        yaml.safe_dump({**CONTRACT, "sandbox": {}}),
+        yaml.safe_dump({**CONTRACT, "test": "make a && make b"}),
+        yaml.safe_dump({**CONTRACT, "build": "make $TARGET"}),
+        yaml.safe_dump({**CONTRACT, "lint": "ruff check > out"}),
+        yaml.safe_dump({**CONTRACT, "setup": "pip install -e . ; true"}),
+        yaml.safe_dump({**CONTRACT, "test_files": "pytest {files} | cat"}),
+        yaml.safe_dump({**CONTRACT, "env_passthrough": ["GH_TOKEN"]}),
+        yaml.safe_dump({**CONTRACT, "sandbox": {"devcontainer": "/etc"}}),
+        yaml.safe_dump({**CONTRACT, "sandbox": {"devcontainer": "../x"}}),
+        "build: x\n" * 1000,
+    ],
+)
+def test_contract_proposal_rejects_unsafe_or_invalid_yaml(contract_yaml):
+    with pytest.raises(ValidationError):
+        ContractProposal(contract_yaml=contract_yaml, rationale="r")
+
+
+def test_contract_proposal_accepts_a_valid_contract():
+    data = {**CONTRACT, "setup": "pip install -e .", "test_files": "pytest {files}"}
+    proposal = ContractProposal(contract_yaml=yaml.safe_dump(data), rationale="r")
+    assert yaml.safe_load(proposal.contract_yaml)["setup"] == "pip install -e ."
+
+
+async def test_invalid_contract_reply_is_retried_once(store, loop_cfg, tmp_path):
+    bad = json.dumps({"contract_yaml": "build: x", "rationale": "r"})
+    rt, task, asker, gate = make(store, loop_cfg, [bad, contract_json()])
+
+    await propose_contract(asker, loop_cfg, gate, task, tmp_path)
+
+    assert len(rt.calls) == 2
+    assert len(store.artifacts(task.id, ArtifactKind.CONTRACT)) == 1
+
+
+def test_architect_contract_prompt_loads():
+    text = load_prompt(Role.ARCHITECT, "contract")
+    assert ".agentco.yml" in text and "JSON" in text
