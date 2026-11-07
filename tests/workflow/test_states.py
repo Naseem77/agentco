@@ -38,3 +38,7 @@ def test_back_to_first_floor_edges_are_allowed():
         (TaskState.PR_OPEN, TaskState.TRIAGE),
         (TaskState.PREFLIGHT, TaskState.TRIAGE),
     }
+
+
+def test_awaiting_human_can_be_merged():
+    assert TaskState.MERGED in ALLOWED_TRANSITIONS[TaskState.AWAITING_HUMAN]

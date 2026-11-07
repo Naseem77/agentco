@@ -53,6 +53,7 @@ from agentco.sandbox.worktree import (
 )
 from agentco.store.models import Artifact, ArtifactKind, TaskRecord
 from agentco.store.task_store import TaskStore
+from agentco.workflow.escalation import effective_budgets
 from agentco.workflow.pr import pr_body, pr_title
 from agentco.workflow.preflight import CheckResult, Preflight, PreflightReport
 from agentco.workflow.states import TaskState
@@ -219,15 +220,7 @@ class _Run:
         return self.store.transition(self.task_id, to, actor, reason)
 
     def _budgets(self) -> Budgets:
-        budgets = self.ctx.cfg.budgets
-        extra = float(self._meta("extra_budget") or 0)
-        rounds = self._meta("max_rounds")
-        return budgets.model_copy(
-            update={
-                "per_task_usd": budgets.per_task_usd + extra,
-                "max_rounds": int(rounds) if rounds else budgets.max_rounds,
-            }
-        )
+        return effective_budgets(self.ctx.cfg, self.store, self.task_id)
 
     def _issue(self) -> PMReply:
         artifact = self._latest(ArtifactKind.ISSUE)
