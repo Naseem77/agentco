@@ -351,3 +351,133 @@ def test_remove_worktree(make_repo):
     remove_worktree(root, wt.path)
     assert not wt.path.exists()
     assert "agentco/task-1" not in git(root, "worktree", "list")
+
+
+def _blob(root: Path, text: str) -> str:
+    return subprocess.run(
+        ["git", "hash-object", "-w", "--stdin"],
+        cwd=root,
+        input=text,
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout.strip()
+
+
+def _mktree(root: Path, *entries: tuple[str, str, str, str]) -> str:
+    lines = "".join(
+        f"{mode} {kind} {sha}\t{name}\n" for mode, kind, sha, name in entries
+    )
+    return subprocess.run(
+        ["git", "mktree"],
+        cwd=root,
+        input=lines,
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout.strip()
+
+
+def _point_branch_at_tree(root: Path, wt, tree: str) -> None:
+    commit = git(root, "commit-tree", tree, "-m", "crafted", "-p", "HEAD").strip()
+    git(root, "update-ref", f"refs/heads/{wt.branch}", commit)
+
+
+def _snapshot_must_fail_cleanly(wt, tmp_path: Path) -> None:
+    outer = tmp_path / "outer"
+    outer.mkdir()
+    with pytest.raises(GitError):
+        make_snapshot(wt, outer / "snap")
+    assert list(outer.iterdir()) == []
+
+
+def test_snapshot_rejects_case_colliding_symlink_dir_without_stray_writes(
+    make_repo, tmp_path
+):
+    root = make_repo({"a.py": "x = 1\n"})
+    wt = create_worktree(root, 1, "main")
+    up = _blob(root, "..")
+    inner = _mktree(root, ("120000", "blob", _blob(root, "x"), "x"))
+    tree = _mktree(root, ("120000", "blob", up, "Z"), ("040000", "tree", inner, "z"))
+    _point_branch_at_tree(root, wt, tree)
+    _snapshot_must_fail_cleanly(wt, tmp_path)
+
+
+def test_snapshot_rejects_duplicate_symlink_and_dir_without_stray_writes(
+    make_repo, tmp_path
+):
+    root = make_repo({"a.py": "x = 1\n"})
+    wt = create_worktree(root, 1, "main")
+    inner = _mktree(root, ("120000", "blob", _blob(root, "x"), "b"))
+    tree = _mktree(
+        root,
+        ("120000", "blob", _blob(root, ".."), "a"),
+        ("040000", "tree", inner, "a"),
+    )
+    _point_branch_at_tree(root, wt, tree)
+    _snapshot_must_fail_cleanly(wt, tmp_path)
+
+
+def test_snapshot_rejects_file_under_file(make_repo, tmp_path):
+    root = make_repo({"a.py": "x = 1\n"})
+    wt = create_worktree(root, 1, "main")
+    inner = _mktree(root, ("100644", "blob", _blob(root, "y"), "b"))
+    tree = _mktree(
+        root,
+        ("100644", "blob", _blob(root, "x"), "a"),
+        ("040000", "tree", inner, "a"),
+    )
+    _point_branch_at_tree(root, wt, tree)
+    _snapshot_must_fail_cleanly(wt, tmp_path)
+
+
+def test_snapshot_rejects_link_under_link(make_repo, tmp_path):
+    root = make_repo({"a.py": "x = 1\n"})
+    wt = create_worktree(root, 1, "main")
+    inner = _mktree(root, ("120000", "blob", _blob(root, "x"), "b"))
+    tree = _mktree(
+        root,
+        ("120000", "blob", _blob(root, "d"), "a"),
+        ("040000", "tree", inner, "a"),
+    )
+    _point_branch_at_tree(root, wt, tree)
+    _snapshot_must_fail_cleanly(wt, tmp_path)
+
+
+def test_snapshot_rejects_case_colliding_files(make_repo, tmp_path):
+    root = make_repo({"a.py": "x = 1\n"})
+    wt = create_worktree(root, 1, "main")
+    tree = _mktree(
+        root,
+        ("100644", "blob", _blob(root, "1"), "Readme"),
+        ("100644", "blob", _blob(root, "2"), "readme"),
+    )
+    _point_branch_at_tree(root, wt, tree)
+    _snapshot_must_fail_cleanly(wt, tmp_path)
+
+
+def test_snapshot_handles_gitlink_as_empty_directory(make_repo, tmp_path):
+    root = make_repo({"a.py": "x = 1\n"})
+    git(root, "update-index", "--add", "--cacheinfo", f"160000,{'1' * 40},sub")
+    git(root, "commit", "-m", "add submodule")
+    wt = create_worktree(root, 1, "main")
+    snap = make_snapshot(wt, tmp_path / "snap")
+    assert (snap / "a.py").read_text() == "x = 1\n"
+    assert (snap / "sub").is_dir() and list((snap / "sub").iterdir()) == []
+    assert git(snap, "log", "--format=%s").strip() == "agentco: snapshot"
+
+
+def test_snapshot_converts_unexpected_errors_and_cleans_dest(
+    make_repo, tmp_path, monkeypatch
+):
+    root = make_repo({"a.py": "x = 1\n"})
+    wt = create_worktree(root, 1, "main")
+
+    def boom(*args, **kwargs):
+        raise IndexError("surprise")
+
+    monkeypatch.setattr("agentco.sandbox.worktree._read_blobs", boom)
+    dest = tmp_path / "snap"
+    with pytest.raises(GitError):
+        make_snapshot(wt, dest)
+    assert not dest.exists()

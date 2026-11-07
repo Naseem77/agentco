@@ -6,8 +6,10 @@ no prompts, and a fixed agentco identity.
 """
 
 import os
+import posixpath
 import shutil
 import subprocess
+import unicodedata
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -211,36 +213,88 @@ def _safe_rel(path: str) -> Path:
     return Path(*parts)
 
 
+_BLOB_MODES = {"100644", "100755", "120000"}
+
+
+def _fold(path: str) -> str:
+    # macOS APFS is case-insensitive and normalization-insensitive
+    return unicodedata.normalize("NFD", path).casefold()
+
+
+def _validate_entries(entries: list[tuple[str, str, str]]) -> None:
+    """Reject trees that could write outside dest or collide on disk.
+
+    Checked up front, before anything is written: a symlink whose lexical
+    target is absolute or leaves dest; duplicate or case-colliding paths; and
+    any path that lies under another entry (file-under-file, anything under a
+    symlink or gitlink).
+    """
+    seen = {_fold(path) for _, _, path in entries}
+    if len(seen) != len(entries):
+        raise GitError("refusing snapshot with duplicate or case-colliding paths")
+    for _mode, _sha, path in entries:
+        parts = path.split("/")
+        for i in range(1, len(parts)):
+            if _fold("/".join(parts[:i])) in seen:
+                raise GitError(f"refusing snapshot: {path!r} lies under another entry")
+
+
+def _check_inside(root: Path, directory: Path) -> None:
+    if not Path(os.path.realpath(directory)).is_relative_to(root):
+        raise GitError(f"snapshot path {directory} resolves outside dest")
+
+
+def _make_parent(root: Path, target: Path) -> None:
+    ancestor = target.parent
+    while not ancestor.exists() and ancestor != root:
+        ancestor = ancestor.parent
+    _check_inside(root, ancestor)
+    target.parent.mkdir(parents=True, exist_ok=True)
+    _check_inside(root, target.parent)
+
+
 def _materialize(wt: Worktree, dest: Path) -> None:
     """Copy HEAD's committed blobs into dest, with no attribute processing.
 
     Not `git archive`/`checkout-index`: those honour .gitattributes
     (`export-subst` would expand the engineer's commit message into files).
-    Symlinks are recreated as symlinks, after all regular files, and a symlink
-    that is absolute or resolves outside dest raises GitError.
+    Every entry is validated before anything is written. Regular files go
+    first, then symlinks (recreated as symlinks; absolute or escaping targets
+    raise GitError). Gitlinks (submodules) become empty directories, like
+    `git archive`; their content is not in this repo's objects.
     """
     entries = _tree_entries(wt)
-    blobs = _read_blobs(wt, [sha for mode, sha, _ in entries if mode[0] in "01"])
-    links: list[tuple[Path, str]] = []
+    _validate_entries(entries)
+    root = dest.resolve()
+    links: list[tuple[Path, str, str]] = []
+    for mode, _sha, path in entries:
+        if mode == "160000" or mode in _BLOB_MODES:
+            continue
+        raise GitError(f"unsupported mode {mode} for {path!r} in snapshot")
+    blobs = _read_blobs(wt, [sha for mode, sha, _ in entries if mode in _BLOB_MODES])
     for mode, sha, path in entries:
         target = dest / _safe_rel(path)
-        if mode == "160000":  # submodule: archive-like empty directory
-            target.mkdir(parents=True, exist_ok=True)
+        if mode == "160000":
+            _make_parent(root, target)
+            target.mkdir(exist_ok=True)
         elif mode == "120000":
-            links.append((target, blobs[sha].decode(errors="surrogateescape")))
+            link_target = blobs[sha].decode(errors="surrogateescape")
+            resolved = posixpath.normpath(
+                posixpath.join(posixpath.dirname(path), link_target)
+            )
+            if posixpath.isabs(link_target) or resolved.split("/")[0] == "..":
+                raise GitError(f"snapshot symlink {path!r} is absolute or escapes dest")
+            links.append((target, link_target, path))
         else:
-            target.parent.mkdir(parents=True, exist_ok=True)
+            _make_parent(root, target)
             target.write_bytes(blobs[sha])
             target.chmod(0o755 if mode == "100755" else 0o644)
-    root = dest.resolve()
-    for link, link_target in links:
-        if os.path.isabs(link_target):
-            raise GitError(f"snapshot symlink {link.relative_to(dest)} is absolute")
-        link.parent.mkdir(parents=True, exist_ok=True)
+    for link, link_target, _ in links:
+        _make_parent(root, link)
         os.symlink(link_target, link)
-    for link, _ in links:  # after all links exist, so chains are resolved physically
+    for link, _, path in links:  # after all links exist, so chains resolve physically
         if not Path(os.path.realpath(link)).is_relative_to(root):
-            raise GitError(f"snapshot symlink {link.relative_to(dest)} escapes dest")
+            raise GitError(f"snapshot symlink {path!r} escapes dest")
 
 
 def make_snapshot(wt: Worktree, dest: Path) -> Path:
@@ -259,7 +313,7 @@ def make_snapshot(wt: Worktree, dest: Path) -> Path:
         _git(dest, "init", "-b", "main")
         _git(dest, "add", "-A")
         _git(dest, "commit", "--allow-empty", "-m", SNAPSHOT_MESSAGE)
-    except (GitError, OSError, ValueError) as e:
+    except Exception as e:
         _clean(dest, keep_dir=existed)
         if isinstance(e, GitError):
             raise
