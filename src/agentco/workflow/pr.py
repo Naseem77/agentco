@@ -1,4 +1,5 @@
 import re
+from collections.abc import Sequence
 
 from agentco.agents.lead import LeadDecision
 from agentco.agents.qa import QAReply
@@ -96,6 +97,8 @@ def pr_body(
     qa: QAReply | None,
     preflight: PreflightReport,
     source_issue: int | None,
+    *,
+    feedback: tuple[int, Sequence[str]] | None = None,
 ) -> str:
     def build(max_rows: int | None) -> str:
         blocks = [
@@ -109,6 +112,15 @@ def pr_body(
             _qa_section(qa, max_rows),
             _preflight_section(preflight),
         ]
+        if feedback is not None:
+            round_, titles = feedback
+            blocks.append(
+                [
+                    f"## PR feedback addressed (round {round_})",
+                    "",
+                    *(f"- {_one_line(t)}" for t in titles),
+                ]
+            )
         if source_issue is not None:
             blocks.append([f"Closes #{source_issue}"])
         blocks.append([HUMAN_MERGES])

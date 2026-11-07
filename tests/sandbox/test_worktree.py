@@ -1,8 +1,10 @@
+import shutil
 import subprocess
 from pathlib import Path
 
 import pytest
 
+from agentco.sandbox import worktree
 from agentco.sandbox.worktree import (
     GitError,
     Worktree,
@@ -411,6 +413,83 @@ def test_push_branch_never_forces_a_branch_that_is_not_a_task_branch(
 
     assert str(err.value) == "refusing to push 'main': not an agentco task branch"
     assert _remote_sha(root, tmp_path, "main") == main_sha
+
+
+def test_push_argv_uses_lease_never_force(make_repo, monkeypatch):
+    root = make_repo({"a.py": "x = 1\n"})
+    wt = create_worktree(root, 5, "main")
+    pushes: list[tuple[str, ...]] = []
+    real = worktree._git
+
+    def spy(cwd, *args):
+        if args[0] == "push":
+            pushes.append(args)
+        return real(cwd, *args)
+
+    monkeypatch.setattr(worktree, "_git", spy)
+    push_branch(wt)
+
+    [argv] = pushes
+    assert any(a.startswith("--force-with-lease=") for a in argv)
+    assert "--force" not in argv and "-f" not in argv
+
+
+def test_removed_worktree_directory_recovers_the_local_branch(make_repo):
+    root = make_repo({"a.py": "x = 1\n"})
+    wt = create_worktree(root, 5, "main")
+    (wt.path / "b.py").write_text("y = 1\n")
+    sha = commit_all(wt, "task")
+    shutil.rmtree(wt.path)
+
+    again = create_worktree(root, 5, "main")
+
+    assert again.path.exists() and head_sha(again) == sha
+
+
+def test_removed_worktree_and_branch_recover_from_origin(make_repo):
+    root = make_repo({"a.py": "x = 1\n"})
+    wt = create_worktree(root, 5, "main")
+    (wt.path / "b.py").write_text("y = 1\n")
+    sha = commit_all(wt, "task")
+    push_branch(wt)
+    shutil.rmtree(wt.path)
+    git(root, "worktree", "prune")
+    git(root, "branch", "-D", "agentco/task-5")
+
+    again = create_worktree(root, 5, "main")
+
+    assert head_sha(again) == sha
+    assert (again.path / "b.py").read_text() == "y = 1\n"
+
+
+def test_missing_branch_everywhere_starts_from_the_base(make_repo):
+    root = make_repo({"a.py": "x = 1\n"})
+    main_sha = git(root, "rev-parse", "main").strip()
+
+    wt = create_worktree(root, 9, "main")
+
+    assert head_sha(wt) == main_sha
+
+
+def test_unreachable_origin_never_restarts_a_task_branch_from_the_base(
+    make_repo, tmp_path
+):
+    root = make_repo({"a.py": "x = 1\n"})
+    git(root, "remote", "set-url", "origin", str(tmp_path / "missing.git"))
+
+    with pytest.raises(GitError):
+        create_worktree(root, 9, "main")
+
+    assert "agentco/task-9" not in git(root, "branch", "--list")
+
+
+def test_a_repo_without_origin_still_creates_worktrees(make_repo):
+    root = make_repo({"a.py": "x = 1\n"})
+    git(root, "remote", "remove", "origin")
+
+    wt = create_worktree(root, 2, "main")
+
+    assert wt.path.exists()
 
 
 def test_commit_counting_helpers(make_repo):
