@@ -1,3 +1,4 @@
+import hashlib
 from dataclasses import replace
 from datetime import UTC, datetime, timedelta
 
@@ -242,8 +243,14 @@ def test_dismissed_and_empty_reviews_skipped(store, tracked, gh):
     gh.add_review(R(2, state="APPROVED", body=""))
     gh.add_review(R(3, state="COMMENTED", body="   "))
     gh.add_review(R(4, state="CHANGES_REQUESTED", body="fix the race"))
-    gh.add_review(R(5, state="APPROVED", body="LGTM"))
-    assert [f.id for f in collect(store, gh, tracked)] == ["r4", "r5"]
+    assert [f.id for f in collect(store, gh, tracked)] == ["r4"]
+
+
+def test_approved_review_is_not_feedback_even_with_a_body(store, tracked, gh):
+    gh.add_review(R(1, state="APPROVED", body="LGTM"))
+    gh.add_review(R(2, state="COMMENTED", body="LGTM"))
+    gh.add_review(R(3, state="CHANGES_REQUESTED", body="LGTM"))
+    assert [f.id for f in collect(store, gh, tracked)] == ["r2", "r3"]
 
 
 def test_reviews_before_since_or_unsubmitted_are_skipped(store, tracked, gh):
@@ -360,6 +367,33 @@ def test_fingerprint_depends_on_path_and_text():
     assert base != fingerprint("b.py", "missing check")
     assert base != fingerprint("a.py", "different words")
     assert fingerprint(None, "x") == fingerprint("", "x")
+
+
+def test_fence_only_bodies_fingerprint_by_their_content():
+    a = "```suggestion\nx = foo()\n```"
+    b = "```suggestion\nreturn bar\n```"
+    assert fingerprint("a.py", a) != fingerprint("a.py", b)
+    assert fingerprint("a.py", a) == fingerprint(
+        "a.py", "```suggestion\nx = foo()\n```"
+    )
+    assert fingerprint("a.py", a) == fingerprint(
+        "a.py", "```suggestion\n  x  =  foo()\n```"
+    )
+
+
+def test_url_only_and_digit_only_bodies_fingerprint_by_their_content():
+    assert fingerprint("a.py", "https://x.org/a") != fingerprint(
+        "a.py", "https://x.org/b"
+    )
+    assert fingerprint("a.py", "12") != fingerprint("a.py", "40")
+    assert fingerprint("a.py", "12") == fingerprint("a.py", " 12\n")
+
+
+def test_check_matrix_jobs_get_different_fingerprints(store, tracked, gh):
+    gh.set_checks("sha1", [K(1, name="tests (3.11)"), K(2, name="tests (3.12)")])
+    a, b = collect(store, gh, tracked)
+    assert a.fingerprint != b.fingerprint
+    assert a.fingerprint == hashlib.sha1(b"\ncheck:tests (3.11)").hexdigest()[:12]
 
 
 def test_fingerprint_shape_and_value():

@@ -233,6 +233,19 @@ def test_fake_created_pull_is_readable_and_mutable():
     assert [p.number for p in gh.pulls("acme/app")] == [ref.number]
 
 
+def test_fake_find_open_pull_ignores_closed_and_merged_pulls():
+    gh = FakeGitHub([], [], [], {})
+    ref = gh.create_pull("acme/app", "agentco/task-1", "main", "t", "b")
+    assert gh.find_open_pull("acme/app", "agentco/task-1") == ref
+    pull = gh.get_pull("acme/app", ref.number)
+    gh.upsert_pull(replace(pull, state="closed"))
+    assert gh.find_open_pull("acme/app", "agentco/task-1") is None
+    gh.upsert_pull(replace(pull, state="open", merged_at=NOW))
+    assert gh.find_open_pull("acme/app", "agentco/task-1") is None
+    gh.upsert_pull(pull)
+    assert gh.find_open_pull("acme/app", "agentco/task-1") == ref
+
+
 def test_fake_get_pull_unknown_number_is_github_error():
     with pytest.raises(GitHubError) as err:
         FakeGitHub([], [], [], {}).get_pull("acme/app", 99)

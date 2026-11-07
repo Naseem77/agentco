@@ -31,7 +31,15 @@ def fingerprint(path: str | None, body: str) -> str:
     text = _URL_RE.sub(" ", text)
     text = _DIGITS_RE.sub("", text)
     normalized = _SPACE_RE.sub(" ", text).strip()
+    if not normalized:
+        # Fence-, URL- or digit-only: the text that was stripped is all there is.
+        normalized = _SPACE_RE.sub(" ", body).strip()
     return hashlib.sha1(f"{path or ''}\n{normalized}".encode()).hexdigest()[:12]
+
+
+def _check_fingerprint(name: str) -> str:
+    """Check names are identifiers: `tests (3.11)` and `tests (3.12)` are different jobs."""
+    return hashlib.sha1(f"\ncheck:{name}".encode()).hexdigest()[:12]
 
 
 class PRFinding(BaseModel):
@@ -135,7 +143,7 @@ def collect_findings(
     ]
     for review in gh.pull_reviews(repo, tp.number):
         if (
-            review.state == "DISMISSED"
+            review.state in ("DISMISSED", "APPROVED")
             or not review.body.strip()
             or review.submitted_at is None
             or _aware(review.submitted_at) < _aware(since)
@@ -173,7 +181,7 @@ def collect_findings(
                 body=f"CI check {check.name}: {check.conclusion}"[:MAX_BODY],
                 url=check.url,
                 created_at=check.completed_at or since,
-                fingerprint=fingerprint(None, f"check:{check.name}"),
+                fingerprint=_check_fingerprint(check.name),
             )
         )
     fresh = [

@@ -215,6 +215,36 @@ def test_real_bug_beats_tradeoff():
     assert [f.id for f in d.findings_to_fix] == ["c1"]
 
 
+def test_tradeoff_with_real_bug_is_carried_not_classified():
+    d = decide([PF("c1"), PF("c2")], R(("c1", "real_bug"), ("c2", "tradeoff")))
+    assert d.outcome == "reenter"
+    assert d.carried == ("c2",)
+    assert [c.finding_id for c in d.classifications] == ["c1"]
+
+
+def test_tradeoff_with_conflict_or_new_pattern_is_carried():
+    findings = [PF("c1"), PF("c2"), PF("c3")]
+    reply = R(("c1", "tradeoff"), ("c2", "edge_case"), conflicts=["a vs b"])
+    d = decide(findings, reply)
+    assert (d.outcome, d.category, d.carried) == ("escalate", "new", ("c1",))
+    assert [c.finding_id for c in d.classifications] == ["c2", "c3"]
+    reply = R(("c1", "tradeoff"), new_pattern="use asyncio")
+    d = decide(findings, reply)
+    assert (d.outcome, d.category, d.carried) == ("escalate", "new", ("c1",))
+    assert [c.finding_id for c in d.classifications] == ["c2", "c3"]
+
+
+def test_tradeoff_that_is_asked_now_is_not_carried():
+    d = decide([PF("c1"), PF("c2")], R(("c1", "tradeoff"), ("c2", "covered_style")))
+    assert (d.category, d.carried) == ("tradeoff", ())
+    assert [c.finding_id for c in d.classifications] == ["c1", "c2"]
+
+
+def test_nothing_is_carried_by_default():
+    assert decide([PF("c1")], R(("c1", "real_bug"))).carried == ()
+    assert decide([]).carried == ()
+
+
 def test_edge_case_is_follow_up_alongside_tradeoff():
     d = decide([PF("c1"), PF("c2")], R(("c1", "edge_case"), ("c2", "tradeoff")))
     assert d.category == "tradeoff"
@@ -451,6 +481,50 @@ async def test_classify_round_prompt_carries_issue_and_context(store, loop_cfg, 
         "src/calc.py, src/lex.py",
     ):
         assert expected in prompt
+
+
+async def test_prompt_shows_at_most_50_pending_and_carries_the_rest(
+    store, loop_cfg, gate
+):
+    findings = [PF(f"c{i}", body=f"b{i}", fp=f"fp{i}") for i in range(1, 56)]
+    env = Env(
+        store,
+        loop_cfg,
+        gate,
+        [lead_json(*[(f"c{i}", "real_bug") for i in range(1, 51)])],
+    )
+    d = await env.run(findings)
+    [call] = env.runtime.calls
+    assert call.prompt.count("UNTRUSTED PR FEEDBACK") == 50
+    assert "[c50]" in call.prompt and "[c51]" not in call.prompt
+    assert d.outcome == "reenter"
+    assert d.carried == tuple(f"c{i}" for i in range(51, 56))
+    assert [c.finding_id for c in d.classifications] == [f"c{i}" for i in range(1, 51)]
+    assert [f.id for f in d.findings_to_fix] == [f"c{i}" for i in range(1, 51)]
+
+
+async def test_overflow_and_tradeoff_carries_combine(store, loop_cfg, gate):
+    findings = [PF(f"c{i}", fp=f"fp{i}") for i in range(1, 53)]
+    env = Env(
+        store,
+        loop_cfg,
+        gate,
+        [
+            lead_json(
+                ("c1", "real_bug"),
+                ("c2", "tradeoff"),
+                *[(f"c{i}", "covered_style") for i in range(3, 51)],
+            )
+        ],
+    )
+    d = await env.run(findings)
+    assert d.carried == ("c2", "c51", "c52")
+
+
+async def test_exactly_50_pending_carry_nothing(store, loop_cfg, gate):
+    findings = [PF(f"c{i}", fp=f"fp{i}") for i in range(1, 51)]
+    env = Env(store, loop_cfg, gate, [lead_json(("c1", "real_bug"))])
+    assert (await env.run(findings)).carried == ()
 
 
 async def test_classify_round_without_prior_artifacts_still_asks(store, loop_cfg, gate):

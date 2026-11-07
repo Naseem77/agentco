@@ -382,8 +382,14 @@ class FakeGitHub:
     def find_open_pull(self, repo: str, head: str) -> PullRef | None:
         validate_repo(repo)
         for pull in self.created:
-            if pull["repo"] == repo and pull["head"] == head:
-                return PullRef(number=pull["number"], url=pull["url"])
+            if pull["repo"] != repo or pull["head"] != head:
+                continue
+            current = next((p for p in self._pulls if p.number == pull["number"]), None)
+            if current is not None and (
+                current.state != "open" or current.merged_at is not None
+            ):
+                continue
+            return PullRef(number=pull["number"], url=pull["url"])
         return None
 
     def edit_pull(self, repo: str, number: int, body: str) -> None:

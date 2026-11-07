@@ -1,7 +1,7 @@
 """Classify a PR feedback round: the lead judges, code applies the stop rule (spec §6)."""
 
 import re
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import Literal
 
 from pydantic import Field
@@ -28,6 +28,7 @@ READY_OPTIONS = (
     "reject",
 )
 TRADEOFF_OPTIONS = ("fix", "keep as is")
+MAX_PROMPT_FINDINGS = 50
 _HEADER_FIELD_MAX = 200
 _CATEGORIES = ("real_bug", "edge_case", "tradeoff", "covered_style")
 
@@ -58,6 +59,12 @@ class PRRoundDecision:
     summary: str
     question: str
     options: tuple[str, ...]
+    carried: tuple[str, ...] = ()
+    """Ids of findings NOT handled this round: tradeoffs that were not put to a human
+    because a real bug, a conflict or a new pattern took the round, and pending findings
+    beyond MAX_PROMPT_FINDINGS. They are in no `classifications` entry, so the consumer
+    must store them in no PR_REVIEW artifact and set no marker for them. They then come
+    back as pending findings next round, once the task is back in PR_OPEN."""
 
 
 def prior_categories(store: TaskStore, task_id: int) -> dict[str, str]:
@@ -124,7 +131,16 @@ def decide_pr_round(
             if c.finding_id in pending
         )
 
-    open_findings = [f for f in findings if f.id not in known]
+    all_open = [f for f in findings if f.id not in known]
+    # A tradeoff is a human's call; if another outcome takes this round, ask it next round.
+    deferred = reply is not None and bool(reply.conflicts or reply.new_pattern)
+    deferred = deferred or any(
+        categories.get(f.id, "real_bug") == "real_bug" for f in all_open
+    )
+    carried_ids = tuple(
+        f.id for f in all_open if deferred and categories.get(f.id) == "tradeoff"
+    )
+    open_findings = [f for f in all_open if f.id not in carried_ids]
     # A pending finding the lead did not classify counts as a real bug.
     effective = {f.id: categories.get(f.id, "real_bug") for f in open_findings}
     classifications = tuple(
@@ -163,6 +179,7 @@ def decide_pr_round(
             summary=summary,
             question=question,
             options=options,
+            carried=carried_ids,
         )
 
     if not open_findings:
@@ -263,6 +280,11 @@ async def classify_round(
 ) -> PRRoundDecision:
     pre = preclassify(findings, prior_categories(store, task.id))
     reply: PRLeadReply | None = None
+    overflow = pre.pending[MAX_PROMPT_FINDINGS:]
+    if overflow:
+        shown = {f.id for f in overflow}
+        findings = [f for f in findings if f.id not in shown]
+        pre = replace(pre, pending=pre.pending[:MAX_PROMPT_FINDINGS])
     if pre.pending:
         sections = [
             *_context(store, task),
@@ -279,4 +301,8 @@ async def classify_round(
             timeout_s=cfg.loop.agent_timeout_s,
         )
         reply = await asker.ask(call, PRLeadReply)
-    return decide_pr_round(findings, pre, reply)
+    decision = decide_pr_round(findings, pre, reply)
+    if not overflow:
+        return decision
+    carried = (*decision.carried, *(f.id for f in overflow))
+    return replace(decision, carried=carried)
