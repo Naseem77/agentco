@@ -3,10 +3,12 @@
 Rebase and size fail fast. Every later check runs and every failure is reported,
 so the engineer fixes everything in one round. The `red` check proves the new
 tests fail without the fix, by reverting the source files on a committed clean
-tree and always restoring the worktree afterwards.
+tree and always restoring the worktree afterwards. A check that passed on the
+same tree against the same base commit is not run again.
 """
 
 import asyncio
+from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -28,6 +30,7 @@ from agentco.sandbox.affected import (
     is_test_path,
     test_command,
 )
+from agentco.sandbox.check_cache import CheckCache, base_sha, tree_sha
 from agentco.sandbox.runner import (
     NOT_FOUND_EXIT,
     TIMEOUT_EXIT,
@@ -47,6 +50,7 @@ from agentco.sandbox.worktree import (
 
 DETAIL_LINES = 60
 NO_TESTS_EXIT = 5  # pytest: no tests collected
+RULE_SEP = "\0"
 
 
 @dataclass(frozen=True)
@@ -143,13 +147,34 @@ class Preflight:
     memory: ScopedMemory
     asker: Asker
     reviewer_model: str
+    cache: CheckCache = field(default_factory=CheckCache)
     _prepared: set[Path] = field(default_factory=set, init=False, repr=False)
 
-    async def _command(self, name: str, command: str, wt: Worktree) -> CheckResult:
-        result = await self._exec(command, wt)
-        if result.exit_code == 0:
-            return CheckResult(name, True, "")
-        return CheckResult(name, False, self._failure_detail(result))
+    async def _cached(
+        self,
+        name: str,
+        command: str,
+        stamp: tuple[str, str],
+        check: Callable[[], Awaitable[CheckResult]],
+    ) -> CheckResult:
+        key = self.cache.key(name, command, *stamp)
+        hit = self.cache.get(key)
+        if hit is not None:
+            return hit
+        result = await check()
+        self.cache.put(key, result)
+        return result
+
+    async def _command(
+        self, name: str, command: str, wt: Worktree, stamp: tuple[str, str]
+    ) -> CheckResult:
+        async def check() -> CheckResult:
+            result = await self._exec(command, wt)
+            if result.exit_code == 0:
+                return CheckResult(name, True, "")
+            return CheckResult(name, False, self._failure_detail(result))
+
+        return await self._cached(name, command, stamp, check)
 
     async def _exec(self, command: str, wt: Worktree) -> CommandResult:
         return await asyncio.to_thread(
@@ -191,11 +216,17 @@ class Preflight:
                 )
             )
             return _report(checks)
+        # what every cached result is keyed on: content, and the base it is against
+        stamp = (
+            await asyncio.to_thread(tree_sha, wt),
+            await asyncio.to_thread(base_sha, wt, base),
+        )
 
         try:
             return await self._gate(
                 wt,
                 base,
+                stamp,
                 checks,
                 fix_since,
                 final,
@@ -211,6 +242,7 @@ class Preflight:
         self,
         wt: Worktree,
         base: str,
+        stamp: tuple[str, str],
         checks: list[CheckResult],
         fix_since: str | None,
         final: bool,
@@ -236,22 +268,29 @@ class Preflight:
             return _report(checks)
         checks.append(CheckResult("size", True, f"{lines} changed lines {scope}"))
 
-        checks.append(await self._rules(wt, base, lead_comments))
+        checks.append(await self._rules(wt, base, stamp, lead_comments))
 
         if not await self._prepare(wt, checks):
             return _report(checks)
 
-        checks.append(await self._command("lint", self.contract.lint, wt))
-        checks.append(await self._command("build", self.contract.build, wt))
+        checks.append(await self._command("lint", self.contract.lint, wt, stamp))
+        checks.append(await self._command("build", self.contract.build, wt, stamp))
         if final:
             command = self.contract.test
         else:
             affected = await affected_tests(self.repo, wt, base)
             command = test_command(self.contract, affected)
-        checks.append(await self._command("tests", command, wt))
-        checks.append(await self._red(wt, base, no_test_reason, test_only))
+        checks.append(await self._command("tests", command, wt, stamp))
+        checks.append(
+            await self._cached(
+                "red",
+                RULE_SEP.join(("red", str(test_only), no_test_reason)),
+                stamp,
+                lambda: self._red(wt, base, no_test_reason, test_only),
+            )
+        )
         if final and self.contract.e2e:
-            checks.append(await self._command("e2e", self.contract.e2e, wt))
+            checks.append(await self._command("e2e", self.contract.e2e, wt, stamp))
         return _report(checks)
 
     async def _prepare(self, wt: Worktree, checks: list[CheckResult]) -> bool:
@@ -267,7 +306,11 @@ class Preflight:
         return True
 
     async def _rules(
-        self, wt: Worktree, base: str, lead_comments: list[str]
+        self,
+        wt: Worktree,
+        base: str,
+        stamp: tuple[str, str],
+        lead_comments: list[str],
     ) -> CheckResult:
         files = await asyncio.to_thread(changed_files, wt, base)
         rules: dict[str, None] = {}
@@ -277,6 +320,21 @@ class Preflight:
         rules.update((c, None) for c in lead_comments)
         if not rules:
             return CheckResult("rules", True, "no review rules apply")
+        passed = CheckResult("rules", True, f"checked {len(rules)} rule(s)")
+        # a diff that kept a larger rule set also keeps every subset of it
+        if self.cache.find(
+            "rules", *stamp, lambda command: set(rules) <= set(command.split(RULE_SEP))
+        ):
+            return passed
+        result = await self._ask_rules(wt, base, rules)
+        self.cache.put(
+            self.cache.key("rules", RULE_SEP.join(sorted(rules)), *stamp), result
+        )
+        return result
+
+    async def _ask_rules(
+        self, wt: Worktree, base: str, rules: dict[str, None]
+    ) -> CheckResult:
         patch = await asyncio.to_thread(diff, wt, base)
         listed = "\n".join(f"- {r}" for r in rules)
         prompt = f"## Review rules\n{listed}\n\n## Diff\n{patch}"

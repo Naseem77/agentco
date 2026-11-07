@@ -100,14 +100,12 @@ async def test_preflight_runs_before_review_and_cost_is_recorded(make_rig):
 
     roles = [c.role for c in rig.runtime.calls]
     assert roles[:4] == [Role.PM, Role.TRIAGE, Role.JUNIOR, Role.REVIEWER]
-    assert set(roles[4:6]) == {Role.REVIEWER, Role.QA} and roles[6:] == [
-        Role.LEAD,
-        Role.REVIEWER,
-    ]
+    # the final pre-flight reuses the round's rules check: same tree, same base
+    assert set(roles[4:6]) == {Role.REVIEWER, Role.QA} and roles[6:] == [Role.LEAD]
     first_reviewer = rig.calls(Role.REVIEWER)[0]
     assert first_reviewer.system.startswith(load_prompt(Role.REVIEWER, "rules"))
-    assert len(roles) == 8
-    assert rig.task().cost_usd == pytest.approx(0.04 * 8)
+    assert len(roles) == 7
+    assert rig.task().cost_usd == pytest.approx(0.04 * 7)
 
 
 async def test_send_back_never_opens_pr_and_reruns_with_scoped_findings(make_rig):
@@ -564,7 +562,10 @@ async def test_a_pr_retry_after_main_moved_force_pushes_the_rebased_branch(
 
 
 class FinalGateRunner(ScriptRunner):
-    """Fails the full suite only while the task waits on the lead (the final pre-flight)."""
+    """Fails the full suite only while the task waits on the lead (the final pre-flight).
+
+    Main moves on each approval, so the final pre-flight cannot reuse the round's pass.
+    """
 
     def __init__(self) -> None:
         super().__init__(codes={RED_CMD: 1})
@@ -577,7 +578,16 @@ class FinalGateRunner(ScriptRunner):
         return super().run(command, cwd, timeout_s)
 
 
+def approve_after_main_moved(repo: list[Path], n: int):
+    def step(call):
+        advance_main(repo[0], {f"docs/upstream{n}.md": "moved\n"})
+        return LEAD_OK
+
+    return step
+
+
 async def test_final_preflight_failure_sends_the_round_back_without_a_push(make_rig):
+    repo: list[Path] = []
     script = {
         Role.PM: [PM_JSON],
         Role.TRIAGE: [triage_json()] * 2,
@@ -585,10 +595,11 @@ async def test_final_preflight_failure_sends_the_round_back_without_a_push(make_
         Role.SENIOR: [engineer(2), engineer(3)],
         Role.REVIEWER: [RULES_OK, REVIEW_OK, RULES_OK] * 2,
         Role.QA: [QA_OK] * 2,
-        Role.LEAD: [LEAD_OK] * 2,
+        Role.LEAD: [approve_after_main_moved(repo, i) for i in range(2)],
     }
     runner = FinalGateRunner()
     rig = await make_rig(script, max_rounds=1, runner=runner)
+    repo.append(rig.repo)
     runner.final_gate = lambda: rig.task().state is TaskState.LEAD_DECISION
 
     task = await rig.run()

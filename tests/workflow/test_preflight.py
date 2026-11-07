@@ -38,6 +38,8 @@ from agentco.workflow.preflight import (
     RestoreError,
 )
 
+RULES_OK = '{"violations": []}'
+
 
 @dataclass
 class Rig:
@@ -701,3 +703,97 @@ async def test_exit_5_no_tests_collected_is_not_a_red_proof(make_repo, store):
     assert red.detail.splitlines()[0] == (
         "new tests were not collected (exit 5): cannot prove they fail without the fix"
     )
+
+
+async def add_rule(
+    rig: Rig, text: str = "ReviewRule: keep operand order in src/calc.py"
+):
+    from datetime import UTC, datetime
+
+    await rig.backend.add(
+        graph_name("acme", Scope.RND),
+        Scope.RND,
+        MemoryItem("r", text, "t", datetime.now(UTC)),
+    )
+
+
+async def test_cache_hit_skips_runner(make_repo, store):
+    _, wt = fixed_worktree(make_repo)
+    runner = ScriptRunner(codes={RED_CMD: 1})
+    rig = make_preflight(runner, store, replies=[RULES_OK, RULES_OK])
+    await add_rule(rig)
+    first = await go(rig, wt)
+    second = await go(rig, wt)
+    assert first.ok and second == first
+    assert sorted(runner.calls) == sorted([LINT, BUILD, TESTS_CMD, RED_CMD])
+    assert len(rig.runtime.calls) == 1  # the rules check was cached too
+
+
+async def test_cache_misses_after_new_commit(make_repo, store):
+    _, wt = fixed_worktree(make_repo)
+    runner = ScriptRunner(codes={RED_CMD: 1})
+    rig = make_preflight(runner, store, replies=[RULES_OK, RULES_OK])
+    await add_rule(rig)
+    await go(rig, wt)
+    first = len(runner.calls)
+    (wt.path / "src/calc.py").write_text(FIXED + "# tweak\n")
+    commit_all(wt, "tweak")
+    await go(rig, wt)
+    assert len(runner.calls) == 2 * first == 8  # every command ran again
+    for command in (LINT, BUILD, RED_CMD):
+        assert runner.calls.count(command) == 2, command
+    assert len(rig.runtime.calls) == 2
+
+
+async def test_cache_misses_after_base_change(make_repo, store):
+    root, wt = fixed_worktree(make_repo)
+    runner = ScriptRunner(codes={RED_CMD: 1})
+    rig = make_preflight(runner, store, replies=[RULES_OK, RULES_OK])
+    await add_rule(rig)
+    await go(rig, wt)
+    tree = git(wt.path, "rev-parse", "HEAD^{tree}")
+    git(root, "commit", "--allow-empty", "-m", "base moved, same content")
+    await go(rig, wt)
+    assert git(wt.path, "rev-parse", "HEAD^{tree}") == tree  # only the base moved
+    for command in (LINT, BUILD, TESTS_CMD, RED_CMD):
+        assert runner.calls.count(command) == 2, command
+    assert len(rig.runtime.calls) == 2
+
+
+async def test_failed_result_not_cached(make_repo, store):
+    _, wt = fixed_worktree(make_repo)
+    runner = ScriptRunner(codes={LINT: 1, RED_CMD: 1})
+    rig = make_preflight(runner, store)
+    await go(rig, wt)
+    rep = await go(rig, wt)
+    assert [c.name for c in rep.failures()] == ["lint"]
+    assert runner.calls.count(LINT) == 2
+    assert runner.calls.count(BUILD) == 1 and runner.calls.count(TESTS_CMD) == 1
+
+
+async def test_rules_pass_covers_a_smaller_rule_set(make_repo, store):
+    _, wt = fixed_worktree(make_repo)
+    rig = make_preflight(ScriptRunner(codes={RED_CMD: 1}), store, replies=[RULES_OK])
+    await add_rule(rig)
+    await go(rig, wt, lead_comments=["add a docstring"])
+    rep = await go(rig, wt, lead_comments=[])
+    assert rep.ok and len(rig.runtime.calls) == 1
+
+
+async def test_rules_cache_misses_for_a_new_lead_comment(make_repo, store):
+    _, wt = fixed_worktree(make_repo)
+    rig = make_preflight(
+        ScriptRunner(codes={RED_CMD: 1}), store, replies=[RULES_OK, RULES_OK]
+    )
+    await add_rule(rig)
+    await go(rig, wt)
+    await go(rig, wt, lead_comments=["add a docstring"])
+    assert len(rig.runtime.calls) == 2
+
+
+async def test_red_cache_depends_on_the_no_test_reason(make_repo, store):
+    _, wt = fixed_worktree(make_repo, with_test=False)
+    rig = make_preflight(ScriptRunner(), store)
+    first = await red_of(rig, wt, no_test_reason="docs only")
+    second = await red_of(rig, wt)
+    assert (first.ok, second.ok) == (True, False)
