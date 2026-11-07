@@ -112,6 +112,16 @@ def test_one_argument_runner_still_serves_reads():
     assert len(seen) == 1
 
 
+def test_one_argument_runner_rejects_writes_instead_of_dropping_body():
+    seen = []
+    gh = GhCli(runner=lambda argv: seen.append(argv) or URL)
+    with pytest.raises(ValueError):
+        gh.create_pull("acme/app", "h", "main", "t", "the body")
+    with pytest.raises(ValueError):
+        gh.edit_pull("acme/app", 1, "the body")
+    assert seen == []
+
+
 def test_default_runner_sends_body_on_stdin(monkeypatch):
     seen = []
 
@@ -141,6 +151,21 @@ def test_no_merge_anywhere():
         agentco.workflow.pr
     )
     assert '"merge"' not in src and "'merge'" not in src
+
+
+def test_no_merge_in_any_emitted_argv():
+    argvs = []
+
+    def runner(argv, input=None):
+        argvs.append(argv)
+        return "[]" if "list" in argv else URL
+
+    gh = GhCli(runner=runner)
+    gh.create_pull("acme/app", "h", "main", "t", "b")
+    gh.find_open_pull("acme/app", "h")
+    gh.edit_pull("acme/app", 1, "b")
+    assert len(argvs) == 3
+    assert not any("merge" in arg for argv in argvs for arg in argv)
 
 
 def test_fake_records_and_finds_writes():

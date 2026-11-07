@@ -112,6 +112,15 @@ def _pull_ref(raw: dict) -> PullRef:
         ) from e
 
 
+def _read_only(runner: Callable[..., str]) -> Runner:
+    def run(argv: list[str], input: str | None = None) -> str:
+        if input is not None:
+            raise ValueError("this runner takes no stdin, so it cannot serve writes")
+        return runner(argv)
+
+    return run
+
+
 class GhCli:
     def __init__(self, runner: Callable[..., str] | None = None) -> None:
         if runner is None:
@@ -119,7 +128,7 @@ class GhCli:
         elif _accepts_input(runner):
             self._runner = runner
         else:
-            self._runner = lambda argv, input=None: runner(argv)
+            self._runner = _read_only(runner)
 
     def _get(self, path: str) -> list[dict]:
         return _flatten_pages(
