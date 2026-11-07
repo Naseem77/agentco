@@ -263,3 +263,56 @@ uv run pytest -m integration      # needs FalkorDB on localhost:6379 and OPENAI_
 AGENTCO_IT_COPILOT=1 uv run pytest tests/test_task_loop_integration.py -m integration  # real Copilot agents
 uv run ruff check src tests
 ```
+
+## Webhooks and one intake per repo (`agentco serve`)
+
+<!-- Plan 5, PR 4: keep this section self-contained so it merges cleanly. -->
+
+Polling with `agentco intake` (see [PR feedback](#pr-feedback)) still works and always will.
+`agentco serve` adds a push path for one repo: GitHub tells agentco when something happens,
+and agentco runs the same intake right away instead of waiting for the next cron tick.
+
+```bash
+export AGENTCO_WEBHOOK_SECRET=...            # any long random string
+agentco serve --repo acme/app                # 127.0.0.1:8787; --host / --port to change
+```
+
+In the repo's **Settings → Webhooks**, add a webhook with:
+
+- **Payload URL:** `https://<your tunnel or proxy>/webhook`
+- **Content type:** `application/json`
+- **Secret:** the same value as `AGENTCO_WEBHOOK_SECRET`
+- **Events:** `issues`, `pull_request`, `pull_request_review`,
+  `pull_request_review_comment` and `check_run` (a `ping` is answered too; any other event
+  is rejected)
+
+What the receiver does, and what it refuses:
+
+- The secret comes from the environment variable named by `webhook.secret_env` (default
+  `AGENTCO_WEBHOOK_SECRET`), never from the config file. `serve` exits 1 if it is not set.
+- Every request is checked with the `X-Hub-Signature-256` HMAC before anything is parsed.
+  A missing or wrong signature gets 401; an unknown event, a payload for another repo or a
+  malformed body gets 400; a missing `Content-Length` 411; a body over
+  `webhook.max_body_bytes` (default 1 MiB) 413, without being read.
+- A delivery id is handled once: GitHub redelivering it is answered `200 duplicate` and does
+  not start an intake. A burst of different deliveries is coalesced into one running intake
+  and at most one more after it (`webhook.debounce_s`, default 2 seconds, waits for the burst
+  to settle).
+- A webhook never creates a task and never carries data into the team: it only asks for an
+  intake, which reads GitHub itself.
+
+```yaml
+webhook:
+  secret_env: AGENTCO_WEBHOOK_SECRET   # name of the environment variable
+  max_body_bytes: 1048576
+  debounce_s: 2
+```
+
+`serve` speaks plain HTTP and binds to `127.0.0.1` by default. Reach it from GitHub only
+through a tunnel or a reverse proxy that terminates TLS; do not expose the port directly.
+
+**Only one intake per repo runs at a time**, across processes: `agentco intake`, cron and
+`agentco serve` share a lease in the state database (`intake:<tenant>:<repo>`), released when
+a run ends; if a process is killed mid-run, its lease expires after one hour. If one is already running, the other skips:
+`agentco intake` prints `another intake for acme/app is running; skipped` and exits 0, and the
+skipped run does not move the intake cursor, so the next run sees everything.

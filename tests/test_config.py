@@ -275,3 +275,31 @@ def test_relative_sqlite_url_independent_of_cwd(tmp_path, monkeypatch):
 def test_other_database_urls_unchanged(tmp_path, url):
     cfg = load_config(write(tmp_path, EXAMPLE + f'database_url: "{url}"\n'))
     assert cfg.database_url == url
+
+
+def test_webhook_config_defaults(tmp_path):
+    cfg = load_config(write(tmp_path, EXAMPLE))
+    assert cfg.webhook.secret_env == "AGENTCO_WEBHOOK_SECRET"
+    assert cfg.webhook.max_body_bytes == 1_048_576
+    assert cfg.webhook.debounce_s == 2.0
+
+
+def test_webhook_override(tmp_path):
+    raw = BASE | {"webhook": {"secret_env": "MY_SECRET", "debounce_s": 0}}
+    cfg = load_config(write(tmp_path, yaml.safe_dump(raw)))
+    assert (cfg.webhook.secret_env, cfg.webhook.debounce_s) == ("MY_SECRET", 0)
+
+
+@pytest.mark.parametrize(
+    "extra",
+    [
+        {"max_body_bytes": 0},
+        {"max_body_bytes": 26_214_401},
+        {"debounce_s": -1},
+        {"secret": "inline"},
+    ],
+)
+def test_webhook_invalid(tmp_path, extra):
+    raw = BASE | {"webhook": extra}
+    with pytest.raises(ConfigError):
+        load_config(write(tmp_path, yaml.safe_dump(raw)))

@@ -65,6 +65,14 @@ class IntakeConfig(BaseModel):
     ]
 
 
+class WebhookConfig(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    secret_env: str = "AGENTCO_WEBHOOK_SECRET"
+    max_body_bytes: int = Field(1_048_576, gt=0, le=26_214_400)
+    debounce_s: float = Field(2.0, ge=0, allow_inf_nan=False)
+
+
 class TenantConfig(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
@@ -79,6 +87,7 @@ class TenantConfig(BaseModel):
     thresholds: Thresholds = Thresholds()
     loop: LoopLimits = LoopLimits()
     intake: IntakeConfig = IntakeConfig()
+    webhook: WebhookConfig = WebhookConfig()
 
     @field_validator("tenant")
     @classmethod

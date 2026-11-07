@@ -1597,6 +1597,85 @@ def test_intake_busy_exit_0(env, monkeypatch):
     assert gh.calls == []
 
 
+def test_serve_refuses_without_secret(env, monkeypatch):
+    monkeypatch.delenv("AGENTCO_WEBHOOK_SECRET", raising=False)
+    result = env("serve", "--repo", "acme/app")
+    assert result.exit_code == 1
+    assert "AGENTCO_WEBHOOK_SECRET" in result.stdout
+
+
+def test_serve_refuses_empty_secret(env, monkeypatch):
+    monkeypatch.setenv("AGENTCO_WEBHOOK_SECRET", "")
+    assert env("serve", "--repo", "acme/app").exit_code == 1
+
+
+def test_serve_rejects_a_bad_repo_exit_1(env, monkeypatch):
+    monkeypatch.setenv("AGENTCO_WEBHOOK_SECRET", "s")
+    assert env("serve", "--repo", "not a repo").exit_code == 1
+
+
+class _StubServer:
+    server_address = ("127.0.0.1", 4242)
+
+    def __init__(self):
+        self.closed = False
+
+    def serve_forever(self):
+        raise KeyboardInterrupt
+
+    def server_close(self):
+        self.closed = True
+
+
+def test_serve_binds_and_closes_on_ctrl_c(env, monkeypatch):
+    monkeypatch.setenv("AGENTCO_WEBHOOK_SECRET", "s3")
+    stub, seen = _StubServer(), {}
+
+    def fake_make_server(host, port, **kw):
+        seen.update(host=host, port=port, **kw)
+        return stub
+
+    monkeypatch.setattr(cli, "make_server", fake_make_server)
+
+    result = env("serve", "--repo", "acme/app", "--port", "0")
+
+    assert result.exit_code == 0, result.stdout
+    assert stub.closed
+    assert seen["host"] == "127.0.0.1" and seen["secret"] == b"s3"
+    assert (seen["tenant"], seen["repo"]) == ("acme", "acme/app")
+    assert seen["max_body"] == 1_048_576
+    assert "/webhook" in result.stdout
+    seen["trigger"].request()  # closed: must not run an intake
+    assert seen["trigger"].wait_idle(1)
+
+
+def test_serve_run_once_runs_the_intake_and_prints_it(env, monkeypatch, capsys):
+    monkeypatch.setenv("AGENTCO_WEBHOOK_SECRET", "s3")
+    gh = _intake_gh(env, monkeypatch)
+    task_id = _pr_task(env, gh)
+    gh.add_comment(_comment(1))
+    env.seams.script({Role.LEAD: [_lead_says(("c1", "real_bug"))]})
+    seen = {}
+
+    class Stub(_StubServer):
+        def serve_forever(self):
+            seen["trigger"].request()
+            assert seen["trigger"].wait_idle(30)
+            raise KeyboardInterrupt
+
+    def fake_make_server(host, port, **kw):
+        seen.update(kw)
+        return Stub()
+
+    monkeypatch.setattr(cli, "make_server", fake_make_server)
+
+    result = env("serve", "--repo", "acme/app", "--port", "0")
+
+    assert result.exit_code == 0, result.stdout
+    assert f"#{task_id} back to triage (round 1): 1 finding(s)" in result.stdout
+    assert env.store.get(task_id).state is TaskState.TRIAGE
+
+
 def test_intake_github_failure_exit_3(env, monkeypatch):
     gh = _intake_gh(env, monkeypatch, fail_reads=True)
     task_id = _pr_task(env, gh)
