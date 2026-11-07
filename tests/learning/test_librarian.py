@@ -832,3 +832,55 @@ async def test_merged_root_cause_task_writes_area_playbook(
     assert "Applies to: src/app, tests" in playbook.body
     found = await area_playbooks(gate.for_role(Role.TRIAGE), ["src/app"])
     assert any("ordered once, at the boundary" in text for text in found)
+
+
+def adr_body():
+    return {
+        "adr": {
+            "title": "Plugin registry",
+            "decision": "Use a registry.",
+            "consequences": "One more module.",
+        },
+        "human_note": "",
+    }
+
+
+async def test_librarian_writes_decision_once_after_approval(
+    loop_cfg, store, gate, backend
+):
+    tid = new_task(store, TaskState.ENGINEERING)
+    adr = put(store, tid, K.ADR, adr_body(), Role.ARCHITECT)
+    escalation(store, tid, category="tradeoff", from_state="architect")
+    lib, _ = librarian(loop_cfg, store, gate, [NONE])
+
+    before = await lib.learn_task(tid, NOW)
+    assert of_kind(backend, Scope.RND, "Decision") == []
+    assert store.get_meta(artifact_marker("acme", adr.id)) is None
+    assert before.added == 0
+
+    human(store, tid, "approve", "")
+    await lib.learn_task(tid, NOW)
+    await lib.learn_task(tid, NOW)
+
+    [decision] = of_kind(backend, Scope.RND, "Decision")
+    assert (
+        "Plugin registry: Use a registry. Consequences: One more module."
+        in decision.body
+    )
+    assert f"Source: task:{tid}:adr:{adr.id}" in decision.body
+    assert store.get_meta(artifact_marker("acme", adr.id)) == "done"
+
+
+async def test_rejected_adr_is_marked_and_writes_nothing(
+    loop_cfg, store, gate, backend
+):
+    tid = new_task(store, TaskState.ENGINEERING)
+    adr = put(store, tid, K.ADR, adr_body(), Role.ARCHITECT)
+    escalation(store, tid, category="tradeoff", from_state="architect")
+    human(store, tid, "reject", "")
+    lib, _ = librarian(loop_cfg, store, gate, [NONE])
+
+    await lib.learn_task(tid, NOW)
+
+    assert of_kind(backend, Scope.RND, "Decision") == []
+    assert store.get_meta(artifact_marker("acme", adr.id)) == "done"

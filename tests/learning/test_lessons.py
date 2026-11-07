@@ -13,6 +13,7 @@ from agentco.learning.lessons import (
     bump_overrides,
     lesson_item,
     lesson_key,
+    lessons_from_adr,
     lessons_from_lead,
     lessons_from_pr_review,
     lessons_from_qa,
@@ -237,6 +238,7 @@ def test_kind_scope_is_derived_from_entity_types():
         "Policy": Scope.COMPANY,
         "EscapedBug": Scope.QA,
         "NeighbourCase": Scope.QA,
+        "Decision": Scope.RND,
     }
     for kind, scope in KIND_SCOPE.items():
         assert kind in ENTITY_TYPES[scope]
@@ -436,3 +438,58 @@ def test_bump_overrides_honours_configured_threshold(store):
 def test_stale_after_must_be_positive():
     with pytest.raises(ValidationError):
         Thresholds(stale_after=0)
+
+
+def adr_artifact(id=3, **kw):
+    adr = {
+        "title": "Plugin registry",
+        "decision": "Use a registry.",
+        "consequences": "One more module.",
+        **kw,
+    }
+    return art(
+        ArtifactKind.ADR, {"adr": adr, "human_note": ""}, id=id, role=Role.ARCHITECT
+    )
+
+
+def decision(id, verdict):
+    return art(
+        ArtifactKind.HUMAN_DECISION,
+        {"decision": verdict, "note": ""},
+        id=id,
+        role=Role.HUMAN,
+    )
+
+
+def test_lessons_from_adr_waits_for_decision_then_writes_decision():
+    adr = adr_artifact()
+
+    assert lessons_from_adr(adr, [adr]) is None
+    [lesson] = lessons_from_adr(adr, [adr, decision(5, "approve")])
+
+    assert lesson.kind == "Decision"
+    assert KIND_SCOPE[lesson.kind] is Scope.RND
+    assert lesson.origin == "human" and lesson.modules == ()
+    assert lesson.source == "task:1:adr:3"
+    assert lesson.text == (
+        "Plugin registry: Use a registry. Consequences: One more module."
+    )
+
+
+def test_rejected_adr_writes_nothing():
+    adr = adr_artifact()
+    assert lessons_from_adr(adr, [adr, decision(5, "reject")]) == []
+    assert lessons_from_adr(adr, [adr, decision(5, "answer")]) == []
+
+
+def test_only_the_first_later_decision_counts():
+    adr = adr_artifact()
+    both = [adr, decision(5, "answer"), decision(7, "approve")]
+    assert lessons_from_adr(adr, both) == []
+    assert lessons_from_adr(adr, [decision(2, "approve"), adr]) is None
+
+
+def test_long_adr_text_is_clipped_to_the_lesson_limit():
+    adr = adr_artifact(decision="d" * 900)
+    [lesson] = lessons_from_adr(adr, [adr, decision(5, "approve")])
+    assert len(lesson.text) <= 500
