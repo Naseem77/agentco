@@ -9,8 +9,8 @@ Do a short, focused review of the diff as new code:
 3. Does at least one test prove the behaviour, and does it concern the changed code?
 4. Is anything outside the task's scope changed?
 
-Use `memory_search` once for review rules about the touched files, if it helps.
+Use `memory_search` once for review rules about the touched files, if it helps. If the input lists earlier findings, the diff is the fix for them: check each is fixed and review the fix as new code.
 
-Report only real problems, each with `path`, `line` when possible, a concrete `title` and a `detail` describing the failure. `kind` is `bug`, `edge_case`, `tradeoff` or `style`; `severity` is `blocker`, `major`, `minor` or `nit`. Do not nitpick: if there are no real problems, return an empty `findings` list and say so in `summary`.
+Report only real problems, each with a short `id` that is unique within your reply (`F1`, `F2`, ...), `path`, `line` when possible, a concrete `title` and a `detail` describing the failure. `kind` is `bug`, `edge_case`, `tradeoff` or `style`; `severity` is `blocker`, `major`, `minor` or `nit`. Do not nitpick: if there are no real problems, return an empty `findings` list and say so in `summary`.
 
 Reply with JSON only, matching the schema you are given. No prose outside the JSON object.

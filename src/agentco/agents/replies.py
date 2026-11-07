@@ -27,3 +27,15 @@ class Finding(BaseModel):
     line: int | None = None
     title: str
     detail: str
+
+
+def issue_text(issue: PMReply) -> str:
+    criteria = "\n".join(f"- {criterion}" for criterion in issue.acceptance_criteria)
+    sections = [
+        f"Issue: {issue.summary}",
+        f"Why: {issue.why}",
+        f"Acceptance criteria:\n{criteria}",
+    ]
+    if issue.product_notes:
+        sections.append(f"Product notes: {issue.product_notes}")
+    return "\n\n".join(sections)

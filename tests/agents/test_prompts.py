@@ -39,3 +39,16 @@ def test_isolated_roles_state_they_are_blind(role, variant):
 def test_missing_prompt_raises():
     with pytest.raises(FileNotFoundError):
         load_prompt(Role.ARCHITECT)
+
+
+@pytest.mark.parametrize("variant", [None, "light"])
+def test_reviewer_prompts_name_every_finding_field(variant):
+    text = load_prompt(Role.REVIEWER, variant)
+    for field in ("`id`", "`path`", "`title`", "`detail`", "`kind`", "`severity`"):
+        assert field in text
+
+
+def test_qa_prompt_names_every_failure_field():
+    text = load_prompt(Role.QA)
+    for field in ("`title`", "`steps`", "`expected`", "`actual`"):
+        assert field in text
