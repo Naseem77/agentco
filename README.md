@@ -198,6 +198,35 @@ human: stuck`, `#5 merged`) and a summary (`7 known, 1 deferred`). Exit codes: 1
 arguments or config, 2 FalkorDB unreachable, 3 `gh` unavailable or failing, 4 an agent step
 failed (a rerun is safe), 0 otherwise.
 
+## What agentco learns
+
+After `task run`, `decide` and `intake`, the Librarian turns what happened into company memory.
+It reads only what the task stored, never the chat history:
+
+- the lead's review comments become review rules (`rnd`);
+- QA failures become issues (`rnd`); only title, steps, expected and actual, never the tests;
+- a real bug found on a PR (not recurring) becomes a risk (`rnd`), an escaped bug and a
+  neighbour case to test next time (`qa`);
+- your `agentco decide` answers become escalation rules and policies (`company`), one or two at
+  most per decision; approving over non-real findings over and over marks a rule stale;
+- a merged task adds its invariant, what was solved and how its agents did, plus the human
+  review comments on its PR; a cancelled one adds the agent profile only;
+- after a merge, QA's regression tests become a follow-up task (`qa-followup`) that adds them
+  to the repo through the normal PR path.
+
+Nothing goes to `product`. Every lesson is a plain fact with its origin (`lead`, `human` or
+`librarian`) and a provenance line, for example `Source: task:3:lead:12` (task, artifact kind,
+artifact id), so you can trace it back. Lessons are deduplicated against what memory already
+holds. Warnings (`warning: librarian #3: ...`) never change an exit code.
+
+Everything is idempotent. To rerun the Librarian, for instance after FalkorDB was down or the
+model failed:
+
+```bash
+agentco learn 3        # one task: prints "#3: 2 added, 1 duplicate"
+agentco learn --all    # every task with something not yet learned
+```
+
 ## Tests
 
 ```bash

@@ -326,3 +326,102 @@ async def test_container_prepare_failure_fails_qa_without_running_commands(
             actual="devcontainer up failed",
         )
     ]
+
+
+def qa_reply(*paths: str, **extra) -> str:
+    return json.dumps({**PASSING, "new_tests": list(paths), **extra})
+
+
+async def test_run_qa_captures_new_tests_before_snapshot_removed(
+    make_repo, store, loop_cfg
+):
+    text = "def test_neighbour():\n    assert True\n"
+
+    def write_tests(call):
+        (call.workdir / "tests/test_neighbour.py").write_text(text)
+        return qa_reply("tests/test_neighbour.py")
+
+    env = Env(make_repo, store, loop_cfg, [write_tests])
+
+    qa = await env.qa(FakeRunner())
+
+    assert qa.new_tests == ["tests/test_neighbour.py"]
+    assert qa.new_test_sources == {"tests/test_neighbour.py": text}
+    assert not (env.wt.path.parent / "1-qa-r1").exists()
+    assert not (env.wt.path / "tests/test_neighbour.py").exists()
+
+
+async def test_new_test_sources_skip_unsafe_paths(make_repo, store, loop_cfg, tmp_path):
+    outside = tmp_path / "secret.py"
+    outside.write_text("SECRET = 1\n")
+    good = "def test_ok():\n    pass\n"
+
+    def write_tests(call):
+        root = call.workdir
+        (root / "tests/test_ok.py").write_text(good)
+        (root / "tests/test_link.py").symlink_to(outside)
+        (root / "tests/linked").symlink_to(tmp_path)
+        (root / "helper.py").write_text("x = 1\n")  # not a test path
+        (tmp_path / "test_escape.py").write_text("def test_x():\n    pass\n")
+        return qa_reply(
+            "../test_escape.py",
+            "tests/../../test_escape.py",
+            str(tmp_path / "test_escape.py"),
+            "tests/test_link.py",
+            "tests/linked/secret.py",
+            "helper.py",
+            "tests/test_missing.py",
+            "tests/test_ok.py",
+        )
+
+    env = Env(make_repo, store, loop_cfg, [write_tests])
+
+    qa = await env.qa(FakeRunner())
+
+    assert qa.new_test_sources == {"tests/test_ok.py": good}
+
+
+async def test_new_test_sources_are_capped_in_count_and_size(
+    make_repo, store, loop_cfg
+):
+    names = [f"tests/test_n{i}.py" for i in range(12)]
+
+    def write_tests(call):
+        for name in names:
+            (call.workdir / name).write_text(f"def test_{name[-4:-3]}():\n    pass\n")
+        (call.workdir / "tests/test_big.py").write_text("x" * 20_001)
+        (call.workdir / "tests/test_edge.py").write_text("y" * 20_000)
+        return qa_reply("tests/test_big.py", "tests/test_edge.py", *names)
+
+    env = Env(make_repo, store, loop_cfg, [write_tests])
+
+    qa = await env.qa(FakeRunner())
+
+    assert list(qa.new_test_sources) == ["tests/test_edge.py", *names[:9]]
+    assert qa.new_test_sources["tests/test_edge.py"] == "y" * 20_000
+
+
+async def test_the_model_cannot_supply_new_test_sources(make_repo, store, loop_cfg):
+    forged = {"tests/test_evil.py": "import os\n"}
+    env = Env(
+        make_repo,
+        store,
+        loop_cfg,
+        [qa_reply(new_test_sources=forged)],
+    )
+
+    qa = await env.qa(FakeRunner())
+
+    assert qa.new_test_sources == {}
+
+
+def test_new_test_sources_is_hidden_from_the_model_schema():
+    assert "new_test_sources" not in QAReply.model_json_schema()["properties"]
+
+
+async def test_fast_lane_qa_has_no_new_test_sources(make_repo, store, loop_cfg):
+    env = Env(make_repo, store, loop_cfg)
+
+    qa = await env.qa(FakeRunner(), fast_lane=True)
+
+    assert qa.new_test_sources == {}

@@ -506,6 +506,92 @@ async def test_test_only_change_has_no_fix_to_revert(make_repo, store):
     assert runner.calls == [LINT, BUILD, RED_CMD]  # the tests check ran them once
 
 
+TEST_ONLY = "test-only change: regression tests for a merged fix"
+
+
+async def red_of(rig, wt, **kw):
+    rep = await go(rig, wt, **kw)
+    return {c.name: c for c in rep.checks}["red"]
+
+
+async def test_red_check_test_only_passes_only_when_flagged(make_repo, store):
+    root = make_repo(FILES)
+    wt = create_worktree(root, 1, "main")
+    add_test(wt)
+    commit_all(wt, "tests")
+
+    flagged = await red_of(make_preflight(ScriptRunner(), store), wt, test_only=True)
+    plain = await red_of(make_preflight(ScriptRunner(), store), wt)
+
+    assert (flagged.ok, flagged.detail) == (True, TEST_ONLY)
+    assert (plain.ok, plain.detail) == (True, "test-only change: no fix to revert")
+
+
+async def test_test_only_passes_when_the_tests_are_removed_but_not_for_normal_tasks(
+    make_repo, store
+):
+    root = make_repo(FILES)
+    wt = create_worktree(root, 1, "main")
+    (wt.path / "tests/test_add.py").unlink()
+    commit_all(wt, "drop")
+
+    flagged = await red_of(make_preflight(ScriptRunner(), store), wt, test_only=True)
+    plain = await red_of(make_preflight(ScriptRunner(), store), wt)
+
+    assert (flagged.ok, flagged.detail) == (True, TEST_ONLY)
+    assert (plain.ok, plain.detail) == (False, "no new test")
+
+
+async def test_test_only_does_not_weaken_red_when_a_source_file_changed(
+    make_repo, store
+):
+    _, wt = fixed_worktree(make_repo)
+    runner = ScriptRunner(codes={RED_CMD: 0})
+
+    red = await red_of(make_preflight(runner, store), wt, test_only=True)
+
+    assert (red.ok, red.detail) == (
+        False,
+        "tests pass without the fix: tests/test_new.py",
+    )
+    assert runner.calc_at_call[RED_CMD] == ORIGINAL
+
+
+async def test_test_only_without_tests_needs_a_reason_like_any_task(make_repo, store):
+    _, wt = fixed_worktree(make_repo, with_test=False)
+
+    bare = await red_of(make_preflight(ScriptRunner(), store), wt, test_only=True)
+    reasoned = await red_of(
+        make_preflight(ScriptRunner(), store),
+        wt,
+        test_only=True,
+        no_test_reason="docs only",
+    )
+
+    assert (bare.ok, bare.detail) == (False, "no new test")
+    assert (reasoned.ok, reasoned.detail) == (True, "no new test: docs only")
+
+
+async def test_test_only_with_a_non_test_file_alone_still_fails(make_repo, store):
+    root = make_repo(FILES)
+    wt = create_worktree(root, 1, "main")
+    (wt.path / "README.md").write_text("docs\n")
+    commit_all(wt, "docs")
+
+    red = await red_of(make_preflight(ScriptRunner(), store), wt, test_only=True)
+
+    assert (red.ok, red.detail) == (False, "no new test")
+
+
+async def test_test_only_with_no_changes_at_all_does_not_pass(make_repo, store):
+    root = make_repo(FILES)
+    wt = create_worktree(root, 1, "main")
+
+    red = await red_of(make_preflight(ScriptRunner(), store), wt, test_only=True)
+
+    assert (red.ok, red.detail) == (False, "no new test")
+
+
 async def test_prepare_runs_once_per_worktree(make_repo, store):
     _, wt = fixed_worktree(make_repo)
     runner = ScriptRunner(codes={RED_CMD: 1})

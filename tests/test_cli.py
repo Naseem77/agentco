@@ -22,6 +22,7 @@ from agentco import cli
 from agentco.code.graph import InMemoryCodeGraph
 from agentco.github.client import FakeGitHub, GhCli, GitHubError
 from agentco.github.models import GhPull, GhReviewComment, GhUser
+from agentco.learning.librarian import LearnReport
 from agentco.llm.fake import FakeRuntime
 from agentco.memory.backend import InMemoryBackend, MemoryItem
 from agentco.memory.scopes import Scope
@@ -34,7 +35,18 @@ from agentco.workflow.states import TaskState
 
 # The orchestrator rig lives next to its tests and imports its siblings by bare name.
 sys.path.insert(0, str(Path(__file__).parent / "workflow"))
-from orch_helpers import PM_JSON, SEED_FACT, STUCK, happy, triage_json
+from orch_helpers import (
+    LEAD_OK,
+    PM_JSON,
+    QA_OK,
+    REVIEW_OK,
+    RULES_OK,
+    SEED_FACT,
+    STUCK,
+    engineer,
+    happy,
+    triage_json,
+)
 from script_runner import FILES, RED_CMD, ScriptRunner
 
 runner = CliRunner()
@@ -1034,10 +1046,17 @@ def _new_task(env, title="Make add commutative-safe") -> int:
     return int(env("task", "new", title).stdout)
 
 
+NONE_LESSON = json.dumps({"lessons": [{"kind": "none", "text": ""}]})
+
+
 def _over_budget(env):
     """PM and triage cost more than the whole budget, so the task escalates."""
     env.seams.script(
-        {Role.PM: [PM_JSON, PM_JSON], Role.TRIAGE: [triage_json(), triage_json()]},
+        {
+            Role.PM: [PM_JSON, PM_JSON],
+            Role.TRIAGE: [triage_json(), triage_json()],
+            Role.LIBRARIAN: [NONE_LESSON] * 2,
+        },
         premium=100,
     )
 
@@ -1367,6 +1386,7 @@ def test_decide_add_budget_then_run_resumes(env, repo):
     script = happy()
     script[Role.PM] = [PM_JSON]
     script[Role.TRIAGE] = [triage_json()]
+    script[Role.LIBRARIAN] = [NONE_LESSON]
     env.seams.script(script, premium=100)
     task_id = _new_task(env)
     assert _run_task(env, repo, str(task_id)).stdout == "task 1: awaiting_human\n"
@@ -1650,3 +1670,248 @@ def test_fake_github_fail_reads_blocks_every_read():
     for read in reads:
         with pytest.raises(GitHubError, match="simulated failure"):
             read()
+
+
+# -- the Librarian after task run, decide and intake --------------------------------
+
+_FINDING = {
+    "id": "f1",
+    "severity": "major",
+    "kind": "bug",
+    "path": "src/calc.py",
+    "title": "Operand order lost",
+    "detail": "swapping breaks subtraction callers",
+}
+REVIEW_FINDING = json.dumps({"findings": [_FINDING], "summary": "one bug"})
+LEAD_SEND_BACK = json.dumps(
+    {
+        "confidence": 0.9,
+        "classifications": [{"finding_id": "f1", "category": "real_bug", "note": "x"}],
+        "summary": "fix it",
+        "comments": ["Keep add free of side effects"],
+    }
+)
+
+
+def _send_back_once() -> dict:
+    script = happy()
+    script[Role.TRIAGE] = [triage_json()] * 2
+    script[Role.JUNIOR] = [engineer(1), engineer(2)]
+    script[Role.REVIEWER] = [RULES_OK, REVIEW_FINDING, RULES_OK, REVIEW_OK, RULES_OK]
+    script[Role.QA] = [QA_OK, QA_OK]
+    script[Role.LEAD] = [LEAD_SEND_BACK, LEAD_OK]
+    return script
+
+
+def _lessons(env, graph="acme__rnd") -> list[str]:
+    return [i.body for i in env.backend.items(graph)]
+
+
+def test_task_run_then_learn_rerun_adds_nothing(env, repo):
+    env.seams.script(_send_back_once())
+    task_id = _new_task(env)
+
+    ran = _run_task(env, repo, str(task_id))
+
+    assert (ran.exit_code, ran.stdout.count("warning")) == (0, 0), ran.stdout
+    learned = _lessons(env)
+    assert any("Keep add free of side effects" in body for body in learned)
+    assert f"task:{task_id}:lead:" in " ".join(learned)
+    assert env.store.get_meta("librarian:acme:closed:1") is None
+
+    again = env("learn", str(task_id))
+
+    assert (again.exit_code, again.stdout) == (0, "#1: 0 added, 0 duplicate\n")
+    assert _lessons(env) == learned
+    assert env("learn", "--all").stdout == "nothing to learn\n"
+
+
+def test_learn_all_runs_every_task_that_needs_it(env, repo):
+    env.seams.script({Role.PM: [PM_JSON]})
+    waiting = _new_task(env)
+    done = _pr_task(env, env.seams.github)
+    env.store.put_artifact(
+        done,
+        ArtifactKind.LEAD,
+        Role.LEAD,
+        {"comments": ["Never mutate the input list"], "outcome": "approve"},
+    )
+
+    result = env("learn", "--all")
+
+    assert (result.exit_code, result.stdout) == (0, f"#{done}: 1 added, 0 duplicate\n")
+    assert waiting != done
+    assert env("learn", "--all").stdout == "nothing to learn\n"
+
+
+def test_learn_needs_exactly_one_of_id_or_all(env):
+    both = env("learn", "1", "--all")
+    neither = env("learn")
+    assert (both.exit_code, neither.exit_code) == (1, 1)
+    assert "exactly one" in both.stdout and "exactly one" in neither.stdout
+
+
+def test_learn_unknown_task_exit_1(env):
+    result = env("learn", "99")
+    assert (result.exit_code, result.stdout) == (1, "task 99 not found\n")
+
+
+def test_learn_falkordb_down_exit_2(env, monkeypatch):
+    task_id = _new_task(env)
+    env.store.transition(task_id, TaskState.CANCELLED, Role.HUMAN, "test")
+
+    def down(cfg):
+        raise redis.exceptions.ConnectionError("refused")
+
+    monkeypatch.setattr(cli, "make_backend", down)
+    result = env("learn", str(task_id))
+    assert (result.exit_code, result.stdout) == (
+        2,
+        "cannot reach FalkorDB at localhost:6379\n",
+    )
+
+
+def test_decide_reject_runs_close_out(env, repo):
+    _over_budget(env)
+    task_id = _new_task(env)
+    _run_task(env, repo, str(task_id))
+    env.seams.script({Role.LIBRARIAN: [NONE_LESSON]})
+
+    result = env("decide", str(task_id), "reject", "--note", "not now")
+
+    assert (result.exit_code, result.stdout) == (0, "task 1: cancelled\n")
+    assert [c.role for c in env.seams.runtime.calls] == [Role.LIBRARIAN]
+    assert env.store.get_meta("librarian:acme:closed:1") == "done"
+    assert any("AgentProfile" in body for body in _lessons(env))
+    assert env("learn", "--all").stdout == "nothing to learn\n"
+
+
+def test_decide_answer_learns_from_the_decision(env, repo):
+    _over_budget(env)
+    task_id = _new_task(env)
+    _run_task(env, repo, str(task_id))
+    reply = json.dumps(
+        {
+            "lessons": [
+                {
+                    "kind": "EscalationRule",
+                    "text": "Spending over budget always needs a human",
+                    "category": "stuck",
+                }
+            ]
+        }
+    )
+    env.seams.script({Role.LIBRARIAN: [reply]})
+
+    result = env("decide", str(task_id), "answer", "--note", "go on")
+
+    assert result.exit_code == 0, result.stdout
+    assert any(
+        "Spending over budget always needs a human" in body
+        for body in _lessons(env, "acme__company")
+    )
+    assert env.store.get(task_id).state is TaskState.AWAITING_HUMAN
+
+
+def test_librarian_invalid_reply_is_warning_not_failure(env, repo):
+    _over_budget(env)
+    task_id = _new_task(env)
+    _run_task(env, repo, str(task_id))
+    env.seams.script({Role.LIBRARIAN: ["not json", "still not", "nope"]})
+
+    result = env("decide", str(task_id), "reject", "--note", "not now")
+
+    assert result.exit_code == 0, result.stdout
+    lines = result.stdout.splitlines()
+    assert lines[0] == "task 1: cancelled"
+    assert lines[1].startswith(f"warning: librarian #{task_id}: ")
+    assert env.store.get(task_id).state is TaskState.CANCELLED
+    assert len(_decisions(env, task_id)) == 1
+    assert env.store.get_meta(f"librarian:acme:closed:{task_id}") == "done"
+    decision = env.store.latest_artifact(task_id, ArtifactKind.HUMAN_DECISION)
+    assert env.store.get_meta(f"librarian:acme:artifact:{decision.id}") is None
+
+
+def _merge_pull(gh, number=7):
+    pull = gh.get_pull("acme/app", number)
+    gh.upsert_pull(
+        dataclasses.replace(pull, state="closed", merged_at=datetime.now(UTC))
+    )
+
+
+def test_intake_merge_runs_close_out_and_followup(env, monkeypatch):
+    gh = _intake_gh(env, monkeypatch)
+    task_id = _pr_task(env, gh)
+    env.store.put_artifact(
+        task_id,
+        ArtifactKind.QA,
+        Role.QA,
+        {
+            "passed": True,
+            "bug_class": "tabs",
+            "tests_run": [],
+            "failures": [],
+            "new_tests": ["tests/test_tabs_qa.py"],
+            "new_test_sources": {"tests/test_tabs_qa.py": "def test_tabs(): ...\n"},
+        },
+    )
+    _merge_pull(gh)
+
+    result = _intake(env)
+
+    assert (result.exit_code, result.stdout) == (
+        0,
+        f"#{task_id} merged\n0 known, 0 deferred\n",
+    )
+    assert env.store.get_meta(f"librarian:acme:closed:{task_id}") == "done"
+    [followup] = [
+        t for t in env.store.list_tasks("acme", [TaskState.INTAKE]) if t.id != task_id
+    ]
+    assert followup.source == "qa-followup"
+    request = env.store.latest_artifact(followup.id, ArtifactKind.REQUEST)
+    assert request.body["test_files"] == {
+        "tests/test_tabs_qa.py": "def test_tabs(): ...\n"
+    }
+    assert any("fix tabs" in body for body in _lessons(env))
+
+    second = _intake(env)
+    assert second.exit_code == 0
+    assert len(env.store.list_tasks("acme", [TaskState.INTAKE])) == 1
+
+
+def test_intake_librarian_failure_does_not_change_the_exit_code(env, monkeypatch):
+    gh = _intake_gh(env, monkeypatch)
+    task_id = _pr_task(env, gh)
+    _merge_pull(gh)
+    monkeypatch.setattr(cli.Librarian, "learn_task", _report_boom)
+
+    result = _intake(env)
+
+    assert result.exit_code == 0, result.stdout
+    assert f"warning: librarian #{task_id}: boom" in result.stdout
+
+
+async def _report_boom(self, task_id, now=None):
+    return LearnReport(task_id, errors=["boom"])
+
+
+def test_task_run_all_runs_the_librarian_for_every_task_that_finished(
+    env, repo, monkeypatch
+):
+    seen = []
+
+    async def record(self, task_id, now=None):
+        seen.append(task_id)
+        return LearnReport(task_id)
+
+    monkeypatch.setattr(cli.Librarian, "learn_task", record)
+    env.seams.script(
+        {Role.PM: [PM_JSON] * 3, Role.TRIAGE: [triage_json()] * 3}, premium=100
+    )
+    ids = [_new_task(env, f"task {n}") for n in range(2)]
+    stuck = _new_task(env, "stuck")
+
+    result = _run_task(env, repo, "--all")
+
+    assert result.exit_code == 0, result.stdout
+    assert sorted(seen) == sorted([*ids, stuck])

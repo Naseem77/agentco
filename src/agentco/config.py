@@ -34,6 +34,7 @@ class Thresholds(BaseModel):
 
     known_min_facts: int = Field(1, ge=1)
     lead_min_confidence: float = Field(0.7, ge=0, le=1)
+    stale_after: int = Field(3, ge=1)
 
 
 class LoopLimits(BaseModel):

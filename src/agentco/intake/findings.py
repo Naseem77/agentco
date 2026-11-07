@@ -25,8 +25,8 @@ _SPACE_RE = re.compile(r"\s+")
 _TERMINAL = (TaskState.MERGED, TaskState.CANCELLED)
 
 
-def fingerprint(path: str | None, body: str) -> str:
-    """Stable id of a complaint: the same text on the same file, however it is dressed up."""
+def normalize_text(body: str) -> str:
+    """Complaint text with code fences, URLs, digits and whitespace runs collapsed."""
     text = _CODE_FENCE_RE.sub(" ", body.lower())
     text = _URL_RE.sub(" ", text)
     text = _DIGITS_RE.sub("", text)
@@ -34,7 +34,14 @@ def fingerprint(path: str | None, body: str) -> str:
     if not normalized:
         # Fence-, URL- or digit-only: the text that was stripped is all there is.
         normalized = _SPACE_RE.sub(" ", body).strip()
-    return hashlib.sha1(f"{path or ''}\n{normalized}".encode()).hexdigest()[:12]
+    return normalized
+
+
+def fingerprint(path: str | None, body: str) -> str:
+    """Stable id of a complaint: the same text on the same file, however it is dressed up."""
+    return hashlib.sha1(f"{path or ''}\n{normalize_text(body)}".encode()).hexdigest()[
+        :12
+    ]
 
 
 def _check_fingerprint(name: str) -> str:
