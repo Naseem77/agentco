@@ -125,7 +125,7 @@ async def test_human_ok_overrides_unknown(store, loop_cfg):
     )
 
 
-async def test_new_design_escalates_until_plan_5(store, loop_cfg):
+async def test_new_design_without_architect_escalates(store, loop_cfg):
     _, task, _, asker, gate = await setup(
         store, loop_cfg, triage_json(route="new_design", size="l", risk="medium")
     )
@@ -134,8 +134,8 @@ async def test_new_design_escalates_until_plan_5(store, loop_cfg):
 
     assert (d.route, d.escalate, d.fast_lane) == (Role.SENIOR, "new", False)
     assert d.reason == (
-        "new design needs the Architect (Plan 5); "
-        "a human decides for now. Triage: small local change"
+        "a new design inside a sub-task or PR round; "
+        "a human decides. Triage: small local change"
     )
 
 
@@ -147,6 +147,48 @@ async def test_human_ok_lets_new_design_through_as_senior(store, loop_cfg):
     d = await run_triage(asker, loop_cfg, gate, store, task, ISSUE, human_ok=True)
 
     assert (d.route, d.escalate, d.fast_lane) == (Role.SENIOR, None, False)
+
+
+async def test_new_design_with_architect_routes_to_architect(store, loop_cfg):
+    _, task, _, asker, gate = await setup(
+        store, loop_cfg, triage_json(route="new_design", size="xs"), known=False
+    )
+
+    d = await run_triage(
+        asker, loop_cfg, gate, store, task, ISSUE, allow_architect=True
+    )
+
+    assert (d.route, d.escalate, d.fast_lane, d.require_invariant) == (
+        Role.ARCHITECT,
+        None,
+        False,
+        False,
+    )
+    assert store.latest_artifact(task.id, ArtifactKind.TRIAGE).body["route"] == (
+        "architect"
+    )
+
+
+async def test_allow_architect_only_affects_new_design(store, loop_cfg):
+    _, task, _, asker, gate = await setup(store, loop_cfg, triage_json(), known=False)
+
+    d = await run_triage(
+        asker, loop_cfg, gate, store, task, ISSUE, allow_architect=True
+    )
+
+    assert (d.route, d.escalate) == (Role.JUNIOR, "new")
+
+
+async def test_known_ok_skips_unknown_area_but_not_new_design(store, loop_cfg):
+    _, task, _, asker, gate = await setup(store, loop_cfg, triage_json(), known=False)
+    d = await run_triage(asker, loop_cfg, gate, store, task, ISSUE, known_ok=True)
+    assert (d.route, d.escalate) == (Role.JUNIOR, None)
+
+    _, task, _, asker, gate = await setup(
+        store, loop_cfg, triage_json(route="new_design"), known=False
+    )
+    d = await run_triage(asker, loop_cfg, gate, store, task, ISSUE, known_ok=True)
+    assert d.escalate == "new"
 
 
 def lead_finding(path):

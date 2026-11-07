@@ -16,6 +16,7 @@ from pathlib import Path
 
 from pydantic import TypeAdapter
 
+from agentco.agents.architect import run_architect
 from agentco.agents.checks import CheckOutcome, run_checks
 from agentco.agents.engineer import (
     EngineerBrief,
@@ -66,6 +67,7 @@ from agentco.workflow.pr import pr_body, pr_title
 from agentco.workflow.preflight import CheckResult, Preflight, PreflightReport
 from agentco.workflow.states import InvalidTransition, TaskState
 from agentco.workflow.stop_rules import StopDecision, apply_stop_rules
+from agentco.workflow.tree import ADR_SOURCE, spawn_children
 
 _S = TaskState
 _DONE = frozenset({_S.PR_OPEN, _S.MERGED, _S.CANCELLED})
@@ -199,6 +201,7 @@ class _Run:
             _S.INTAKE: self._intake,
             _S.PM: self._pm,
             _S.TRIAGE: self._triage,
+            _S.ARCHITECT: self._architect,
             _S.ENGINEERING: self._engineering,
             _S.PREFLIGHT: self._preflight,
             _S.INTERNAL_REVIEW: self._review,
@@ -259,6 +262,7 @@ class _Run:
         from_state: str | None = None,
         open_pr: bool = False,
         actor: Role = Role.LEAD,
+        step: str | None = None,
     ) -> None:
         write_escalation(
             self.store,
@@ -271,6 +275,7 @@ class _Run:
             from_state=from_state,
             open_pr=open_pr,
             actor=actor,
+            step=step,
         )
 
     def _is_pr_round(self) -> bool:
@@ -443,6 +448,8 @@ class _Run:
                 task,
                 self._issue(),
                 human_ok=self._human_ok(),
+                known_ok=task.source == ADR_SOURCE,  # the human approved the design
+                allow_architect=task.parent_id is None and not self._is_pr_round(),
             )
         except (ReplyInvalid, AgentStuck) as exc:
             await self._escalate("stuck", _agent_error(exc), actor=Role.TRIAGE)
@@ -450,12 +457,66 @@ class _Run:
         if decision.escalate:
             await self._escalate(decision.escalate, decision.reason, actor=Role.TRIAGE)
             return
+        if decision.route is Role.ARCHITECT:
+            self.store.assign(self.task_id, Role.ARCHITECT)
+            self._go(_S.ARCHITECT, Role.TRIAGE, decision.reason)
+            return
         if not task.reassigned:
             self.store.assign(self.task_id, decision.route)
         # review feedback on an open PR is always reviewed as new code
         fast_lane = decision.fast_lane and not self._is_pr_round()
         self._set("fast_lane", "1" if fast_lane else "0")
         self._go(_S.ENGINEERING, Role.TRIAGE, decision.reason)
+
+    async def _architect(self, task: TaskRecord) -> None:
+        if await self._escalate_if_over_budget(task):
+            return
+        floor = _id(self._latest(ArtifactKind.HUMAN_DECISION))
+        adr = self._latest(ArtifactKind.ADR)
+        if adr is None or adr.id < floor:
+            human = self._human_input()
+            note = human[0] if human and human[1] == _S.ARCHITECT.value else ""
+            try:
+                _, adr = await run_architect(
+                    self.asker,
+                    self.ctx.cfg,
+                    self.ctx.gate,
+                    self.store,
+                    task,
+                    self._issue(),
+                    repo_root=self.ctx.repo_root,
+                    human_note=note,
+                )
+            except (ReplyInvalid, AgentStuck) as exc:
+                await self._escalate("stuck", _agent_error(exc), actor=Role.ARCHITECT)
+                return
+        # an ADR written before a crash is escalated as it is, not rewritten
+        sub_tasks = adr.body["adr"]["sub_tasks"]
+        await self._escalate(
+            "new",
+            f"ADR: {adr.body['adr']['title']} ({len(sub_tasks)} sub-tasks)",
+            question=(
+                f"Approve this design and its sub-tasks? See `agentco adr {task.id}`."
+            ),
+            options=("approve", "answer: change the design", "reject"),
+            actor=Role.ARCHITECT,
+            step="adr",
+        )
+
+    async def _approve_adr(self, escalation: Artifact) -> None:
+        """Children come from the ADR the human saw: the latest one before the escalation."""
+        adrs = [
+            a
+            for a in self.store.artifacts(self.task_id, ArtifactKind.ADR)
+            if a.id < escalation.id
+        ]
+        if not adrs:
+            raise StepFailed(self.task().state, "no ADR to approve")
+        spawned = spawn_children(self.store, self.task(), adrs[-1])
+        self._set("adr", str(adrs[-1].id))
+        self._go(
+            _S.WAITING_CHILDREN, Role.HUMAN, f"ADR approved: {len(spawned)} sub-tasks"
+        )
 
     def _human_input(self) -> tuple[str, str] | None:
         """(note, from_state of the escalation answered) not yet seen by an engineer."""
@@ -915,7 +976,12 @@ class _Run:
             return True
         if choice not in ("approve", "answer") or escalation is None:
             return False
-        if origin == "pr_open":
+        if origin == _S.ARCHITECT.value:
+            if choice == "approve" and escalation.body.get("step") == "adr":
+                await self._approve_adr(escalation)
+            else:
+                self._go(_S.ARCHITECT, Role.HUMAN, f"human {choice}")
+        elif origin == "pr_open":
             await self._resume_pr(choice, decision)
         elif escalation.body.get("stop") == "rounds":
             self._set("max_rounds", str(self._budgets().max_rounds + 1))
