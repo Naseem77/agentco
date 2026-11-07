@@ -54,6 +54,8 @@ class ArtifactKind(StrEnum):
     ESCALATION = "escalation"
     HUMAN_DECISION = "human_decision"
     PR = "pr"
+    PR_FEEDBACK = "pr_feedback"
+    PR_REVIEW = "pr_review"
 
 
 class TaskRow(Base):

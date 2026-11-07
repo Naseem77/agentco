@@ -93,3 +93,15 @@ def test_list_tasks_filters_tenant_and_state(store):
     ]
     assert store.list_tasks("acme", []) == []
     assert store.list_tasks("nobody") == []
+
+
+def test_pr_feedback_and_review_kinds_roundtrip(store):
+    t = store.create_task("t", "x", "cli")
+    feedback = store.put_artifact(t.id, ArtifactKind.PR_FEEDBACK, Role.LEAD, {"n": 1})
+    review = store.put_artifact(t.id, ArtifactKind.PR_REVIEW, Role.LEAD, {"n": 2})
+    assert (ArtifactKind.PR_FEEDBACK.value, ArtifactKind.PR_REVIEW.value) == (
+        "pr_feedback",
+        "pr_review",
+    )
+    assert store.artifacts(t.id, kind=ArtifactKind.PR_FEEDBACK) == [feedback]
+    assert store.latest_artifact(t.id, ArtifactKind.PR_REVIEW) == review
