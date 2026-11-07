@@ -1833,6 +1833,26 @@ def test_librarian_invalid_reply_is_warning_not_failure(env, repo):
     assert env.store.get_meta(f"librarian:acme:artifact:{decision.id}") is None
 
 
+@pytest.mark.parametrize("decision", ["reject", "approve"])
+def test_librarian_runtime_failure_never_changes_decide_exit_code(
+    env, repo, monkeypatch, decision
+):
+    _over_budget(env)
+    task_id = _new_task(env)
+    _run_task(env, repo, str(task_id))
+
+    def broken(cfg):
+        raise RuntimeError("claude CLI not found")
+
+    monkeypatch.setattr(cli, "make_runtime", broken)
+
+    result = env("decide", str(task_id), decision)
+
+    assert result.exit_code == 0, result.stdout
+    assert f"warning: librarian #{task_id}: " in result.stdout
+    assert len(_decisions(env, task_id)) == 1
+
+
 def _merge_pull(gh, number=7):
     pull = gh.get_pull("acme/app", number)
     gh.upsert_pull(

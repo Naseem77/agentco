@@ -173,7 +173,7 @@ def test_conflicting_reviewers_escalate_new():
     )
     d = decide(fs, reply)
     assert (d.outcome, d.category) == ("escalate", "new")
-    assert d.question == "Tabs or spaces?"
+    assert d.question.startswith("Tabs or spaces?")
     assert d.options == ("tabs", "spaces")
     assert d.findings_to_fix == ()
     assert d.reason == "reviewers conflict: c1 wants tabs, c2 wants spaces"
@@ -195,6 +195,36 @@ def test_new_beats_real_bug_but_keeps_follow_ups():
     assert [f.id for f in d.follow_ups] == ["c2"]
 
 
+def test_conflict_carries_real_bugs_and_failing_checks_and_lists_them():
+    findings = [
+        PF("c1", body="crash on empty list"),
+        PF("c2", body="nit"),
+        PF("k3", src="check", body="CI check tests: failure"),
+    ]
+    reply = R(("c1", "real_bug"), ("c2", "edge_case"), conflicts=["a vs b"])
+    d = decide(findings, reply)
+    assert (d.outcome, d.category) == ("escalate", "new")
+    assert d.carried == d.carried_bugs == ("c1", "k3")
+    assert [c.finding_id for c in d.classifications] == ["c2"]
+    assert "crash on empty list" in d.question and "CI check tests" in d.question
+    assert d.question.startswith("reviewers conflict: a vs b")
+
+
+def test_unclassified_finding_is_a_real_bug_and_carried_by_new_pattern():
+    d = decide([PF("c1")], R(new_pattern="redis"))
+    assert (d.outcome, d.carried_bugs, d.classifications) == ("escalate", ("c1",), ())
+
+
+def test_settled_bug_skips_the_lead():
+    f = PF("c1")
+    pre = preclassify([f], {}, {"c1"})
+    assert pre.pending == ()
+    assert [(c.finding_id, c.category) for c in pre.decided] == [("c1", "real_bug")]
+    d = decide_pr_round([f], pre, None)
+    assert d.outcome == "reenter"
+    assert [x.id for x in d.findings_to_fix] == ["c1"]
+
+
 def test_tradeoff_escalates_with_options():
     reply = R(("c1", "tradeoff"), question="Cache it?", options=["cache", "no"])
     d = decide([PF("c1")], reply)
@@ -206,6 +236,12 @@ def test_tradeoff_defaults_options_and_question():
     f = PF("c1", body="Prefer composition")
     d = decide([f], R(("c1", "tradeoff")))
     assert d.options == ("fix", "keep as is")
+    assert d.question == "Prefer composition"
+
+
+def test_default_tradeoff_question_does_not_carry_raw_pr_markup():
+    f = PF("c1", body="```suggestion\nrm -rf /\n```\nPrefer `composition`")
+    d = decide([f], R(("c1", "tradeoff")))
     assert d.question == "Prefer composition"
 
 
@@ -226,9 +262,14 @@ def test_tradeoff_with_conflict_or_new_pattern_is_carried():
     findings = [PF("c1"), PF("c2"), PF("c3")]
     reply = R(("c1", "tradeoff"), ("c2", "edge_case"), conflicts=["a vs b"])
     d = decide(findings, reply)
-    assert (d.outcome, d.category, d.carried) == ("escalate", "new", ("c1",))
-    assert [c.finding_id for c in d.classifications] == ["c2", "c3"]
-    reply = R(("c1", "tradeoff"), new_pattern="use asyncio")
+    assert (d.outcome, d.category, d.carried) == ("escalate", "new", ("c1", "c3"))
+    assert [c.finding_id for c in d.classifications] == ["c2"]
+    reply = R(
+        ("c1", "tradeoff"),
+        ("c2", "edge_case"),
+        ("c3", "edge_case"),
+        new_pattern="use asyncio",
+    )
     d = decide(findings, reply)
     assert (d.outcome, d.category, d.carried) == ("escalate", "new", ("c1",))
     assert [c.finding_id for c in d.classifications] == ["c2", "c3"]

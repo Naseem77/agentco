@@ -222,6 +222,27 @@ def test_checks_read_for_given_head_sha_only(store, tracked, gh):
     assert ("check_runs", "old") not in gh.calls
 
 
+def test_check_run_of_another_head_is_dropped(store, tracked, gh):
+    gh.set_checks("sha1", [K(1, sha="old"), K(2)])
+    assert [f.id for f in collect(store, gh, tracked)] == ["k2"]
+
+
+def test_checks_can_be_left_out(store, tracked, gh):
+    gh.set_checks("sha1", [K(1)])
+    found = collect_findings(
+        gh,
+        REPO,
+        tracked,
+        SINCE,
+        by_pr(gh),
+        IntakeConfig(),
+        "sha1",
+        store=store,
+        with_checks=False,
+    )
+    assert found == [] and ("check_runs", "sha1") not in gh.calls
+
+
 def test_failing_conclusions_are_configurable(store, tracked, gh):
     gh.set_checks("sha1", [K(1, conclusion="cancelled"), K(2, conclusion="failure")])
     cfg = IntakeConfig(failing_conclusions=["cancelled"])
@@ -427,6 +448,38 @@ def test_counts_rules():
     assert counts(f("good[bot]", "NONE", bot=True), bots)
     assert counts(f("good[bot]", "MEMBER", bot=True), bots)
     assert not counts(f("evil[bot]", "NONE", bot=True), bots)
+    assert not counts(f("good[bot]", "NONE", bot=False), bots)
+
+
+def test_user_named_like_an_allow_listed_bot_is_not_a_bot(store, tracked, gh):
+    gh.add_comment(C(1, COPILOT, "NONE", "null check missing", bot=False))
+    assert collect(store, gh, tracked) == []
+
+
+@pytest.mark.parametrize(
+    ("body", "title"),
+    [
+        ("```suggestion\nfoo()\n```\nplease use foo", "please use foo"),
+        ("```suggestion\nfoo()\n```", "PR feedback"),
+        ("   \n  ", "PR feedback"),
+        ("use `foo`   instead\tof  bar", "use foo instead of bar"),
+        ("```\nunterminated fence", "PR feedback"),
+        ("y" * 200, "y" * 80),
+    ],
+)
+def test_title_is_one_clean_line(body, title):
+    f = PRFinding(
+        id="c1",
+        source="comment",
+        author="a",
+        is_bot=False,
+        association="MEMBER",
+        body=body,
+        url="u",
+        created_at=AFTER,
+        fingerprint="f",
+    )
+    assert f.as_finding().title == title
 
 
 def test_as_finding_maps_severity_and_title(store, tracked, gh):

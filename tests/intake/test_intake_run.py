@@ -7,6 +7,7 @@ import agentco.intake.run as run_module
 from agentco.github.client import FakeGitHub, _validate_ref
 from agentco.github.errors import GitHubError
 from agentco.github.models import GhCheckRun, GhPull, GhReviewComment, GhUser
+from agentco.intake.findings import PRFinding
 from agentco.intake.run import IntakeReport, run_intake
 from agentco.llm.fake import FakeRuntime
 from agentco.memory.backend import InMemoryBackend
@@ -299,6 +300,19 @@ async def test_cursor_moves_only_after_success(store, loop_cfg):
     assert store.get_meta(f"intake:acme:{REPO}:cursor") == T2.isoformat()
 
 
+async def test_cursor_is_read_with_an_overlap_for_clock_skew(store, loop_cfg):
+    env = with_lead(store, loop_cfg, lead_json(("c1", "real_bug")))
+    await env.run()
+    assert store.get_meta(f"intake:acme:{REPO}:cursor") == T1.isoformat()
+    # GitHub stamped this a little before our clock's cursor.
+    env.gh.add_comment(
+        C(1, "alice", "MEMBER", "crash on empty list", at=T1 - timedelta(minutes=2))
+    )
+    rep = await env.run(now=T2)
+    assert rep.reentered == [env.tid]
+    assert ("review_comments", T1 - run_module.CURSOR_OVERLAP) in env.gh.calls
+
+
 async def test_comment_read_failure_is_a_github_failure(env):
     class Down(FakeGitHub):
         def review_comments(self, repo, since=None):
@@ -417,6 +431,34 @@ async def test_failing_check_reenters_without_llm(env):
     assert [f["id"] for f in lead["findings_to_fix"]] == ["k5"]
     assert lead["findings_to_fix"][0]["severity"] == "major"
     assert env.task().state is S.TRIAGE
+
+
+async def test_failing_check_is_not_recorded_while_a_round_is_in_flight(env):
+    walk(env.store, env.tid, S.TRIAGE)
+    env.gh.set_checks("sha1", [K(5)])
+    rep = await env.run()
+    assert rep.new_findings == 0 and env.kinds(ArtifactKind.PR_FEEDBACK) == []
+
+
+async def test_stale_check_recorded_on_the_old_head_does_not_start_a_round(env):
+    old = env.kinds(ArtifactKind.PR_FEEDBACK)
+    assert old == []
+    stale = PRFinding(
+        id="k5",
+        source="check",
+        author="ci",
+        is_bot=False,
+        association="CI",
+        body="CI check tests: failure",
+        url="u",
+        created_at=BASE,
+        fingerprint="fp",
+    )
+    run_module._store_feedback(env.store, env.tid, 7, "sha1", [stale])
+    env.gh.upsert_pull(pull_of(head_sha="sha2"))
+    rep = await env.run()
+    assert rep.ok and rep.reentered == [] and env.task().state is S.PR_OPEN
+    assert env.kinds(ArtifactKind.PR_REVIEW) == []
 
 
 async def test_recurring_failing_check_is_bounded_by_the_round_limit(store, loop_cfg):
@@ -677,6 +719,41 @@ async def test_approved_escalation_over_only_tradeoffs_is_not_asked_again(
     assert len(env.kinds(ArtifactKind.ESCALATION)) == 1
     assert len(env.kinds(ArtifactKind.PR_REVIEW)) == 1
     assert env.task().state is S.PR_OPEN
+
+
+@pytest.mark.parametrize(
+    "extra", [{"conflicts": ["a vs b"]}, {"new_pattern": "use asyncio"}]
+)
+async def test_real_bug_survives_a_conflict_escalation_and_is_fixed_after_approve(
+    store, loop_cfg, extra
+):
+    env = with_lead(
+        store,
+        loop_cfg,
+        lead_json(("c1", "real_bug"), ("c2", "tradeoff"), question="Which?", **extra),
+        lead_json(("c2", "tradeoff")),
+    )
+    env.gh.add_comment(C(1, "alice", "MEMBER", "crash on empty list"))
+    env.gh.add_comment(C(2, "bob", "MEMBER", "do it the other way", path="b.py"))
+    env.gh.set_checks("sha1", [K(5)])
+    rep = await env.run()
+    assert rep.escalated == [(env.tid, "new")]
+    review = env.kinds(ArtifactKind.PR_REVIEW)[-1].body
+    assert review["consumed"] == []
+    assert sorted(review["decision"]["carried_bugs"]) == ["c1", "k5"]
+    esc = env.kinds(ArtifactKind.ESCALATION)[-1].body
+    assert "crash on empty list" in esc["question"]
+    store.put_artifact(
+        env.tid, ArtifactKind.HUMAN_DECISION, Role.HUMAN, {"decision": "approve"}
+    )
+    store.transition(env.tid, S.PR_OPEN, Role.HUMAN, "human approved")
+    rep = await env.run(now=T2)
+    assert rep.ok and rep.reentered == [env.tid]
+    assert len(env.lead_calls()) == 2
+    assert "c1" not in env.lead_calls()[1].prompt
+    lead = env.kinds(ArtifactKind.LEAD)[-1].body
+    assert {f["id"] for f in lead["findings_to_fix"]} == {"c1", "k5"}
+    assert env.task().state is S.TRIAGE
 
 
 async def test_human_merge_while_awaiting_is_found_by_intake(store, loop_cfg):

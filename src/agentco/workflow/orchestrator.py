@@ -860,7 +860,7 @@ class _Run:
     async def _resume_pr(self, choice: str, decision: Artifact) -> None:
         """A human answered an escalation raised while the PR was open."""
         if choice == "approve":
-            self._go(_S.PR_OPEN, Role.HUMAN, "human approved: nothing to fix")
+            self._go(_S.PR_OPEN, Role.HUMAN, "human approved")
             return
         lead = self._latest(ArtifactKind.LEAD)
         if lead is None or lead.body.get("human_decision") != decision.id:
