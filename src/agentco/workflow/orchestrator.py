@@ -16,7 +16,7 @@ from pathlib import Path
 
 from pydantic import TypeAdapter
 
-from agentco.agents.architect import run_architect
+from agentco.agents.architect import ADRReply, run_architect
 from agentco.agents.checks import CheckOutcome, run_checks
 from agentco.agents.engineer import (
     EngineerBrief,
@@ -24,7 +24,7 @@ from agentco.agents.engineer import (
     EngineerReply,
     run_engineer,
 )
-from agentco.agents.lead import LeadDecision, run_lead
+from agentco.agents.lead import ChildSummary, LeadDecision, review_parent, run_lead
 from agentco.agents.models import role_model
 from agentco.agents.pm import run_pm
 from agentco.agents.qa import QAReply, run_qa
@@ -67,7 +67,12 @@ from agentco.workflow.pr import pr_body, pr_title
 from agentco.workflow.preflight import CheckResult, Preflight, PreflightReport
 from agentco.workflow.states import InvalidTransition, TaskState
 from agentco.workflow.stop_rules import StopDecision, apply_stop_rules
-from agentco.workflow.tree import ADR_SOURCE, spawn_children
+from agentco.workflow.tree import (
+    ADR_SOURCE,
+    adr_children,
+    cancel_open_children,
+    spawn_children,
+)
 
 _S = TaskState
 _DONE = frozenset({_S.PR_OPEN, _S.MERGED, _S.CANCELLED})
@@ -211,6 +216,10 @@ class _Run:
             task = self.task()
             if task.state is _S.AWAITING_HUMAN:
                 if not await self._resume(task):
+                    return task
+                continue
+            if task.state is _S.WAITING_CHILDREN:
+                if not await self._children(task):
                     return task
                 continue
             if task.state is _S.PR_OPEN and self._answer_interrupted():
@@ -517,6 +526,101 @@ class _Run:
         self._go(
             _S.WAITING_CHILDREN, Role.HUMAN, f"ADR approved: {len(spawned)} sub-tasks"
         )
+
+    def _accepted(self) -> set[int]:
+        return set(json.loads(self._meta("accepted") or "[]"))
+
+    def _child_summary(self, child: TaskRecord) -> ChildSummary:
+        pr = self.store.latest_artifact(child.id, ArtifactKind.PR)
+        lead = self.store.latest_artifact(child.id, ArtifactKind.LEAD)
+        return ChildSummary(
+            child.id,
+            child.title,
+            child.state.value,
+            str(pr.body.get("url", "")) if pr else "",
+            str(lead.body.get("summary", "")) if lead else "",
+        )
+
+    def _parent_note(self) -> str:
+        """A human's answer to the last whole-tree review, until the next escalation."""
+        escalation = self._latest(ArtifactKind.ESCALATION)
+        decision = self._latest(ArtifactKind.HUMAN_DECISION)
+        if (
+            escalation is None
+            or decision is None
+            or decision.id < escalation.id
+            or escalation.body.get("step") != "parent_review"
+        ):
+            return ""
+        return str(decision.body.get("note", "")).strip()
+
+    async def _children(self, task: TaskRecord) -> bool:
+        """Act on the children of a waiting parent; False while there is nothing to do."""
+        kids = adr_children(self.store, task)
+        accepted = self._accepted()
+        failed = [k for k in kids if k.state is _S.CANCELLED and k.id not in accepted]
+        if failed:
+            await self._escalate(
+                "stuck",
+                "sub-task(s) " + ", ".join(f"#{k.id}" for k in failed) + " cancelled",
+                options=(
+                    "approve: continue without them",
+                    "reject: cancel the whole task",
+                ),
+                step="child_failed",
+            )
+            return True
+        done = all(
+            k.state is _S.MERGED or (k.state is _S.CANCELLED and k.id in accepted)
+            for k in kids
+        )
+        if not kids or not done:
+            return False
+        if await self._escalate_if_over_budget(task):
+            return True
+        adr_id = self._meta("adr")
+        adr = next(
+            (
+                a
+                for a in self.store.artifacts(self.task_id, ArtifactKind.ADR)
+                if str(a.id) == adr_id
+            ),
+            None,
+        )
+        if adr is None:
+            raise StepFailed(_S.WAITING_CHILDREN, "no approved ADR to review against")
+        try:
+            reply = await review_parent(
+                self.asker,
+                self.ctx.cfg,
+                self.ctx.gate,
+                self.store,
+                task,
+                adr=ADRReply.model_validate(adr.body["adr"]),
+                children=[self._child_summary(k) for k in kids],
+                human_note=self._parent_note(),
+            )
+        except (ReplyInvalid, AgentStuck) as exc:
+            await self._escalate(
+                "stuck", f"lead failed: {_agent_error(exc)}", step="parent_review"
+            )
+            return True
+        if (
+            reply.approve
+            and reply.confidence >= self.ctx.cfg.thresholds.lead_min_confidence
+        ):
+            self._go(
+                _S.MERGED, Role.LEAD, "all sub-tasks merged; lead approved the whole"
+            )
+        else:
+            await self._escalate(
+                "tradeoff",
+                reply.reason,
+                question="Do the merged sub-tasks deliver the design?",
+                options=("approve", "answer: what is missing", "reject"),
+                step="parent_review",
+            )
+        return True
 
     def _human_input(self) -> tuple[str, str] | None:
         """(note, from_state of the escalation answered) not yet seen by an engineer."""
@@ -973,6 +1077,9 @@ class _Run:
         origin = escalation.body.get("from_state") if escalation else None
         if choice == "reject":
             self._go(_S.CANCELLED, Role.HUMAN, "rejected by a human")
+            cancel_open_children(
+                self.store, self.task_id, Role.HUMAN, "parent rejected"
+            )
             return True
         if choice not in ("approve", "answer") or escalation is None:
             return False
@@ -981,6 +1088,8 @@ class _Run:
                 await self._approve_adr(escalation)
             else:
                 self._go(_S.ARCHITECT, Role.HUMAN, f"human {choice}")
+        elif origin == _S.WAITING_CHILDREN.value:
+            self._resume_parent(choice, escalation)
         elif origin == "pr_open":
             await self._resume_pr(choice, decision)
         elif escalation.body.get("stop") == "rounds":
@@ -993,6 +1102,20 @@ class _Run:
         else:
             self._go(_S.TRIAGE, Role.HUMAN, f"human {choice}")
         return True
+
+    def _resume_parent(self, choice: str, escalation: Artifact) -> None:
+        step = escalation.body.get("step")
+        if step == "child_failed":
+            cancelled = {
+                k.id
+                for k in adr_children(self.store, self.task())
+                if k.state is _S.CANCELLED
+            }
+            self._set("accepted", json.dumps(sorted(self._accepted() | cancelled)))
+        if step == "parent_review" and choice == "approve":
+            self._go(_S.MERGED, Role.HUMAN, "human approved the whole")
+        else:
+            self._go(_S.WAITING_CHILDREN, Role.HUMAN, f"human {choice}")
 
     async def _resume_pr(self, choice: str, decision: Artifact) -> None:
         """A human answered an escalation raised while the PR was open."""

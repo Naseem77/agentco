@@ -1,11 +1,13 @@
 """Team lead: classifies findings, then code applies the decision order (spec §6)."""
 
 import re
+from collections.abc import Sequence
 from dataclasses import asdict, dataclass, replace
 from typing import Literal
 
 from pydantic import BaseModel, Field
 
+from agentco.agents.architect import ADRReply, adr_markdown
 from agentco.agents.checks import CheckOutcome
 from agentco.agents.engineer import EngineerReply
 from agentco.agents.models import role_model
@@ -434,3 +436,82 @@ async def run_lead(
     body["follow_ups"] = [f.model_dump() for f in decision.follow_ups]
     store.put_artifact(task.id, ArtifactKind.LEAD, Role.LEAD, body)
     return decision
+
+
+@dataclass(frozen=True)
+class ChildSummary:
+    id: int
+    title: str
+    state: str
+    pr_url: str
+    summary: str
+
+
+class ParentLeadReply(Reply):
+    approve: bool
+    confidence: float = Field(ge=0, le=1)
+    reason: str
+    summary: str
+
+
+def parent_input(
+    issue: PMReply | None,
+    adr: ADRReply,
+    children: Sequence[ChildSummary],
+    human_note: str,
+) -> str:
+    sections = [
+        adr_markdown(adr),
+        issue_text(issue) if issue else "(the parent has no issue text)",
+    ]
+    lines = [
+        f"- #{c.id} {c.title} [{c.state}]"
+        + (f" {c.pr_url}" if c.pr_url else "")
+        + (f"\n  lead summary: {c.summary}" if c.summary else "")
+        for c in children
+    ]
+    sections.append("Sub-tasks:\n" + ("\n".join(lines) or "(none)"))
+    if human_note.strip():
+        sections.append(f"Human guidance:\n{human_note.strip()}")
+    return "\n\n".join(sections)
+
+
+async def review_parent(
+    asker: Asker,
+    cfg: TenantConfig,
+    gate: MemoryGate,
+    store: TaskStore,
+    parent: TaskRecord,
+    *,
+    adr: ADRReply,
+    children: Sequence[ChildSummary],
+    human_note: str = "",
+) -> ParentLeadReply:
+    """Do the merged sub-tasks together deliver the ADR and the parent's criteria?"""
+    issue_artifact = store.latest_artifact(parent.id, ArtifactKind.ISSUE)
+    issue = PMReply.model_validate(issue_artifact.body) if issue_artifact else None
+    call = AgentCall(
+        role=Role.LEAD,
+        model=role_model(cfg, Role.LEAD).model,
+        system=load_prompt(Role.LEAD, "parent"),
+        prompt=parent_input(issue, adr, children, human_note),
+        tools=memory_tools(gate.for_role(Role.LEAD)),
+        max_turns=cfg.loop.agent_max_turns,
+        timeout_s=cfg.loop.agent_timeout_s,
+    )
+    reply = await asker.ask(call, ParentLeadReply)
+    approved = reply.approve and reply.confidence >= cfg.thresholds.lead_min_confidence
+    decision = LeadDecision(
+        outcome="approve" if approved else "escalate",
+        category="" if approved else "tradeoff",
+        findings_to_fix=(),
+        follow_ups=(),
+        reason=reply.reason,
+        summary=reply.summary,
+        comments=(),
+        question="",
+        options=(),
+    )
+    body = asdict(decision) | {"source": "parent"}
+    store.put_artifact(parent.id, ArtifactKind.LEAD, Role.LEAD, body)
+    return reply
