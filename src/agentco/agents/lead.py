@@ -32,6 +32,19 @@ CRITICAL_PATTERNS: dict[str, tuple[str, ...]] = {
     "money": (r"payment|billing|license",),
 }
 FAST_LANE_SUMMARY = "fast lane: rule-based approval"
+ROOT_CAUSE_QUESTION = (
+    "Root cause required: does the invariant remove the cause, not just this symptom?"
+)
+MISSING_INVARIANT = Finding(
+    id="root-cause",
+    severity="major",
+    kind="bug",
+    title="State one invariant",
+    detail=(
+        "This area came back again: state the one rule that removes the cause, "
+        "apply it, and test it."
+    ),
+)
 
 _DIFF_HEADER = re.compile(r"^diff --git a/(.+?) b/(.+)$", re.MULTILINE)
 _DIFF_FILE_LINE = re.compile(
@@ -272,6 +285,7 @@ def lead_input(
     changed_lines: int,
     critical: list[str],
     new: list[str],
+    require_invariant: bool = False,
 ) -> str:
     sections = [
         issue_text(issue),
@@ -288,6 +302,8 @@ def lead_input(
         sections.append("Critical changes:\n" + "\n".join(f"- {h}" for h in critical))
     if new:
         sections.append("New or unknown:\n" + "\n".join(f"- {h}" for h in new))
+    if require_invariant:
+        sections.append(ROOT_CAUSE_QUESTION)
     sections.append(f"Changed lines: {changed_lines}\n\nDiff:\n{diff_text}")
     return "\n\n".join(sections)
 
@@ -340,12 +356,29 @@ async def run_lead(
     checks: CheckOutcome,
     changed_lines: int,
     fast_lane: bool,
+    require_invariant: bool = False,
 ) -> LeadDecision:
     paths = sorted({*diff_paths(diff_text), *engineer.files_touched})
     critical = critical_hits(paths, checks.qa)
     new = await new_hits(gate, paths, engineer.new_dependencies)
 
-    if fast_lane and _fast_lane_eligible(cfg, checks, changed_lines, critical, new):
+    if require_invariant and not engineer.invariant.strip():
+        decision = LeadDecision(
+            outcome="send_back",
+            category="",
+            findings_to_fix=(MISSING_INVARIANT,),
+            follow_ups=(),
+            reason="root cause: the engineer stated no invariant",
+            summary="",
+            comments=(),
+            question="",
+            options=(),
+        )
+    elif (
+        fast_lane
+        and not require_invariant
+        and _fast_lane_eligible(cfg, checks, changed_lines, critical, new)
+    ):
         decision = LeadDecision(
             outcome="approve",
             category="",
@@ -371,6 +404,7 @@ async def run_lead(
                 changed_lines,
                 critical,
                 new,
+                require_invariant,
             ),
             tools=memory_tools(gate.for_role(Role.LEAD)),
             max_turns=cfg.loop.agent_max_turns,

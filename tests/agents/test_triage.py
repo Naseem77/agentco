@@ -1,10 +1,12 @@
 import json
+from dataclasses import replace
 from datetime import UTC, datetime
 
 import pytest
 
 from agentco.agents.replies import PMReply
 from agentco.agents.triage import TriageDecision, run_triage
+from agentco.learning.recurrence import area_recurrences, record_recurrence
 from agentco.llm.fake import FakeRuntime
 from agentco.llm.replies import Asker
 from agentco.memory.backend import InMemoryBackend, MemoryItem
@@ -44,7 +46,11 @@ async def test_known_junior_small_low_risk_takes_fast_lane(store, loop_cfg):
 
     d = await run_triage(asker, loop_cfg, gate, store, task, ISSUE)
 
-    assert d == TriageDecision(Role.JUNIOR, True, False, None, "small local change")
+    # the fake memory matches loosely, so the known fact also comes back as a playbook
+    assert d.playbooks == ("the parser module handles tabs",)
+    assert replace(d, playbooks=()) == TriageDecision(
+        Role.JUNIOR, True, False, None, "small local change"
+    )
     [call] = runtime.calls
     assert (call.role, call.model, call.tools) == (Role.TRIAGE, "m-triage", ())
     assert call.prompt == (
@@ -61,6 +67,8 @@ async def test_known_junior_small_low_risk_takes_fast_lane(store, loop_cfg):
         "require_invariant": False,
         "escalate": None,
         "reason": "small local change",
+        "root_cause": [],
+        "playbooks": ["the parser module handles tabs"],
         "reply": {
             "route": "junior",
             "size": "xs",
@@ -112,7 +120,9 @@ async def test_human_ok_overrides_unknown(store, loop_cfg):
 
     d = await run_triage(asker, loop_cfg, gate, store, task, ISSUE, human_ok=True)
 
-    assert d == TriageDecision(Role.JUNIOR, True, False, None, "small local change")
+    assert replace(d, playbooks=()) == TriageDecision(
+        Role.JUNIOR, True, False, None, "small local change"
+    )
 
 
 async def test_new_design_escalates_until_plan_5(store, loop_cfg):
@@ -168,7 +178,10 @@ def to_round(store, task_id, paths_by_round):
             task_id,
             ArtifactKind.LEAD,
             Role.LEAD,
-            {"findings_to_fix": [lead_finding(p) for p in paths]},
+            {
+                "outcome": "send_back",
+                "findings_to_fix": [lead_finding(p) for p in paths],
+            },
         )
         store.transition(task_id, TaskState.TRIAGE, Role.LEAD, "send back")
     return store.get(task_id)
@@ -244,3 +257,128 @@ async def test_fast_lane_only_for_small_low_risk_known_first_round(
     d = await run_triage(asker, loop_cfg, gate, store, task, ISSUE)
 
     assert d.fast_lane is expected
+
+
+async def add_playbook(backend, text):
+    await backend.add(
+        "acme__rnd",
+        Scope.RND,
+        MemoryItem("p", f"Playbook (origin librarian): {text}", "t", datetime.now(UTC)),
+    )
+
+
+async def hot_setup(store, loop_cfg, reply):
+    """A task whose one send-back is the 2nd recurrence in src/calc."""
+    runtime, task, backend, asker, gate = await setup(store, loop_cfg, reply)
+    record_recurrence(store, "acme", 99, ["src/calc/x.py"], "pr-review-1")  # 1st
+    task = to_round(store, task.id, [["src/calc/add.py"]])
+    record_recurrence(store, "acme", task.id, ["src/calc/add.py"], "pr-review-2")
+    return runtime, task, backend, asker, gate
+
+
+async def test_second_recurrence_forces_senior_with_invariant_and_playbooks(
+    store, loop_cfg
+):
+    _, task, backend, asker, gate = await hot_setup(store, loop_cfg, triage_json())
+    await add_playbook(backend, "src/calc: normalise inputs before compare")
+
+    d = await run_triage(asker, loop_cfg, gate, store, task, ISSUE)
+
+    assert d.route is Role.SENIOR and d.require_invariant and not d.fast_lane
+    assert d.root_cause == ("src/calc",)
+    assert any("normalise inputs" in p for p in d.playbooks)
+    assert d.reason.endswith(
+        " Root cause: src/calc came back 2 times; state one invariant."
+    )
+    [artifact] = store.artifacts(task.id, ArtifactKind.TRIAGE)
+    assert artifact.body["root_cause"] == ["src/calc"]
+    assert artifact.body["route"] == "senior"
+    assert any("normalise inputs" in p for p in artifact.body["playbooks"])
+
+
+async def test_first_recurrence_keeps_plan4_behaviour(store, loop_cfg):
+    _, task, _, asker, gate = await setup(store, loop_cfg, triage_json(size="m"))
+    task = to_round(store, task.id, [["src/calc/add.py"]])
+    record_recurrence(store, "acme", task.id, ["src/calc/add.py"], "pr-review-2")
+
+    d = await run_triage(asker, loop_cfg, gate, store, task, ISSUE)
+
+    assert (d.route, d.require_invariant, d.root_cause) == (Role.JUNIOR, False, ())
+    assert "Root cause" not in d.reason
+
+
+async def test_threshold_is_configurable(store, loop_cfg):
+    loop_cfg.thresholds.root_cause_after = 3
+    _, task, _, asker, gate = await hot_setup(store, loop_cfg, triage_json(size="m"))
+
+    d = await run_triage(asker, loop_cfg, gate, store, task, ISSUE)
+
+    assert (d.route, d.root_cause) == (Role.JUNIOR, ())
+
+
+async def test_root_cause_overrides_a_new_design_route(store, loop_cfg):
+    reply = triage_json(route="new_design", size="l")
+    _, task, _, asker, gate = await hot_setup(store, loop_cfg, reply)
+
+    d = await run_triage(asker, loop_cfg, gate, store, task, ISSUE, human_ok=True)
+
+    assert (d.route, d.require_invariant, d.root_cause) == (
+        Role.SENIOR,
+        True,
+        ("src/calc",),
+    )
+
+
+async def test_other_modules_do_not_make_this_area_hot(store, loop_cfg):
+    _, task, _, asker, gate = await setup(store, loop_cfg, triage_json(size="m"))
+    record_recurrence(store, "acme", 98, ["src/other/x.py"], "pr-review-1")
+    record_recurrence(store, "acme", 99, ["src/other/y.py"], "pr-review-2")
+    task = to_round(store, task.id, [["src/calc/add.py"]])
+
+    d = await run_triage(asker, loop_cfg, gate, store, task, ISSUE)
+
+    assert (d.route, d.root_cause) == (Role.JUNIOR, ())
+
+
+async def test_within_task_repeat_is_counted_once_per_round(store, loop_cfg):
+    _, task, _, asker, gate = await setup(store, loop_cfg, triage_json())
+    task = to_round(store, task.id, [["src/a/x.py"], ["src/a/x.py"]])
+
+    await run_triage(asker, loop_cfg, gate, store, task, ISSUE)
+    assert area_recurrences(store, "acme", ["src/a"]) == {"src/a": 1}
+    again = Asker(
+        FakeRuntime({Role.TRIAGE: [triage_json()]}),
+        store,
+        task.id,
+        loop_cfg.price_per_request_usd,
+    )
+    await run_triage(again, loop_cfg, gate, store, task, ISSUE)
+    assert area_recurrences(store, "acme", ["src/a"]) == {"src/a": 1}
+
+
+async def test_pr_send_back_paths_count_like_internal_ones(store, loop_cfg):
+    _, task, _, asker, gate = await hot_setup(store, loop_cfg, triage_json())
+    store.put_artifact(
+        task.id,
+        ArtifactKind.LEAD,
+        Role.LEAD,
+        {
+            "outcome": "send_back",
+            "source": "pr",
+            "findings_to_fix": [lead_finding("src/calc/mul.py")],
+        },
+    )
+
+    d = await run_triage(asker, loop_cfg, gate, store, task, ISSUE)
+
+    assert d.root_cause == ("src/calc",)
+
+
+async def test_playbooks_are_looked_up_without_a_send_back(store, loop_cfg):
+    _, task, backend, asker, gate = await setup(store, loop_cfg, triage_json())
+    await add_playbook(backend, "tabs: split on whitespace once")
+
+    d = await run_triage(asker, loop_cfg, gate, store, task, ISSUE)
+
+    assert any("split on whitespace once" in p for p in d.playbooks)
+    assert d.root_cause == () and d.require_invariant is False

@@ -4,6 +4,12 @@ from agentco.agents.models import role_model
 from agentco.agents.prompts import load_prompt
 from agentco.agents.replies import PMReply, TriageReply
 from agentco.config import TenantConfig
+from agentco.importer.episodes import module_of
+from agentco.learning.recurrence import (
+    area_playbooks,
+    area_recurrences,
+    record_recurrence,
+)
 from agentco.llm.replies import Asker
 from agentco.llm.runtime import AgentCall
 from agentco.memory.gate import MemoryGate
@@ -22,6 +28,8 @@ class TriageDecision:
     require_invariant: bool
     escalate: str | None
     reason: str
+    root_cause: tuple[str, ...] = ()
+    playbooks: tuple[str, ...] = ()
 
 
 def _issue_prompt(issue: PMReply) -> str:
@@ -42,6 +50,19 @@ def _repeat_paths(store: TaskStore, task_id: int) -> list[str]:
             if path:
                 rounds.setdefault(path, set()).add(artifact.round)
     return sorted(path for path, seen in rounds.items() if len(seen) >= 2)
+
+
+def _send_back_paths(store: TaskStore, task_id: int) -> list[str]:
+    """Paths of the latest send-back, whether it came from the lead or from the PR."""
+    sent_back = [
+        a
+        for a in store.artifacts(task_id, ArtifactKind.LEAD)
+        if a.body.get("outcome") == "send_back"
+    ]
+    if not sent_back:
+        return []
+    findings = sent_back[-1].body.get("findings_to_fix", [])
+    return [f["path"] for f in findings if f.get("path")]
 
 
 async def run_triage(
@@ -91,6 +112,27 @@ async def run_triage(
             f"{reason} Repeat area ({', '.join(repeated)}): fix causes with one rule."
         )
 
+    # An area is hot once it has come back `root_cause_after` times, across tasks.
+    record_recurrence(store, task.tenant, task.id, repeated, f"round-{task.round}")
+    back_paths = _send_back_paths(store, task.id)
+    back_modules = sorted({module_of(path) for path in back_paths})
+    counts = area_recurrences(store, task.tenant, back_modules)
+    hot = tuple(
+        module
+        for module in back_modules
+        if counts[module] >= cfg.thresholds.root_cause_after
+    )
+    if hot:
+        route = Role.SENIOR
+        require_invariant = True
+        reason = (
+            f"{reason} Root cause: {', '.join(hot)} came back "
+            f"{max(counts[module] for module in hot)} times; state one invariant."
+        )
+    playbooks = await area_playbooks(
+        gate.for_role(Role.TRIAGE), [*back_modules, issue.summary]
+    )
+
     fast_lane = (
         cfg.loop.fast_lane
         and reply.size in _SMALL
@@ -99,7 +141,15 @@ async def run_triage(
         and task.round == 0
         and escalate is None
     )
-    decision = TriageDecision(route, fast_lane, require_invariant, escalate, reason)
+    decision = TriageDecision(
+        route,
+        fast_lane,
+        require_invariant,
+        escalate,
+        reason,
+        hot,
+        tuple(playbooks),
+    )
     store.put_artifact(
         task.id,
         ArtifactKind.TRIAGE,

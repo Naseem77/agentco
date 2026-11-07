@@ -19,6 +19,7 @@ from agentco.learning.librarian import (
     artifact_marker,
     closed_marker,
 )
+from agentco.learning.recurrence import area_playbooks
 from agentco.llm.fake import FakeRuntime
 from agentco.memory.backend import InMemoryBackend, MemoryItem
 from agentco.memory.gate import MemoryGate
@@ -816,3 +817,18 @@ def test_draft_and_report_defaults():
         [],
         [],
     )
+
+
+async def test_merged_root_cause_task_writes_area_playbook(
+    loop_cfg, store, gate, backend
+):
+    tid = merged_task(store, invariant="Operands are ordered once, at the boundary")
+    lib, _ = librarian(loop_cfg, store, gate)
+
+    await lib.learn_task(tid, NOW)
+
+    [playbook] = of_kind(backend, Scope.RND, "Playbook")
+    assert "Operands are ordered once, at the boundary" in playbook.body
+    assert "Applies to: src/app, tests" in playbook.body
+    found = await area_playbooks(gate.for_role(Role.TRIAGE), ["src/app"])
+    assert any("ordered once, at the boundary" in text for text in found)

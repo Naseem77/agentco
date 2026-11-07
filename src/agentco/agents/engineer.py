@@ -36,6 +36,7 @@ class EngineerBrief:
     untrusted_finding_ids: frozenset[str] = frozenset()
     """Findings quoted from PR comments or checks: rendered as fenced data."""
     tests_precommitted: bool = False
+    playbooks: tuple[str, ...] = ()
 
 
 class FollowUp(BaseModel):
@@ -94,6 +95,9 @@ def _prompt(task: TaskRecord, brief: EngineerBrief) -> str:
     ]
     if issue.product_notes:
         sections.append(f"Product notes: {issue.product_notes}")
+    if brief.playbooks:
+        lines = "\n".join(f"- {playbook}" for playbook in brief.playbooks)
+        sections.append(f"Playbooks for this area (start from these):\n{lines}")
     if brief.findings_to_fix:
         findings = "\n".join(
             _untrusted_lines(f)

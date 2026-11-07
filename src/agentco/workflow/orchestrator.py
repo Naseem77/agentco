@@ -513,10 +513,11 @@ class _Run:
             issue=self._issue(),
             findings_to_fix=tuple(findings),
             preflight_failures=failures,
-            require_invariant=bool(triage and triage.body.get("require_invariant")),
+            require_invariant=self._require_invariant(),
             round=task.round,
             human_note=human_note,
             untrusted_finding_ids=untrusted,
+            playbooks=tuple(triage.body.get("playbooks") or ()) if triage else (),
             tests_precommitted=(
                 task.source == FOLLOWUP_SOURCE
                 and task.round == 0
@@ -720,6 +721,10 @@ class _Run:
             raise StepFailed(self.task().state, "no engineer artifact")
         return EngineerReply.model_validate(artifact.body)
 
+    def _require_invariant(self) -> bool:
+        triage = self._latest(ArtifactKind.TRIAGE)
+        return bool(triage and triage.body.get("require_invariant"))
+
     async def _lead(self, task: TaskRecord) -> None:
         if await self._escalate_if_over_budget(task):
             return
@@ -742,6 +747,7 @@ class _Run:
                 checks=self._checks(),
                 changed_lines=await asyncio.to_thread(changed_lines, wt, base),
                 fast_lane=self._meta("fast_lane") == "1",
+                require_invariant=self._require_invariant(),
             )
         except (ReplyInvalid, AgentStuck) as exc:
             await self._escalate("stuck", f"lead failed: {_agent_error(exc)}")

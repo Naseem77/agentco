@@ -509,3 +509,26 @@ async def test_precommitted_flag_without_committed_work_still_fails(
         await env.run(EngineerBrief(issue=ISSUE, tests_precommitted=True))
 
     assert exc.value.reason == "engineer made no changes"
+
+
+async def test_brief_renders_playbooks(make_repo, store, loop_cfg):
+    env = Env(make_repo, store, loop_cfg, [edit_a])
+    brief = EngineerBrief(
+        issue=ISSUE, playbooks=("Normalise at the boundary", "Parse once")
+    )
+
+    await env.run(brief)
+
+    prompt = env.runtime.calls[0].prompt
+    assert (
+        "Playbooks for this area (start from these):\n"
+        "- Normalise at the boundary\n- Parse once"
+    ) in prompt
+
+
+async def test_no_playbooks_section_by_default(make_repo, store, loop_cfg):
+    env = Env(make_repo, store, loop_cfg, [edit_a])
+
+    await env.run()
+
+    assert "Playbooks" not in env.runtime.calls[0].prompt
