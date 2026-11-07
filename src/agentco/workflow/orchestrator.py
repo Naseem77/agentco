@@ -9,6 +9,7 @@ AWAITING_HUMAN with an ESCALATION artifact.
 
 import asyncio
 import json
+import weakref
 from collections.abc import Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -112,6 +113,17 @@ async def run_many(
             *(one(ctx, task_id) for ctx, task_id in jobs), return_exceptions=True
         )
     )
+
+
+_REPO_LOCKS: weakref.WeakKeyDictionary[
+    asyncio.AbstractEventLoop, dict[Path, asyncio.Lock]
+] = weakref.WeakKeyDictionary()
+
+
+def _repo_lock(repo_root: Path) -> asyncio.Lock:
+    """One lock per checkout (and event loop), shared by every run on it."""
+    locks = _REPO_LOCKS.setdefault(asyncio.get_running_loop(), {})
+    return locks.setdefault(Path(repo_root).resolve(), asyncio.Lock())
 
 
 def _agent_error(exc: Exception) -> str:
@@ -279,12 +291,16 @@ class _Run:
         base = self._meta("base")
         if base is None:
             base = await self._refresh_base()
-        return await asyncio.to_thread(
-            create_worktree, self.ctx.repo_root, self.task_id, base
-        )
+        async with _repo_lock(self.ctx.repo_root):
+            return await asyncio.to_thread(
+                create_worktree, self.ctx.repo_root, self.task_id, base
+            )
 
     async def _refresh_base(self) -> str:
-        base = await asyncio.to_thread(refresh_main, self.ctx.repo_root, self.ctx.main)
+        async with _repo_lock(self.ctx.repo_root):
+            base = await asyncio.to_thread(
+                refresh_main, self.ctx.repo_root, self.ctx.main
+            )
         self._set("base", base)
         return base
 
@@ -379,6 +395,10 @@ class _Run:
             if e.id < decision.id
         ]
         origin = earlier[-1].body.get("from_state", "") if earlier else ""
+        if origin == _S.LEAD_DECISION.value and decision.body["decision"] != "answer":
+            return (
+                None  # an approve of the lead's work is not guidance for the next round
+            )
         return note, origin
 
     def _brief(self, task: TaskRecord) -> EngineerBrief:
@@ -462,6 +482,7 @@ class _Run:
                 fix_since=fix_since,
                 final=final,
                 lead_comments=lead_comments,
+                no_test_reason=self._no_test_reason(),
             )
         except (ReplyInvalid, AgentStuck) as exc:
             failed = CheckResult(
@@ -469,6 +490,10 @@ class _Run:
             )
             return PreflightReport(False, (failed,), False), True
         return report, False
+
+    def _no_test_reason(self) -> str:
+        engineer = self._latest(ArtifactKind.ENGINEER)
+        return str(engineer.body.get("no_test_reason", "")).strip() if engineer else ""
 
     def _lead_comments(self) -> list[str]:
         lead = self._latest(ArtifactKind.LEAD)
@@ -495,7 +520,10 @@ class _Run:
         if report.ok:
             self._go(_S.INTERNAL_REVIEW, Role.REVIEWER, "pre-flight passed")
             return
-        floor = _id(self._latest(ArtifactKind.TRIAGE))
+        floor = max(
+            _id(self._latest(ArtifactKind.TRIAGE)),
+            _id(self._latest(ArtifactKind.HUMAN_DECISION)),
+        )
         attempts = sum(
             1
             for a in self.store.artifacts(self.task_id, ArtifactKind.PREFLIGHT)
@@ -651,7 +679,8 @@ class _Run:
                 await self._stop_rules()
                 return
             body = self._pr_body(task, lead, report)
-            await asyncio.to_thread(push_branch, wt)
+            async with _repo_lock(self.ctx.repo_root):
+                await asyncio.to_thread(push_branch, wt)
             pull = await asyncio.to_thread(
                 self.ctx.github.find_open_pull, self.ctx.repo, wt.branch
             )

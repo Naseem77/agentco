@@ -329,3 +329,62 @@ async def test_a_missing_lead_artifact_escalates_and_never_leaves_a_pushed_branc
     again = await rig.run()
     assert again.state is TaskState.AWAITING_HUMAN
     assert len(rig.escalations()) == before
+
+
+async def test_an_approve_note_is_not_guidance_when_the_final_preflight_fails(
+    make_rig,
+):
+    rig = await make_rig(critical_script(rounds=2), max_rounds=3)
+    await rig.run()
+    runner = rig.runner
+    runner.default = 0
+    original = runner.run
+
+    def failing_full_suite(command, cwd, timeout_s):
+        if command == "pytest-all" and rig.task().state is TaskState.AWAITING_HUMAN:
+            from agentco.sandbox.runner import CommandResult
+
+            runner.calls.append(command)
+            return CommandResult(command, 1, "full suite failed", 0.0, False)
+        return original(command, cwd, timeout_s)
+
+    runner.run = failing_full_suite
+
+    rig.decide("approve", "ship it, looks great")
+    task = await rig.run()
+
+    assert rig.github.created == []
+    assert task.state is TaskState.AWAITING_HUMAN
+    second = rig.calls(Role.JUNIOR)[1].prompt
+    assert "ship it" not in second
+    assert "Human guidance" not in second
+
+
+async def test_a_human_answer_resets_the_preflight_attempts(make_rig):
+    from script_runner import LINT, RED_CMD, ScriptRunner
+
+    stuck_senior = AgentResult("", 1.0, stuck=True, stuck_reason="LOST")
+    script = {
+        Role.PM: [PM_JSON],
+        Role.TRIAGE: [triage_json()],
+        Role.JUNIOR: [engineer(1), STUCK],
+        Role.SENIOR: [stuck_senior, engineer(2), engineer(3)],
+        Role.REVIEWER: [RULES_OK] * 6,
+    }
+    rig = await make_rig(
+        script, max_rounds=1, runner=ScriptRunner(codes={RED_CMD: 1, LINT: 1})
+    )
+    await rig.run()
+    assert rig.escalations()[-1]["from_state"] == "engineering"
+
+    rig.decide("answer", "try the other module")
+    await rig.run()
+
+    edges = rig.edges()
+    resumed = edges[edges.index(("awaiting_human", "engineering")) :]
+    assert resumed[:4] == [
+        ("awaiting_human", "engineering"),
+        ("engineering", "preflight"),
+        ("preflight", "engineering"),
+        ("engineering", "preflight"),
+    ]

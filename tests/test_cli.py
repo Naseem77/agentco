@@ -24,8 +24,10 @@ from agentco.llm.fake import FakeRuntime
 from agentco.memory.backend import InMemoryBackend, MemoryItem
 from agentco.memory.scopes import Scope
 from agentco.roles import Role
+from agentco.sandbox.worktree import GitError
 from agentco.store.models import ArtifactKind
 from agentco.store.task_store import TaskStore
+from agentco.workflow.preflight import RestoreError
 from agentco.workflow.states import TaskState
 
 # The orchestrator rig lives next to its tests and imports its siblings by bare name.
@@ -1393,3 +1395,45 @@ def test_decide_add_budget_accumulates(env, repo):
         "human-decision:1:1",
         "human-decision:1:2",
     ]
+
+
+@pytest.mark.parametrize(
+    "error",
+    [GitError("fetch failed: offline"), RestoreError("could not restore")],
+    ids=["git", "restore"],
+)
+def test_task_run_git_failure_is_a_failed_line_with_exit_3(
+    env, repo, monkeypatch, error
+):
+    def broken(*args):
+        raise error
+
+    monkeypatch.setattr("agentco.workflow.orchestrator.create_worktree", broken)
+    env.seams.script({Role.PM: [PM_JSON], Role.TRIAGE: [triage_json()]}, premium=0.01)
+    task_id = _new_task(env)
+
+    result = _run_task(env, repo, str(task_id))
+
+    assert result.exit_code == 3
+    assert result.stdout == f"task 1: failed: {error}\n"
+    assert isinstance(result.exception, SystemExit)
+    assert env.store.get(task_id).state is TaskState.ENGINEERING
+
+
+def test_task_run_all_keeps_other_tasks_lines_when_git_fails(env, repo, monkeypatch):
+    def broken(root, task_id, base):
+        raise GitError("worktree add failed")
+
+    monkeypatch.setattr("agentco.workflow.orchestrator.create_worktree", broken)
+    env.seams.script(
+        {Role.PM: [PM_JSON, STUCK], Role.TRIAGE: [triage_json()]}, premium=0.01
+    )
+    _new_task(env, "Broken git")
+    _new_task(env, "Broken pm")
+
+    result = _run_task(env, repo, "--all")
+
+    assert result.exit_code == 3
+    assert result.stdout == (
+        "task 1: failed: worktree add failed\ntask 2: failed: pm: SECRET_REASON_XYZ\n"
+    )

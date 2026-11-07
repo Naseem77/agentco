@@ -560,3 +560,58 @@ async def test_timeout_detail_mentions_the_limit(make_repo, store):
     limits = LoopLimits(command_timeout_s=30)
     rep = await go(make_preflight(Slow(), store, limits=limits), wt)
     assert rep.checks[3] == CheckResult("lint", False, "timed out after 30s\npartial")
+
+
+class LintLeak(ScriptRunner):
+    def run(self, command, cwd, timeout_s):
+        if command == LINT:
+            (cwd / "lint-report.txt").write_text("report")
+            (cwd / "reports").mkdir(exist_ok=True)
+            (cwd / "reports/out.xml").write_text("<x/>")
+        if command == E2E:
+            (cwd / "e2e-output.txt").write_text("shots")
+        return super().run(command, cwd, timeout_s)
+
+
+async def test_no_test_path_leaves_the_worktree_clean(make_repo, store):
+    _, wt = fixed_worktree(make_repo, with_test=False)
+    rep = await go(make_preflight(LintLeak(), store), wt)
+    assert {c.name: c.detail for c in rep.checks}["red"] == "no new test"
+    assert git(wt.path, "status", "--porcelain", "--untracked-files=all") == ""
+
+
+async def test_test_only_path_leaves_the_worktree_clean(make_repo, store):
+    root = make_repo(FILES)
+    wt = create_worktree(root, 1, "main")
+    add_test(wt)
+    commit_all(wt, "test")
+    await go(make_preflight(LintLeak(), store), wt)
+    assert git(wt.path, "status", "--porcelain", "--untracked-files=all") == ""
+
+
+async def test_final_e2e_output_is_removed(make_repo, store):
+    _, wt = fixed_worktree(make_repo)
+    runner = LintLeak(codes={RED_CMD: 1})
+    rep = await go(make_preflight(runner, store, e2e=E2E), wt, final=True)
+    assert rep.ok
+    assert git(wt.path, "status", "--porcelain", "--untracked-files=all") == ""
+
+
+async def test_clean_check_sees_untracked_files_despite_git_config(make_repo, store):
+    _, wt = fixed_worktree(make_repo)
+    git(wt.path, "config", "status.showUntrackedFiles", "no")
+    (wt.path / "notes.txt").write_text("keep me")
+    runner = ScriptRunner()
+    rep = await go(make_preflight(runner, store), wt)
+    assert [(c.name, c.ok) for c in rep.checks] == [("rebase", True), ("clean", False)]
+    assert runner.calls == []
+
+
+async def test_exit_5_no_tests_collected_is_not_a_red_proof(make_repo, store):
+    _, wt = fixed_worktree(make_repo)
+    rep = await go(make_preflight(ScriptRunner(codes={RED_CMD: 5}), store), wt)
+    red = {c.name: c for c in rep.checks}["red"]
+    assert not red.ok
+    assert red.detail.splitlines()[0] == (
+        "new tests were not collected (exit 5): cannot prove they fail without the fix"
+    )

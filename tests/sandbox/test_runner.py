@@ -193,3 +193,47 @@ def test_runner_for(tmp_path):
     r = runner_for(c, tmp_path, host=False)
     assert isinstance(r, ContainerRunner)
     assert r.container_argv("x", tmp_path)[:3] == ["docker", "compose", "-f"]
+
+
+SECRETS = {
+    "OPENAI_API_KEY": "sk-secret",
+    "GH_TOKEN": "gh-secret",
+    "GITHUB_TOKEN": "ghs-secret",
+    "AWS_SECRET_ACCESS_KEY": "aws-secret",
+    "MY_PROJECT_FLAG": "flag-value",
+    "LC_ALL": "C",
+}
+
+
+def printed_env(tmp_path, monkeypatch, runner) -> dict[str, str]:
+    for k, v in SECRETS.items():
+        monkeypatch.setenv(k, v)
+    r = runner.run("env", tmp_path, timeout_s=10)
+    return dict(line.split("=", 1) for line in r.output.splitlines() if "=" in line)
+
+
+def test_host_runner_drops_secrets_from_the_environment(tmp_path, monkeypatch):
+    seen = printed_env(tmp_path, monkeypatch, HostRunner())
+    assert [k for k in SECRETS if k in seen] == ["LC_ALL"]
+    assert "PATH" in seen and "HOME" in seen
+    assert "sk-secret" not in "".join(seen.values())
+
+
+def test_host_runner_env_passthrough_is_explicit(tmp_path, monkeypatch):
+    seen = printed_env(tmp_path, monkeypatch, HostRunner(["MY_PROJECT_FLAG"]))
+    assert seen["MY_PROJECT_FLAG"] == "flag-value"
+    assert "OPENAI_API_KEY" not in seen and "GH_TOKEN" not in seen
+
+
+def test_runner_for_host_uses_the_contract_passthrough(tmp_path, monkeypatch):
+    c = RepoContract(
+        build="b",
+        test="t",
+        e2e=None,
+        lint="l",
+        sandbox=Sandbox(devcontainer=".devcontainer"),
+        env_passthrough=["MY_PROJECT_FLAG"],
+    )
+    seen = printed_env(tmp_path, monkeypatch, runner_for(c, tmp_path, host=True))
+    assert seen["MY_PROJECT_FLAG"] == "flag-value"
+    assert "AWS_SECRET_ACCESS_KEY" not in seen
