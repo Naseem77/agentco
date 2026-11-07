@@ -56,7 +56,7 @@ def _one_line(text: str) -> str:
     return " ".join(text.split())
 
 
-def _clip(text: str, limit: int) -> str:
+def clip(text: str, limit: int) -> str:
     text = _one_line(text)
     return text if len(text) <= limit else text[: limit - 1].rstrip() + _ELLIPSIS
 
@@ -137,7 +137,7 @@ class LessonWriter:
         return "added"
 
 
-def _source(a: Artifact) -> str:
+def artifact_source(a: Artifact) -> str:
     return f"task:{a.task_id}:{a.kind.value}:{a.id}"
 
 
@@ -147,8 +147,8 @@ def lessons_from_lead(a: Artifact, modules: Iterable[str]) -> list[Lesson]:
     return [
         Lesson(
             kind="ReviewRule",
-            text=_clip(comment, MAX_TEXT),
-            source=_source(a),
+            text=clip(comment, MAX_TEXT),
+            source=artifact_source(a),
             modules=applies_to,
             origin="lead",
         )
@@ -163,12 +163,12 @@ def lessons_from_qa(a: Artifact) -> list[Lesson]:
     for raw in a.body.get("failures") or []:
         failure = QAFailure.model_validate(raw)
         text = (
-            f"QA failure: {_clip(failure.title, 100)}. "
-            f"Steps: {_clip(failure.steps, 150)}. "
-            f"Expected: {_clip(failure.expected, 100)}. "
-            f"Actual: {_clip(failure.actual, 100)}."
+            f"QA failure: {clip(failure.title, 100)}. "
+            f"Steps: {clip(failure.steps, 150)}. "
+            f"Expected: {clip(failure.expected, 100)}. "
+            f"Actual: {clip(failure.actual, 100)}."
         )
-        lessons.append(Lesson(kind="Issue", text=text, source=_source(a)))
+        lessons.append(Lesson(kind="Issue", text=text, source=artifact_source(a)))
     return lessons
 
 
@@ -186,18 +186,18 @@ def lessons_from_pr_review(a: Artifact, bug_class: str) -> list[Lesson]:
         if c.get("category") != _REAL_BUG or c.get("fingerprint") in recurrences:
             continue
         detail = details.get(c.get("finding_id"), {})
-        title = _clip(detail.get("title") or c.get("note") or c["finding_id"], 150)
+        title = clip(detail.get("title") or c.get("note") or c["finding_id"], 150)
         path = _one_line(detail.get("path") or "")
         located = f"{title} ({path})" if path else title
         neighbours = f"also test the neighbours of {title}"
         if bug_class:
-            neighbours = f"bug class {_clip(bug_class, 100)}: {neighbours}"
+            neighbours = f"bug class {clip(bug_class, 100)}: {neighbours}"
         for kind, text in (
             ("Risk", located),
             ("EscapedBug", f"{located}, escaped to {where}"),
             ("NeighbourCase", neighbours),
         ):
-            lessons.append(Lesson(kind=kind, text=text, source=_source(a)))
+            lessons.append(Lesson(kind=kind, text=text, source=artifact_source(a)))
     return lessons
 
 
