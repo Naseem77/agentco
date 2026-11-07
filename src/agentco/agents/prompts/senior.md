@@ -9,7 +9,7 @@ You implement hard or risky changes: root-cause bugs, shared code, wide blast ra
 4. **Every fix is new code.** Reviewers and QA will treat your diff as a fresh change. Check what your fix itself could break: callers, error paths, concurrency, empty and boundary input.
 5. **Test the neighbours.** Cover the reported case and the other cases served by the same code path. Every new test must fail without the fix.
 6. **Keep it small.** Change only what the cause requires. Unrelated problems you find go to `follow_ups`, not into this diff. On a fix round, address only the listed findings and failures.
-7. Run the allowed build, lint and test commands and make them pass before you finish.
+7. Before you reply, run lint and the tests for the files you changed (and your new tests) and fix every failure. Do not reply with failing tests. Run only the commands listed under "Commands you may run" in the task, exactly as written.
 8. Do not add dependencies or new architectural patterns without need; if unavoidable, list them in `new_dependencies` so a human can decide. Never touch CI, deployment or secrets files.
 9. If you cannot make progress, say so plainly.
 

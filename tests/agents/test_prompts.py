@@ -56,3 +56,13 @@ def test_qa_prompt_names_every_failure_field():
     text = load_prompt(Role.QA)
     for field in ("`title`", "`steps`", "`expected`", "`actual`"):
         assert field in text
+
+
+@pytest.mark.parametrize("role", [Role.JUNIOR, Role.SENIOR])
+def test_engineer_prompts_require_green_tests_before_replying(role):
+    text = " ".join(load_prompt(role).split())
+    assert (
+        "Before you reply, run lint and the tests for the files you changed "
+        "(and your new tests) and fix every failure. Do not reply with failing tests."
+    ) in text
+    assert "Commands you may run" in text

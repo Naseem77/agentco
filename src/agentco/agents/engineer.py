@@ -12,6 +12,7 @@ from agentco.llm.replies import AgentStuck, Asker, Reply, ReplyInvalid
 from agentco.llm.runtime import AgentCall
 from agentco.llm.tools import memory_tools
 from agentco.memory.gate import MemoryGate
+from agentco.memory.scopes import Scope
 from agentco.repo_contract import RepoContract
 from agentco.roles import Role
 from agentco.sandbox.worktree import (
@@ -84,7 +85,15 @@ def _untrusted_lines(finding: Finding) -> str:
     return f"{head}\n{fence_untrusted(text)}"
 
 
-def _prompt(task: TaskRecord, brief: EngineerBrief) -> str:
+MAX_REVIEW_RULES = 15
+
+
+def _prompt(
+    task: TaskRecord,
+    brief: EngineerBrief,
+    contract: RepoContract,
+    rules: tuple[str, ...] = (),
+) -> str:
     issue = brief.issue
     criteria = "\n".join(f"- {criterion}" for criterion in issue.acceptance_criteria)
     sections = [
@@ -119,12 +128,35 @@ def _prompt(task: TaskRecord, brief: EngineerBrief) -> str:
         )
     if brief.human_note:
         sections.append(f"Note from the human: {brief.human_note}")
+    if rules:
+        listed = "\n".join(f"- {rule}" for rule in rules)
+        sections.append(f"## Review rules the reviewer will apply\n{listed}")
+    allowed = [*_commands(contract), *(f"{p}<test files>" for p in _prefixes(contract))]
+    if allowed:
+        listed = "\n".join(f"- {command}" for command in allowed)
+        sections.append(
+            "Commands you may run (exactly as written, no shell operators):\n" + listed
+        )
     return "\n\n".join(sections)
 
 
 def _commands(contract: RepoContract) -> tuple[str, ...]:
     commands = (contract.build, contract.test, contract.lint, contract.e2e)
     return tuple(command for command in commands if command)
+
+
+def _prefixes(contract: RepoContract) -> tuple[str, ...]:
+    return (contract.test_files.split("{files}")[0],) if contract.test_files else ()
+
+
+async def _review_rules(
+    gate: MemoryGate, role: Role, task: TaskRecord
+) -> tuple[str, ...]:
+    facts = await gate.for_role(role).search(
+        f"ReviewRule {task.title}", scopes=[Scope.RND], limit=MAX_REVIEW_RULES
+    )
+    rules = dict.fromkeys(" ".join(f.text.split()) for f in facts)
+    return tuple(rule for rule in rules if rule)[:MAX_REVIEW_RULES]
 
 
 async def _invariant_only_retry(
@@ -154,16 +186,16 @@ async def run_engineer(
     contract: RepoContract,
     brief: EngineerBrief,
 ) -> EngineerReply:
-    prefixes = (contract.test_files.split("{files}")[0],) if contract.test_files else ()
+    rules = await _review_rules(gate, role, task)
     call = AgentCall(
         role=role,
         model=role_model(cfg, role).model,
         system=load_prompt(role),
-        prompt=_prompt(task, brief),
+        prompt=_prompt(task, brief, contract, rules),
         workdir=wt.path,
         edits=True,
         commands=_commands(contract),
-        command_prefixes=prefixes,
+        command_prefixes=_prefixes(contract),
         tools=memory_tools(gate.for_role(role)),
         max_turns=cfg.loop.agent_max_turns,
         timeout_s=cfg.loop.agent_timeout_s,
