@@ -182,10 +182,12 @@ def decide_pr_round(
             carried=carried_ids,
         )
 
-    if not open_findings:
-        return outcome("none", "", "no new PR feedback to act on")
-
-    if reply is not None and (reply.conflicts or reply.new_pattern):
+    # Checked before "nothing open": a conflict among carried tradeoffs still needs a human.
+    if (
+        (open_findings or carried_ids)
+        and reply is not None
+        and (reply.conflicts or reply.new_pattern)
+    ):
         if reply.conflicts:
             reason = "reviewers conflict: " + "; ".join(reply.conflicts)
         else:
@@ -197,6 +199,9 @@ def decide_pr_round(
             question=reply.question or reason,
             options=tuple(reply.options),
         )
+
+    if not open_findings:
+        return outcome("none", "", "no new PR feedback to act on")
 
     if by_category["real_bug"]:
         to_fix = (*by_category["real_bug"], *by_category["covered_style"])

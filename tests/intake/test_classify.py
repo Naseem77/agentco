@@ -234,6 +234,16 @@ def test_tradeoff_with_conflict_or_new_pattern_is_carried():
     assert [c.finding_id for c in d.classifications] == ["c2", "c3"]
 
 
+def test_conflict_with_only_tradeoffs_still_escalates():
+    for reply in (
+        R(("c1", "tradeoff"), conflicts=["a vs b"]),
+        R(("c1", "tradeoff"), new_pattern="use asyncio"),
+    ):
+        d = decide([PF("c1")], reply)
+        assert (d.outcome, d.category, d.carried) == ("escalate", "new", ("c1",))
+        assert d.classifications == ()
+
+
 def test_tradeoff_that_is_asked_now_is_not_carried():
     d = decide([PF("c1"), PF("c2")], R(("c1", "tradeoff"), ("c2", "covered_style")))
     assert (d.category, d.carried) == ("tradeoff", ())
