@@ -145,8 +145,9 @@ make progress, `cfg.concurrency` at a time; `--host` runs the repo's build and t
 on this machine instead of in the sandbox.
 
 **A PR opens only after approval, and a human always merges.** The team lead's approval (or
-your `approve` on an escalated task) is the only way a branch is pushed and a PR opened, and
-nothing here ever merges one.
+your `approve` on a lead escalation or a failed push) is the only way a branch is pushed and a
+PR opened, and nothing here ever merges one. An `approve` on a budget or round stop, or after
+the lead failed, just lets the team continue; the lead still has to approve.
 
 `inbox` lists each waiting task with the category, the state it came from, why it stopped and
 the options. `decide <id> approve|reject|answer` answers it: `answer` needs `--note`,

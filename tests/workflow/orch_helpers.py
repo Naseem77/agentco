@@ -119,8 +119,13 @@ class Rig:
     async def run(self) -> TaskRecord:
         return await Orchestrator(self.ctx).run(self.task_id)
 
-    def new_task(self, title: str = "Another task") -> int:
-        return _new_task(self.store, title)
+    def new_task(
+        self,
+        title: str = "Another task",
+        source: str = "cli",
+        source_ref: str | None = None,
+    ) -> int:
+        return _new_task(self.store, title, source, source_ref)
 
     def task(self) -> TaskRecord:
         return self.store.get(self.task_id)
@@ -156,8 +161,10 @@ class Rig:
         )
 
 
-def _new_task(store: TaskStore, title: str) -> int:
-    task = store.create_task("acme", title, "cli")
+def _new_task(
+    store: TaskStore, title: str, source: str = "cli", source_ref: str | None = None
+) -> int:
+    task = store.create_task("acme", title, source, source_ref)
     store.put_artifact(
         task.id, ArtifactKind.REQUEST, Role.HUMAN, {"body": f"please: {title}"}
     )

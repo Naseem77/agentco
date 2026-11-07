@@ -39,11 +39,13 @@ from agentco.sandbox.runner import CommandRunner
 from agentco.sandbox.worktree import (
     GitError,
     Worktree,
-    _git,
     changed_lines,
+    count_commits,
     create_worktree,
     diff,
+    head_ancestor,
     head_sha,
+    is_ancestor,
     push_branch,
     rebase_onto,
     refresh_main,
@@ -60,6 +62,7 @@ _DONE = frozenset({_S.PR_OPEN, _S.MERGED, _S.CANCELLED})
 _MAX_STEPS = 500
 _BUDGET_OPTIONS = ["add budget", "reject"]
 _ROUND_OPTIONS = ["answer: one more round", "reject"]
+_NO_LEAD = "no lead decision to open a PR from"
 
 
 class StepFailed(RuntimeError):
@@ -229,6 +232,7 @@ class _Run:
         question: str = "",
         stop: str | None = None,
         from_state: str | None = None,
+        open_pr: bool = False,
         actor: Role = Role.LEAD,
     ) -> None:
         task = self.task()
@@ -241,6 +245,8 @@ class _Run:
         }
         if stop:
             body["stop"] = stop
+        if open_pr:
+            body["open_pr"] = True  # only these escalations let `approve` open a PR
         self.store.put_artifact(self.task_id, ArtifactKind.ESCALATION, actor, body)
         if task.state is not _S.AWAITING_HUMAN:
             self._go(_S.AWAITING_HUMAN, actor, f"{category}: {reason}")
@@ -290,36 +296,16 @@ class _Run:
         """
         since = self._meta("fix_since")
         behind: int | None = None
-        if since is not None and await self._is_ancestor(wt, since):
-            count = await asyncio.to_thread(
-                _git, wt.path, "rev-list", "--count", f"{since}..HEAD"
-            )
-            behind = int(count)
+        if since is not None and await asyncio.to_thread(is_ancestor, wt, since):
+            behind = await asyncio.to_thread(count_commits, wt, since)
         if not await asyncio.to_thread(rebase_onto, wt, base):
             return since  # the pre-flight rebase check reports the conflict
         if behind is None:
             return None
-        total = int(
-            await asyncio.to_thread(
-                _git, wt.path, "rev-list", "--count", f"{base}..HEAD"
-            )
-        )
-        remapped = (
-            await asyncio.to_thread(
-                _git, wt.path, "rev-parse", f"HEAD~{min(behind, total)}"
-            )
-        ).strip()
+        total = await asyncio.to_thread(count_commits, wt, base)
+        remapped = await asyncio.to_thread(head_ancestor, wt, min(behind, total))
         self._set("fix_since", remapped)
         return remapped
-
-    async def _is_ancestor(self, wt: Worktree, since: str) -> bool:
-        try:
-            await asyncio.to_thread(
-                _git, wt.path, "merge-base", "--is-ancestor", since, "HEAD"
-            )
-        except GitError:
-            return False
-        return True
 
     # -- states ----------------------------------------------------------
 
@@ -453,7 +439,7 @@ class _Run:
             )
         except EngineerFailed as exc:
             # the reason may carry engineer reasoning: it goes only to the human
-            if role is Role.JUNIOR and not task.reassigned:
+            if exc.stuck and role is Role.JUNIOR and not task.reassigned:
                 self.store.reassign_to_senior(self.task_id)
             else:
                 await self._escalate("stuck", exc.reason, actor=role)
@@ -636,11 +622,16 @@ class _Run:
                 decision.reason,
                 options=decision.options,
                 question=decision.question,
+                open_pr=True,
             )
 
     async def _open_pr(self) -> None:
         """Push and open (or update) the PR. Only reached from an approval."""
         task = self.task()
+        lead = self._current_lead()
+        if lead is None:
+            await self._escalate("stuck", _NO_LEAD, from_state=_S.LEAD_DECISION.value)
+            return
         try:
             wt = await self._worktree()
             base = await self._refresh_base()
@@ -659,11 +650,11 @@ class _Run:
                 self._go(_S.TRIAGE, Role.LEAD, "final pre-flight failed")
                 await self._stop_rules()
                 return
+            body = self._pr_body(task, lead, report)
             await asyncio.to_thread(push_branch, wt)
             pull = await asyncio.to_thread(
                 self.ctx.github.find_open_pull, self.ctx.repo, wt.branch
             )
-            body = self._pr_body(task, report)
             if pull is None:
                 pull = await asyncio.to_thread(
                     self.ctx.github.create_pull,
@@ -679,7 +670,10 @@ class _Run:
                 )
         except (GitError, GitHubError) as exc:
             await self._escalate(
-                "stuck", f"push/gh failed: {exc}", from_state="lead_decision"
+                "stuck",
+                f"push/gh failed: {exc}",
+                from_state=_S.LEAD_DECISION.value,
+                open_pr=True,
             )
             return
         self.store.put_artifact(
@@ -690,12 +684,32 @@ class _Run:
         )
         self._go(_S.PR_OPEN, Role.LEAD, f"pull request #{pull.number}")
 
-    def _pr_body(self, task: TaskRecord, report: PreflightReport) -> str:
+    def _current_lead(self) -> Artifact | None:
+        """The lead's approve/escalate decision on the engineer's latest work."""
         lead = self._latest(ArtifactKind.LEAD)
-        if lead is None:
-            raise StepFailed(task.state, "no lead decision to open a PR from")
-        qa = self._checks().qa
-        return pr_body(task, self._issue(), _lead_from(lead.body), qa, report, None)
+        if (
+            lead is None
+            or lead.body.get("outcome") not in ("approve", "escalate")
+            or lead.id < _id(self._latest(ArtifactKind.ENGINEER))
+        ):
+            return None
+        return lead
+
+    def _source_issue(self, task: TaskRecord) -> int | None:
+        ref = task.source_ref or ""
+        return int(ref) if task.source == "issue" and ref.isdecimal() else None
+
+    def _pr_body(
+        self, task: TaskRecord, lead: Artifact, report: PreflightReport
+    ) -> str:
+        return pr_body(
+            task,
+            self._issue(),
+            _lead_from(lead.body),
+            self._checks().qa,
+            report,
+            self._source_issue(task),
+        )
 
     # -- human decisions -------------------------------------------------
 
@@ -715,7 +729,7 @@ class _Run:
         if escalation.body.get("stop") == "rounds":
             self._set("max_rounds", str(self._budgets().max_rounds + 1))
             self._go(_S.TRIAGE, Role.HUMAN, "one more round granted")
-        elif origin == "lead_decision" and choice == "approve":
+        elif escalation.body.get("open_pr") and choice == "approve":
             await self._open_pr()
         elif origin == "engineering":
             self._go(_S.ENGINEERING, Role.HUMAN, f"human {choice}")

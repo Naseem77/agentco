@@ -16,13 +16,14 @@ from orch_helpers import (
     issue_of,
     triage_json,
 )
-from script_runner import FIXED, LINT, NEW_TEST, RED_CMD, ScriptRunner, git
+from script_runner import FIXED, FULL, LINT, NEW_TEST, RED_CMD, ScriptRunner, git
 
 from agentco.agents.prompts import load_prompt
 from agentco.github.client import FakeGitHub
 from agentco.llm.fake import FakeRuntime
 from agentco.llm.runtime import AgentResult
 from agentco.roles import Role
+from agentco.sandbox.runner import CommandResult
 from agentco.store.models import ArtifactKind
 from agentco.workflow.orchestrator import StepFailed, run_many
 from agentco.workflow.pr import pr_title
@@ -518,6 +519,122 @@ async def test_second_open_updates_the_same_pr(make_rig, monkeypatch):
         "number": 1,
         "url": rig.github.created[0]["url"],
     }
+
+
+async def test_a_pr_retry_after_main_moved_force_pushes_the_rebased_branch(
+    make_rig, monkeypatch
+):
+    script = happy()
+    script[Role.REVIEWER] = [RULES_OK, REVIEW_OK, RULES_OK, RULES_OK]
+    script[Role.LEAD] = [LEAD_OK, LEAD_OK]
+    rig = await make_rig(script)
+    real = rig.store.transition
+    crashed: list[bool] = []
+
+    def flaky(task_id, to, actor, reason):
+        if to is TaskState.PR_OPEN and not crashed:
+            crashed.append(True)
+            raise RuntimeError("crash after the PR was created")
+        return real(task_id, to, actor, reason)
+
+    monkeypatch.setattr(rig.store, "transition", flaky)
+    with pytest.raises(RuntimeError, match="crash after"):
+        await rig.run()
+    first_push = git(
+        rig.repo, "--git-dir", str(rig.origin), "rev-parse", "agentco/task-1"
+    )
+    advance_main(rig.repo, {"docs/upstream.md": "moved\n"})
+
+    task = await rig.run()
+
+    assert task.state is TaskState.PR_OPEN
+    assert len(rig.github.created) == 1 and len(rig.github.edited) == 1
+    pushed = git(rig.repo, "--git-dir", str(rig.origin), "rev-parse", "agentco/task-1")
+    assert pushed != first_push
+    assert pushed == git(rig.repo / ".agentco/worktrees/1", "rev-parse", "HEAD")
+    tree = git(
+        rig.repo, "--git-dir", str(rig.origin), "ls-tree", "-r", "--name-only", pushed
+    )
+    assert "docs/upstream.md" in tree.splitlines()
+
+
+class FinalGateRunner(ScriptRunner):
+    """Fails the full suite only while the task waits on the lead (the final pre-flight)."""
+
+    def __init__(self) -> None:
+        super().__init__(codes={RED_CMD: 1})
+        self.final_gate = lambda: False
+
+    def run(self, command, cwd, timeout_s):
+        if command == FULL and self.final_gate():
+            self.calls.append(command)
+            return CommandResult(command, 1, "full suite failed", 0.0, False)
+        return super().run(command, cwd, timeout_s)
+
+
+async def test_final_preflight_failure_sends_the_round_back_without_a_push(make_rig):
+    script = {
+        Role.PM: [PM_JSON],
+        Role.TRIAGE: [triage_json()] * 2,
+        Role.JUNIOR: [engineer(1)],
+        Role.SENIOR: [engineer(2), engineer(3)],
+        Role.REVIEWER: [RULES_OK, REVIEW_OK, RULES_OK] * 2,
+        Role.QA: [QA_OK] * 2,
+        Role.LEAD: [LEAD_OK] * 2,
+    }
+    runner = FinalGateRunner()
+    rig = await make_rig(script, max_rounds=1, runner=runner)
+    runner.final_gate = lambda: rig.task().state is TaskState.LEAD_DECISION
+
+    task = await rig.run()
+
+    assert task.state is TaskState.AWAITING_HUMAN and task.round == 1
+    assert task.assignee is Role.SENIOR and task.reassigned
+    assert rig.edges().count(("lead_decision", "triage")) == 2
+    assert [e["stop"] for e in rig.escalations()] == ["rounds"]
+    assert rig.github.created == [] and rig.github.edited == []
+    last = rig.store.latest_artifact(rig.task_id, ArtifactKind.PREFLIGHT)
+    assert last is not None and last.body["ok"] is False
+    assert [c["name"] for c in last.body["checks"] if not c["ok"]] == ["tests"]
+    assert git(rig.repo, "--git-dir", str(rig.origin), "branch", "--list") == "* main"
+
+
+async def test_a_non_stuck_junior_failure_is_not_a_promotion(make_rig):
+    script = happy()
+    script[Role.JUNIOR] = [
+        lambda call: json.dumps(
+            {"summary": "nothing", "files_touched": [], "tests_added": []}
+        )
+    ]
+    rig = await make_rig(script)
+
+    task = await rig.run()
+
+    assert task.state is TaskState.AWAITING_HUMAN
+    assert task.assignee is Role.JUNIOR and not task.reassigned
+    assert rig.calls(Role.SENIOR) == []
+    [escalation] = rig.escalations()
+    assert escalation["from_state"] == "engineering"
+    assert escalation["reason"] == "engineer made no changes"
+
+
+async def test_the_pr_closes_the_source_issue(make_rig):
+    rig = await make_rig(happy())
+    task_id = rig.new_task("From an issue", "issue", "42")
+    rig.task_id = task_id
+
+    task = await rig.run()
+
+    assert task.state is TaskState.PR_OPEN
+    [created] = rig.github.created
+    assert created["body"].splitlines().count("Closes #42") == 1
+
+
+async def test_a_task_without_an_issue_does_not_close_anything(make_rig):
+    rig = await make_rig(happy())
+    await rig.run()
+    [created] = rig.github.created
+    assert "Closes" not in created["body"]
 
 
 async def test_run_many_respects_the_limit(make_rig):
