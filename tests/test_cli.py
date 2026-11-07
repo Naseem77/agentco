@@ -1257,7 +1257,10 @@ def test_task_run_checkout_without_a_repo_contract_exit_1(env, make_repo):
     task_id = _new_task(env)
     result = _run_task(env, bare, str(task_id))
     assert result.exit_code == 1
-    assert result.stdout == f"repo contract {bare.resolve()}/.agentco.yml not found\n"
+    assert result.stdout == (
+        f"repo contract {bare.resolve()}/.agentco.yml not found; "
+        f"run agentco onboard --repo acme/app --repo-path {bare}\n"
+    )
 
 
 def test_task_run_bad_repo_name_exit_1(env, repo):
@@ -2325,3 +2328,91 @@ def test_decide_reject_parent_cancels_open_children(env, repo):
     assert env.store.get(done).state is TaskState.MERGED
     assert env.store.get(running).state is TaskState.CANCELLED
     assert env.store.get(open_pr).state is TaskState.PR_OPEN
+
+
+ONBOARD_YAML = yaml.safe_dump(CONTRACT)
+
+
+def _onboard(env, repo_path, *args):
+    return env("onboard", "--repo", "acme/app", "--repo-path", str(repo_path), *args)
+
+
+def _script_contract(env, n=1):
+    reply = json.dumps({"contract_yaml": ONBOARD_YAML, "rationale": "from Makefile"})
+    env.seams.script({Role.ARCHITECT: [reply] * n})
+
+
+def test_cli_onboard_exists(env, repo):
+    result = _onboard(env, repo)
+
+    assert result.exit_code == 0
+    assert result.stdout == "onboard: exists\n"
+    assert env.seams.runtime.calls == []
+
+
+def test_cli_onboard_proposes_waits_then_writes(env, make_repo):
+    bare = make_repo(FILES, name="nocontract")
+    _script_contract(env)
+
+    proposed = _onboard(env, bare)
+
+    assert proposed.exit_code == 0
+    assert "onboard: proposed" in proposed.stdout
+    assert "build: build" in proposed.stdout
+    assert not (bare / ".agentco.yml").exists()
+    assert "proposed .agentco.yml" in env("inbox").stdout
+    waiting = _onboard(env, bare)
+    assert "onboard: waiting" in waiting.stdout and "build: build" in waiting.stdout
+    task_id = env.store.list_tasks("acme")[0].id
+
+    decided = env("decide", str(task_id), "approve")
+    assert decided.exit_code == 0 and "agentco onboard" in decided.stdout
+    assert "agentco task run" not in decided.stdout
+    written = _onboard(env, bare)
+
+    assert written.exit_code == 0
+    assert (
+        "onboard: written" in written.stdout and "commit it yourself" in written.stdout
+    )
+    assert (bare / ".agentco.yml").read_text() == ONBOARD_YAML
+    status = subprocess.run(
+        ["git", "status", "--porcelain"],
+        cwd=bare,
+        capture_output=True,
+        text=True,
+        check=True,
+    ).stdout
+    assert status.strip() == "?? .agentco.yml"
+    log = subprocess.run(
+        ["git", "log", "--oneline"],
+        cwd=bare,
+        capture_output=True,
+        text=True,
+        check=True,
+    ).stdout
+    assert len(log.splitlines()) == 1
+
+
+def test_cli_onboard_bad_repo_name_exit_1(env, make_repo):
+    bare = make_repo(FILES, name="nocontract")
+    result = env("onboard", "--repo", "nope", "--repo-path", str(bare))
+    assert result.exit_code == 1
+
+
+def test_cli_onboard_not_a_repo_exit_1(env, tmp_path):
+    result = _onboard(env, tmp_path / "missing")
+    assert result.exit_code == 1
+
+
+def test_task_run_all_skips_onboard_tasks(env, make_repo):
+    bare = make_repo(FILES, name="nocontract")
+    _script_contract(env)
+    _onboard(env, bare)
+    (bare / ".agentco.yml").write_text(ONBOARD_YAML)
+    task_id = env.store.list_tasks("acme")[0].id
+    env("decide", str(task_id), "approve")
+
+    result = _run_task(env, bare, "--all")
+
+    assert result.stdout == "no tasks to run\n"
+    assert env.store.get(task_id).state is TaskState.AWAITING_HUMAN

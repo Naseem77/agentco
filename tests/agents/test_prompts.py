@@ -15,6 +15,7 @@ PROMPTS = [
     (Role.LEAD, None),
     (Role.LEAD, "pr"),
     (Role.ARCHITECT, None),
+    (Role.ARCHITECT, "contract"),
     (Role.LEAD, "parent"),
 ]
 

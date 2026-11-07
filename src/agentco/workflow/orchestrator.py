@@ -63,6 +63,7 @@ from agentco.sandbox.worktree import (
 from agentco.store.models import Artifact, ArtifactKind, TaskRecord
 from agentco.store.task_store import TaskStore
 from agentco.workflow.escalation import effective_budgets, write_escalation
+from agentco.workflow.onboard import ONBOARD_SOURCE
 from agentco.workflow.pr import pr_body, pr_title
 from agentco.workflow.preflight import CheckResult, Preflight, PreflightReport
 from agentco.workflow.states import InvalidTransition, TaskState
@@ -202,6 +203,9 @@ class _Run:
         )
 
     async def loop(self) -> TaskRecord:
+        # an onboarding task is not code work: its approval would write a file
+        if self.task().source == ONBOARD_SOURCE:
+            raise StepFailed(self.task().state, "onboarding runs via agentco onboard")
         handlers = {
             _S.INTAKE: self._intake,
             _S.PM: self._pm,

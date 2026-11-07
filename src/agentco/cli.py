@@ -44,6 +44,7 @@ from agentco.memory.graphiti_backend import build_graphiti_backend
 from agentco.memory.scopes import Scope, graph_name
 from agentco.memory.seed import seed_company
 from agentco.repo_contract import (
+    CONTRACT_FILE,
     RepoContract,
     RepoContractMissing,
     load_repo_contract,
@@ -55,6 +56,7 @@ from agentco.sandbox.worktree import GitError, refresh_main
 from agentco.store.models import ArtifactKind, TaskRecord
 from agentco.store.task_store import TaskStore
 from agentco.webhook import IntakeTrigger, make_server
+from agentco.workflow.onboard import ONBOARD_SOURCE, OnboardResult, onboard_repo
 from agentco.workflow.orchestrator import StepFailed, TaskContext, run_many
 from agentco.workflow.preflight import RestoreError
 from agentco.workflow.states import TaskState
@@ -421,7 +423,8 @@ def _tasks_to_run(
     return [
         t
         for t in store.list_tasks(cfg.tenant, states)
-        if t.state is not TaskState.AWAITING_HUMAN or _has_waiting_decision(store, t)
+        if t.source != ONBOARD_SOURCE
+        and (t.state is not TaskState.AWAITING_HUMAN or _has_waiting_decision(store, t))
     ]
 
 
@@ -550,7 +553,11 @@ def task_run(
         validate_repo(repo)
         checkout = repo_root(repo_path)
         contract = load_repo_contract(checkout)
-    except (ValueError, NotAGitRepo, RepoContractMissing) as e:
+    except RepoContractMissing as e:
+        raise _fail(
+            f"{e}; run agentco onboard --repo {repo} --repo-path {repo_path}"
+        ) from e
+    except (ValueError, NotAGitRepo) as e:
         raise _fail(str(e)) from e
     cfg = _load(config)
     store = TaskStore(cfg.database_url)
@@ -613,6 +620,57 @@ def task_run(
     _echo_warnings(learned)
     if code:
         raise typer.Exit(code)
+
+
+def _onboard_lines(repo: str, result: OnboardResult) -> list[str]:
+    lines = [f"onboard: {result.status}"]
+    if result.task_id is not None:
+        lines[0] += f" (task {result.task_id})"
+    if result.contract_yaml:
+        lines.append(result.contract_yaml.rstrip("\n"))
+    again = f"agentco onboard --repo {repo} --repo-path <path>"
+    if result.status in ("proposed", "waiting"):
+        lines.append(
+            f"approve it with `agentco decide {result.task_id} approve`, "
+            f"then run `{again}` to write the file."
+        )
+    elif result.status == "written":
+        lines.append(f"wrote {CONTRACT_FILE}; commit it yourself (agentco does not).")
+    elif result.status == "kept":
+        lines.append(f"{CONTRACT_FILE} already exists; nothing was overwritten.")
+    return lines
+
+
+@app.command()
+def onboard(
+    repo: Annotated[str, typer.Option("--repo", help="GitHub repo as OWNER/NAME.")],
+    repo_path: Annotated[
+        Path, typer.Option("--repo-path", help="Local checkout to onboard.")
+    ] = Path("."),
+    config: Path = ConfigOption,
+) -> None:
+    """Have the Architect propose a .agentco.yml; a human approves, then it is written locally."""
+    try:
+        validate_repo(repo)
+        checkout = repo_root(repo_path)
+    except (ValueError, NotAGitRepo) as e:
+        raise _fail(str(e)) from e
+    cfg = _load(config)
+    store = TaskStore(cfg.database_url)
+    store.create_all()
+
+    async def _run() -> OnboardResult:
+        async with _started(make_runtime(cfg)) as runtime:
+            gate = MemoryGate(cfg.tenant, _build_backend(cfg))
+            return await onboard_repo(cfg, store, runtime, gate, repo, checkout)
+
+    try:
+        with _falkordb_guard(cfg):
+            result = asyncio.run(_run())
+    except LLM_ERRORS as e:
+        raise _fail(f"LLM request failed: {_one_line(e)}") from e
+    for line in _onboard_lines(repo, result):
+        typer.echo(line)
 
 
 @pool_app.command("fill")
@@ -891,9 +949,12 @@ def decide(
     if add_budget is not None:
         key = f"task:{task_id}:extra_budget"
         store.set_meta(key, str(float(store.get_meta(key) or 0) + add_budget))
-    typer.echo(
-        f"task {task_id}: {decision.value} recorded; run `agentco task run {task_id}`"
+    next_step = (
+        f"agentco onboard --repo {task.source_ref} --repo-path <path>"
+        if task.source == ONBOARD_SOURCE
+        else f"agentco task run {task_id}"
     )
+    typer.echo(f"task {task_id}: {decision.value} recorded; run `{next_step}`")
     _learn_after_decision(cfg, store, task_id)
 
 

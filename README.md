@@ -196,6 +196,25 @@ Exit codes of `task run`: 1 bad arguments, config, checkout or repo contract, 2 
 unreachable, 3 `gh` unavailable or failing or a git operation failed, 4 a step failed and the task stayed where it was
 (run it again to retry). `decide` uses 1 and 2.
 
+## Onboard a repo
+
+A repo without `.agentco.yml` can get one proposed by the Architect:
+
+```bash
+uv run agentco onboard --repo owner/name --repo-path .   # reads the repo, prints a proposed .agentco.yml
+uv run agentco inbox                                     # the proposal waits for you
+uv run agentco decide 7 approve                          # or: answer --note "we use tox" | reject
+uv run agentco onboard --repo owner/name --repo-path .   # writes the file after your approve
+```
+
+Nothing is written until you `approve`. The file is created in the local checkout only if
+none exists (an existing `.agentco.yml` is never overwritten), and **agentco never commits or
+pushes it**: review the file and commit it yourself. The proposal must be a valid contract
+whose commands are each one plain command (no `&&`, `;`, `|`, `$`, redirects) and whose
+`env_passthrough` is empty; the Architect gets one retry before the proposal escalates as
+`stuck`. `answer` asks for a new draft with your note. Onboarding tasks never run with
+`task run`.
+
 ## PR feedback
 
 After a PR is open, `agentco intake` reads what people said about it and sends real problems

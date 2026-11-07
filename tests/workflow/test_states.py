@@ -52,3 +52,7 @@ def test_waiting_children_edges():
         TaskState.CANCELLED,
     } == ALLOWED_TRANSITIONS[TaskState.WAITING_CHILDREN]
     assert TaskState.ARCHITECT in ALLOWED_TRANSITIONS[TaskState.AWAITING_HUMAN]
+
+
+def test_intake_can_go_straight_to_architect_for_onboarding():
+    assert TaskState.ARCHITECT in ALLOWED_TRANSITIONS[TaskState.INTAKE]

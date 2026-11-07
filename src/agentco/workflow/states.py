@@ -27,7 +27,8 @@ _S = TaskState
 _TERMINAL = frozenset({_S.MERGED, _S.CANCELLED})
 
 _EDGES: dict[TaskState, set[TaskState]] = {
-    _S.INTAKE: {_S.PM},
+    # onboarding tasks skip the first floor: the Architect proposes the contract
+    _S.INTAKE: {_S.PM, _S.ARCHITECT},
     _S.PM: {_S.TRIAGE},
     _S.TRIAGE: {_S.ENGINEERING, _S.ARCHITECT, _S.AWAITING_HUMAN},
     _S.ARCHITECT: {_S.AWAITING_HUMAN},
