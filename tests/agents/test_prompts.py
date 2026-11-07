@@ -14,6 +14,7 @@ PROMPTS = [
     (Role.QA, None),
     (Role.LEAD, None),
     (Role.LEAD, "pr"),
+    (Role.ARCHITECT, None),
 ]
 
 
@@ -39,7 +40,7 @@ def test_isolated_roles_state_they_are_blind(role, variant):
 
 def test_missing_prompt_raises():
     with pytest.raises(FileNotFoundError):
-        load_prompt(Role.ARCHITECT)
+        load_prompt(Role.HUMAN)
 
 
 @pytest.mark.parametrize("variant", [None, "light"])
