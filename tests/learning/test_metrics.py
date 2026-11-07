@@ -188,6 +188,9 @@ def test_report_totals_and_since_filter(store):
         "median_duration_h": 4.0,
         "pct_junior": 50.0,  # 1 of 2 merged tasks was finished by a junior
         "recurrences": 0.0,
+        "pool_hits": 0.0,
+        "pool_misses": 0.0,
+        "setup_saved_s": 0.0,
     }
     assert report.stale_rules == []
     assert old in {t.task_id for t in report.tasks}
@@ -235,3 +238,15 @@ def test_stale_rules_listed(store):
         "aaa",
         "bbb",
     ]
+
+
+def test_metrics_pool_totals(store):
+    store.set_meta("pool:acme:hit:1", "90.5")
+    store.set_meta("pool:acme:hit:2", "30")
+    store.set_meta("pool:acme:miss:3", "100")
+    store.set_meta("pool:acme:hit:4", "not a number")
+    store.set_meta("pool:other:hit:5", "999")
+    totals = metrics_report(store, "acme", stale_after=3).totals
+    assert totals["pool_hits"] == 3.0  # a bad value still counts as a claim
+    assert totals["pool_misses"] == 1.0
+    assert totals["setup_saved_s"] == 120.5

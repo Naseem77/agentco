@@ -112,6 +112,10 @@ def test_intake_override(tmp_path):
     "extra",
     [
         {"intake": {"bogus": 1}},
+        {"pool": {"size": -1}},
+        {"pool": {"size": 9}},
+        {"pool": {"setup_timeout_s": 0}},
+        {"pool": {"bogus": 1}},
         {"concurrency": 0},
         {"price_per_request_usd": -1},
         {"loop": {"max_changed_lines": 0}},
@@ -303,3 +307,10 @@ def test_webhook_invalid(tmp_path, extra):
     raw = BASE | {"webhook": extra}
     with pytest.raises(ConfigError):
         load_config(write(tmp_path, yaml.safe_dump(raw)))
+
+
+def test_pool_defaults_and_disable(tmp_path):
+    cfg = load_config(write(tmp_path, EXAMPLE))
+    assert (cfg.pool.size, cfg.pool.setup_timeout_s) == (2, 1800)
+    raw = BASE | {"pool": {"size": 0}}
+    assert load_config(write(tmp_path, yaml.safe_dump(raw))).pool.size == 0

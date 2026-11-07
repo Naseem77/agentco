@@ -146,6 +146,22 @@ def _stale_rules(store: TaskStore, tenant: str, stale_after: int) -> list[str]:
     return [fingerprint for _, fingerprint in sorted(stale)]
 
 
+def _pool_totals(store: TaskStore, tenant: str) -> dict[str, float]:
+    hits = store.meta_with_prefix(f"pool:{tenant}:hit:")
+    misses = store.meta_with_prefix(f"pool:{tenant}:miss:")
+    saved = 0.0
+    for value in hits.values():
+        try:
+            saved += float(value)
+        except ValueError:
+            continue
+    return {
+        "pool_hits": float(len(hits)),
+        "pool_misses": float(len(misses)),
+        "setup_saved_s": saved,
+    }
+
+
 def metrics_report(
     store: TaskStore,
     tenant: str,
@@ -162,6 +178,6 @@ def metrics_report(
         prs += store.latest_artifact(record.id, ArtifactKind.PR) is not None
     return MetricsReport(
         tasks=tasks,
-        totals=_totals(tasks, prs),
+        totals=_totals(tasks, prs) | _pool_totals(store, tenant),
         stale_rules=_stale_rules(store, tenant, stale_after),
     )

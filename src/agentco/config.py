@@ -73,6 +73,13 @@ class WebhookConfig(BaseModel):
     debounce_s: float = Field(2.0, ge=0, allow_inf_nan=False)
 
 
+class PoolConfig(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    size: int = Field(2, ge=0, le=8)  # 0 disables the warm worktree pool
+    setup_timeout_s: float = Field(1800, gt=0, allow_inf_nan=False)
+
+
 class TenantConfig(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
@@ -88,6 +95,7 @@ class TenantConfig(BaseModel):
     loop: LoopLimits = LoopLimits()
     intake: IntakeConfig = IntakeConfig()
     webhook: WebhookConfig = WebhookConfig()
+    pool: PoolConfig = PoolConfig()
 
     @field_validator("tenant")
     @classmethod

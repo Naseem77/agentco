@@ -46,8 +46,9 @@ class RepoContract(BaseModel):
     sandbox: Sandbox
     test_files: str | None = None  # command template; must contain {files}
     env_passthrough: list[str] = []  # host variables the commands may see
+    setup: str | None = None  # prepares a fresh checkout; the warm pool runs it ahead
 
-    @field_validator("build", "test", "e2e", "lint")
+    @field_validator("build", "test", "e2e", "lint", "setup")
     @classmethod
     def _non_empty(cls, v: str | None) -> str | None:
         if v is not None and not v.strip():
