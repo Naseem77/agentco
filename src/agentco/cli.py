@@ -2,6 +2,7 @@ import asyncio
 import dataclasses
 import json
 import math
+import os
 from collections.abc import AsyncIterator, Callable, Iterable, Iterator
 from contextlib import (
     AbstractAsyncContextManager,
@@ -51,6 +52,7 @@ from agentco.sandbox.runner import CommandRunner, runner_for
 from agentco.sandbox.worktree import GitError
 from agentco.store.models import ArtifactKind, TaskRecord
 from agentco.store.task_store import TaskStore
+from agentco.webhook import IntakeTrigger, make_server
 from agentco.workflow.orchestrator import StepFailed, TaskContext, run_many
 from agentco.workflow.preflight import RestoreError
 from agentco.workflow.states import TaskState
@@ -629,6 +631,20 @@ def _intake_lines(store: TaskStore, report: IntakeReport) -> list[str]:
     return lines
 
 
+def _intake_once(
+    cfg: TenantConfig, store: TaskStore, repo: str
+) -> tuple[IntakeReport, list[LearnReport]]:
+    async def _run() -> tuple[IntakeReport, list[LearnReport]]:
+        async with _started(make_runtime(cfg)) as runtime:
+            gate = MemoryGate(cfg.tenant, _build_backend(cfg))
+            gh = make_github()
+            report = await run_intake(cfg, store, gh, runtime, gate, repo)
+            learned = await _learn(cfg, store, gate, runtime, gh, report.touched)
+            return report, learned
+
+    return asyncio.run(_run())
+
+
 @app.command()
 def intake(
     repo: Annotated[str, typer.Option("--repo", help="GitHub repo as OWNER/NAME.")],
@@ -643,21 +659,16 @@ def intake(
     store = TaskStore(cfg.database_url)
     store.create_all()
 
-    async def _run() -> tuple[IntakeReport, list[LearnReport]]:
-        async with _started(make_runtime(cfg)) as runtime:
-            gate = MemoryGate(cfg.tenant, _build_backend(cfg))
-            gh = make_github()
-            report = await run_intake(cfg, store, gh, runtime, gate, repo)
-            learned = await _learn(cfg, store, gate, runtime, gh, report.touched)
-            return report, learned
-
     try:
         with _falkordb_guard(cfg):
-            report, learned = asyncio.run(_run())
+            report, learned = _intake_once(cfg, store, repo)
     except GitHubError as e:
         raise _fail(str(e), 3) from e
     except LLM_ERRORS as e:
         raise _fail(f"LLM request failed: {_one_line(e)}") from e
+    if report.busy:
+        typer.echo(f"another intake for {repo} is running; skipped")
+        return
     for line in _intake_lines(store, report):
         typer.echo(line)
     _echo_warnings(learned)
@@ -665,6 +676,59 @@ def intake(
         raise typer.Exit(3)
     if report.errors:
         raise typer.Exit(4)
+
+
+@app.command()
+def serve(
+    repo: Annotated[str, typer.Option("--repo", help="GitHub repo as OWNER/NAME.")],
+    host: Annotated[str, typer.Option("--host", help="Address to bind.")] = "127.0.0.1",
+    port: Annotated[int, typer.Option("--port", help="Port to listen on.")] = 8787,
+    config: Path = ConfigOption,
+) -> None:
+    """Receive signed GitHub webhooks and run the intake for the repo (one at a time)."""
+    try:
+        validate_repo(repo)
+    except ValueError as e:
+        raise _fail(str(e)) from e
+    cfg = _load(config)
+    secret = os.environ.get(cfg.webhook.secret_env, "")
+    if not secret:
+        raise _fail(
+            f"set the webhook secret in ${cfg.webhook.secret_env} (it is never read from the config)"
+        )
+    store = TaskStore(cfg.database_url)
+    store.create_all()
+
+    def run_once() -> None:
+        with _falkordb_guard(cfg):
+            report, learned = _intake_once(cfg, store, repo)
+        if report.busy:
+            typer.echo(f"another intake for {repo} is running; skipped")
+            return
+        for line in _intake_lines(store, report):
+            typer.echo(line)
+        _echo_warnings(learned)
+
+    trigger = IntakeTrigger(run_once, cfg.webhook.debounce_s)
+    server = make_server(
+        host,
+        port,
+        tenant=cfg.tenant,
+        store=store,
+        repo=repo,
+        secret=secret.encode(),
+        max_body=cfg.webhook.max_body_bytes,
+        trigger=trigger,
+    )
+    bound_host, bound_port = server.server_address[:2]
+    typer.echo(f"listening on http://{bound_host}:{bound_port}/webhook for {repo}")
+    try:
+        server.serve_forever()
+    except KeyboardInterrupt:
+        pass
+    finally:
+        server.server_close()
+        trigger.close()
 
 
 @app.command()

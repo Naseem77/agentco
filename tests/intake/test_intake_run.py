@@ -762,3 +762,27 @@ async def test_human_merge_while_awaiting_is_found_by_intake(store, loop_cfg):
     env.gh.upsert_pull(pull_of(state="closed", merged_at=BASE + timedelta(minutes=1)))
     rep = await env.run()
     assert env.task().state is S.MERGED and rep.merged == [env.tid]
+
+
+async def test_second_intake_is_busy(env):
+    key = "intake:acme:acme/app"
+    assert env.store.try_lease(key, "other", 60)
+    rep = await env.run()
+    assert rep.busy and env.gh.calls == []
+    assert env.store.get_meta(f"{key}:cursor") is None
+    assert not env.store.try_lease(key, "third", 60)
+
+
+async def test_lease_released_after_run(env):
+    await env.run()
+    assert env.store.try_lease("intake:acme:acme/app", "next", 60)
+
+
+async def test_lease_released_after_error(env, monkeypatch):
+    async def boom(*a, **k):
+        raise RuntimeError("boom")
+
+    monkeypatch.setattr(run_module, "_run_intake", boom)
+    with pytest.raises(RuntimeError):
+        await env.run()
+    assert env.store.try_lease("intake:acme:acme/app", "next", 60)
