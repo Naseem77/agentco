@@ -9,12 +9,18 @@ from typing import Protocol
 
 from agentco.github.errors import GitHubError
 from agentco.github.models import (
+    GhCheckRun,
     GhIssue,
     GhPull,
+    GhReview,
     GhReviewComment,
+    GhUser,
     PullRef,
+    linked_issues,
+    parse_check_run,
     parse_issue,
     parse_pull,
+    parse_review,
     parse_review_comment,
 )
 
@@ -41,6 +47,12 @@ class GitHub(Protocol):
 
     def pull_files(self, repo: str, number: int) -> list[str]: ...
 
+    def get_pull(self, repo: str, number: int) -> GhPull: ...
+
+    def pull_reviews(self, repo: str, number: int) -> list[GhReview]: ...
+
+    def check_runs(self, repo: str, sha: str) -> list[GhCheckRun]: ...
+
 
 class GitHubWriter(Protocol):
     def create_pull(
@@ -53,6 +65,7 @@ class GitHubWriter(Protocol):
 
 
 Runner = Callable[[list[str], str | None], str]
+_REF_RE = re.compile(r"^[A-Za-z0-9_.-]+$")
 _PULL_URL_RE = re.compile(r"^https?://\S+/pull/(\d+)$")
 
 
@@ -79,14 +92,36 @@ def _since_param(since: datetime) -> str:
     return _utc(since).strftime("%Y-%m-%dT%H:%M:%SZ")
 
 
-def _flatten_pages(output: str) -> list[dict]:
+def _load_json(output: str) -> object:
     try:
-        pages = json.loads(output)
+        return json.loads(output)
     except json.JSONDecodeError as e:
         raise GitHubError(f"gh api returned invalid JSON: {e}") from e
+
+
+def _flatten_pages(output: str) -> list[dict]:
+    pages = _load_json(output)
     if not isinstance(pages, list) or not all(isinstance(p, list) for p in pages):
         raise GitHubError("gh api returned unexpected JSON: expected a list of pages")
     return [item for page in pages for item in page]
+
+
+def _flatten_key(output: str, key: str) -> list[dict]:
+    """Flatten `--slurp` pages that are objects holding their items under `key`."""
+    pages = _load_json(output)
+    if not isinstance(pages, list) or not all(
+        isinstance(p, dict) and isinstance(p.get(key), list) for p in pages
+    ):
+        raise GitHubError(
+            f"gh api returned unexpected JSON: expected a list of objects with a {key!r} list"
+        )
+    return [item for page in pages for item in page[key]]
+
+
+def _validate_ref(ref: str) -> str:
+    if not _REF_RE.match(ref) or ref in (".", ".."):
+        raise ValueError(f"commit ref must be a plain sha, got {ref!r}")
+    return ref
 
 
 def _filename(raw: dict) -> str:
@@ -131,9 +166,10 @@ class GhCli:
             self._runner = _read_only(runner)
 
     def _get(self, path: str) -> list[dict]:
-        return _flatten_pages(
-            self._runner(["gh", "api", "--paginate", "--slurp", path], None)
-        )
+        return _flatten_pages(self._paginated(path))
+
+    def _paginated(self, path: str) -> str:
+        return self._runner(["gh", "api", "--paginate", "--slurp", path], None)
 
     def issues(self, repo: str, since: datetime | None = None) -> list[GhIssue]:
         path = f"repos/{validate_repo(repo)}/issues?state=all&per_page=100&sort=created&direction=asc"
@@ -156,6 +192,24 @@ class GhCli:
     def pull_files(self, repo: str, number: int) -> list[str]:
         path = f"repos/{validate_repo(repo)}/pulls/{number}/files?per_page=100"
         return [_filename(raw) for raw in self._get(path)]
+
+    def get_pull(self, repo: str, number: int) -> GhPull:
+        path = f"repos/{validate_repo(repo)}/pulls/{int(number)}"
+        raw = _load_json(self._runner(["gh", "api", path], None))
+        if not isinstance(raw, dict):
+            raise GitHubError("gh api returned unexpected JSON: expected an object")
+        return parse_pull(raw)
+
+    def pull_reviews(self, repo: str, number: int) -> list[GhReview]:
+        path = f"repos/{validate_repo(repo)}/pulls/{int(number)}/reviews"
+        return [parse_review(raw, int(number)) for raw in self._get(path)]
+
+    def check_runs(self, repo: str, sha: str) -> list[GhCheckRun]:
+        path = f"repos/{validate_repo(repo)}/commits/{_validate_ref(sha)}/check-runs"
+        return [
+            parse_check_run(raw)
+            for raw in _flatten_key(self._paginated(path), "check_runs")
+        ]
 
     def create_pull(
         self, repo: str, head: str, base: str, title: str, body: str
@@ -201,11 +255,15 @@ class FakeGitHub:
         comments: list[GhReviewComment],
         files: dict[int, list[str]],
         fail_writes: bool = False,
+        reviews: dict[int, list[GhReview]] | None = None,
+        check_runs: dict[str, list[GhCheckRun]] | None = None,
     ) -> None:
         self._issues = issues
         self._pulls = pulls
         self._comments = comments
         self._files = files
+        self._reviews = {n: list(rs) for n, rs in (reviews or {}).items()}
+        self._checks = {sha: list(rs) for sha, rs in (check_runs or {}).items()}
         self.calls: list[tuple[str, object]] = []
         self.fail_writes = fail_writes
         self.created: list[dict] = []
@@ -252,12 +310,43 @@ class FakeGitHub:
         self.calls.append(("pull_files", number))
         return list(self._files.get(number, []))
 
+    def get_pull(self, repo: str, number: int) -> GhPull:
+        validate_repo(repo)
+        self.calls.append(("get_pull", number))
+        for pull in self._pulls:
+            if pull.number == number:
+                return pull
+        raise GitHubError(f"pull request #{number} not found")
+
+    def pull_reviews(self, repo: str, number: int) -> list[GhReview]:
+        validate_repo(repo)
+        self.calls.append(("pull_reviews", number))
+        return list(self._reviews.get(number, []))
+
+    def check_runs(self, repo: str, sha: str) -> list[GhCheckRun]:
+        validate_repo(repo)
+        self.calls.append(("check_runs", sha))
+        return list(self._checks.get(sha, []))
+
+    def upsert_pull(self, pull: GhPull) -> None:
+        self._pulls = [p for p in self._pulls if p.number != pull.number] + [pull]
+        self._pulls.sort(key=lambda p: p.number)
+
+    def add_comment(self, comment: GhReviewComment) -> None:
+        self._comments.append(comment)
+
+    def add_review(self, review: GhReview) -> None:
+        self._reviews.setdefault(review.pr_number, []).append(review)
+
+    def set_checks(self, sha: str, runs: list[GhCheckRun]) -> None:
+        self._checks[sha] = list(runs)
+
     def create_pull(
         self, repo: str, head: str, base: str, title: str, body: str
     ) -> PullRef:
         validate_repo(repo)
         self._check_writable()
-        number = len(self.created) + 1
+        number = max([p.number for p in self._pulls], default=0) + 1
         url = f"https://github.com/{repo}/pull/{number}"
         self.created.append(
             {
@@ -269,6 +358,24 @@ class FakeGitHub:
                 "number": number,
                 "url": url,
             }
+        )
+        now = datetime.now(UTC)
+        self.upsert_pull(
+            GhPull(
+                number=number,
+                title=title,
+                body=body,
+                author=GhUser("agentco", False),
+                state="open",
+                merged_at=None,
+                created_at=now,
+                updated_at=now,
+                base_sha="fake-base",
+                head_sha="fake-sha",
+                labels=(),
+                url=url,
+                closes_issues=linked_issues(body),
+            )
         )
         return PullRef(number=number, url=url)
 
