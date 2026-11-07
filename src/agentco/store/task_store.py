@@ -305,6 +305,15 @@ class TaskStore:
             row = session.get(MetaRow, key)
             return row.value if row else None
 
+    def meta_with_prefix(self, prefix: str) -> dict[str, str]:
+        with self._sessions() as session:
+            rows = session.scalars(
+                select(MetaRow)
+                .where(MetaRow.key.startswith(prefix, autoescape=True))
+                .order_by(MetaRow.key)
+            )
+            return {r.key: r.value for r in rows}
+
     def set_meta(self, key: str, value: str) -> None:
         with self._sessions.begin() as session:
             session.merge(MetaRow(key=key, value=value))

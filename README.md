@@ -115,6 +115,34 @@ Exit codes: 1 bad arguments, config, a non-git `--repo-path` or an LLM error (e.
 `OPENAI_API_KEY` missing, rate limit, refusal), 2 FalkorDB unreachable or rejecting a
 query, 3 `gh` missing, not logged in, the repo not found, or `gh` returning unexpected JSON.
 
+## Metrics
+
+```bash
+uv run agentco metrics                 # totals, then one row per task
+uv run agentco metrics --since 30      # only tasks started in the last 30 days
+uv run agentco metrics --json          # the same data as JSON
+```
+
+Everything is derived on read from the task store (audit log, artifacts, meta). There is no
+extra table, and the command needs neither FalkorDB nor GitHub. It exits 1 only on a bad
+config or bad `--since`.
+
+Each number maps to a success metric of spec §9:
+
+| Number | Spec §9 metric | Target |
+|---|---|---|
+| `pr_comments_per_pr` | human review rounds per PR after it opens (the real ping-pong metric): findings from comments, reviews and failing checks, per PR | **0** |
+| `escaped_real_bugs` | escaped bugs: PR findings the lead classified `real_bug` | ↓ |
+| `fix_round_findings` | % of bugs introduced by fixes: review findings in rounds after the first (a proxy) | ↓ |
+| `avg_rounds`, `avg_pr_rounds` | internal rounds per task; the share of them that came from a PR | ↓ |
+| `escalations`, `recurrences` | human pings (escalations to the inbox); findings that came back after a fix | ↓ |
+| `pct_junior` | % of tasks done by the junior tier (merged tasks whose final assignee is junior) | ↑ |
+| `premium_requests`, `cost_usd`, `median_duration_h` | cost per task; time from creation to merge or cancel | ↓ |
+
+`tasks`, `merged` and `cancelled` count the tasks in the window. `stale rules` lists the
+fingerprints of review findings that humans overrode at least `thresholds.stale_after`
+times (default 3); retire those rules by hand.
+
 ## Run a task
 
 Prerequisites: `init` done, FalkorDB and `OPENAI_API_KEY` as above, the

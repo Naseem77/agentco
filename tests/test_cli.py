@@ -16,6 +16,7 @@ from graphiti_core.llm_client.errors import (
     RateLimitError,
     RefusalError,
 )
+from sqlalchemy import update
 from typer.testing import CliRunner
 
 from agentco import cli
@@ -28,7 +29,7 @@ from agentco.memory.backend import InMemoryBackend, MemoryItem
 from agentco.memory.scopes import Scope
 from agentco.roles import Role
 from agentco.sandbox.worktree import GitError
-from agentco.store.models import ArtifactKind
+from agentco.store.models import ArtifactKind, AuditRow
 from agentco.store.task_store import TaskStore
 from agentco.workflow.preflight import RestoreError
 from agentco.workflow.states import TaskState
@@ -1915,3 +1916,118 @@ def test_task_run_all_runs_the_librarian_for_every_task_that_finished(
 
     assert result.exit_code == 0, result.stdout
     assert sorted(seen) == sorted([*ids, stuck])
+
+
+def _seed_metrics(store):
+    store.create_all()
+    tid = store.create_task("acme", "Fix flicker", "cli").id
+    store.assign(tid, Role.JUNIOR)
+    for state in (
+        TaskState.PM,
+        TaskState.TRIAGE,
+        TaskState.ENGINEERING,
+        TaskState.PREFLIGHT,
+        TaskState.INTERNAL_REVIEW,
+        TaskState.LEAD_DECISION,
+        TaskState.PR_OPEN,
+    ):
+        store.transition(tid, state, Role.LEAD, "t")
+    store.put_artifact(tid, ArtifactKind.PR, Role.LEAD, {"number": 7, "url": "u"})
+    store.put_artifact(
+        tid,
+        ArtifactKind.PR_FEEDBACK,
+        Role.LEAD,
+        {"pr": 7, "findings": [{"id": "c1"}, {"id": "c2"}]},
+    )
+    store.record_cost(tid, Role.JUNIOR, 0.5, {"model": "m", "requests": 4})
+    store.set_meta("librarian:acme:override:abc123", "3")
+    store.set_meta("librarian:acme:override:low", "2")
+    return tid
+
+
+def test_cli_metrics_json(env):
+    tid = _seed_metrics(env.store)
+    result = env("metrics", "--json")
+    assert result.exit_code == 0
+    data = json.loads(result.stdout)
+    assert data["stale_rules"] == ["abc123"]
+    assert data["totals"]["tasks"] == 1
+    assert data["totals"]["pr_comments_per_pr"] == 2
+    assert data["totals"]["premium_requests"] == 4
+    (task,) = data["tasks"]
+    assert (task["task_id"], task["title"], task["state"]) == (
+        tid,
+        "Fix flicker",
+        "pr_open",
+    )
+    assert (task["assignee"], task["pr_findings"], task["cost_usd"]) == (
+        "junior",
+        2,
+        0.5,
+    )
+
+
+def test_cli_metrics_table(env):
+    _seed_metrics(env.store)
+    result = env("metrics")
+    assert result.exit_code == 0
+    lines = result.stdout.splitlines()
+    assert lines[:3] == ["tasks: 1", "merged: 0", "cancelled: 0"]
+    assert "pr_comments_per_pr: 2" in lines
+    assert "stale rules: abc123" in lines
+    blank = lines.index("")
+    assert lines[blank + 1].split() == [
+        "id", "state", "assignee", "rounds", "pr_rounds", "pr_findings", "pr_real",
+        "escalations", "requests", "cost_usd", "hours", "title",
+    ]  # fmt: skip
+    assert lines[blank + 2].split() == [
+        "1", "pr_open", "junior", "0", "0", "2", "0", "0", "4", "0.50", "-",
+        "Fix", "flicker",
+    ]  # fmt: skip
+
+
+def test_cli_metrics_needs_no_falkordb(env, monkeypatch):
+    def boom(cfg):
+        raise AssertionError("metrics must not build a memory backend")
+
+    monkeypatch.setattr(cli, "make_backend", boom)
+    monkeypatch.setattr(cli, "make_code_graph", boom)
+    monkeypatch.setattr(cli, "make_github", boom)
+    result = env("metrics", "--json")
+    assert result.exit_code == 0
+    assert json.loads(result.stdout)["totals"]["tasks"] == 0
+
+
+def test_cli_metrics_since_days(env):
+    _seed_metrics(env.store)
+    assert (
+        json.loads(env("metrics", "--json", "--since", "1").stdout)["totals"]["tasks"]
+        == 1
+    )
+    # a task that started a week ago falls outside --since 1
+    old = env.store.create_task("acme", "old", "cli").id
+    with env.store._sessions.begin() as session:
+        session.execute(
+            update(AuditRow)
+            .where(AuditRow.task_id == old)
+            .values(at=datetime.now(UTC) - timedelta(days=7))
+        )
+    titles = [
+        t["title"]
+        for t in json.loads(env("metrics", "--json", "--since", "1").stdout)["tasks"]
+    ]
+    assert titles == ["Fix flicker"]
+
+
+@pytest.mark.parametrize("value", ["0", "-3", "abc", "1.5"])
+def test_cli_metrics_bad_since_exits_1(env, value):
+    result = env("metrics", "--since", value)
+    assert result.exit_code == 1
+    assert result.stdout.splitlines()[0].startswith("--since must be")
+
+
+def test_cli_metrics_bad_config_exits_1(tmp_path):
+    result = runner.invoke(
+        cli.app, ["metrics", "--config", str(tmp_path / "missing.yml")]
+    )
+    assert result.exit_code == 1

@@ -1,4 +1,6 @@
 import asyncio
+import dataclasses
+import json
 import math
 from collections.abc import AsyncIterator, Callable, Iterable, Iterator
 from contextlib import (
@@ -7,7 +9,7 @@ from contextlib import (
     asynccontextmanager,
     contextmanager,
 )
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from enum import StrEnum
 from pathlib import Path
 from typing import Annotated
@@ -31,6 +33,7 @@ from agentco.importer.locate import SymbolLocator
 from agentco.importer.run import ImportOptions, ImportReport, run_import
 from agentco.intake.run import IntakeReport, run_intake
 from agentco.learning.librarian import LearnReport, Librarian
+from agentco.learning.metrics import MetricsReport, metrics_report
 from agentco.llm.copilot import CopilotRuntime
 from agentco.llm.runtime import AgentRuntime
 from agentco.memory.backend import Fact, MemoryBackend, MemoryItem
@@ -775,3 +778,74 @@ def learn(
         typer.echo(
             f"#{report.task_id}: {report.added} added, {report.duplicates} duplicate"
         )
+
+
+def _metrics_since(days: str | None) -> datetime | None:
+    if days is None:
+        return None
+    try:
+        value = int(days)
+    except ValueError:
+        raise _fail(f"--since must be a number of days, got {days!r}") from None
+    if value < 1:
+        raise _fail(f"--since must be at least 1 day, got {value}")
+    return datetime.now(UTC) - timedelta(days=value)
+
+
+def _metrics_lines(report: MetricsReport) -> list[str]:
+    lines = [
+        f"{name}: {value:g}" if value == int(value) else f"{name}: {value:.2f}"
+        for name, value in report.totals.items()
+    ]
+    if report.stale_rules:
+        lines.append(f"stale rules: {', '.join(report.stale_rules)}")
+    header = ["id", "state", "assignee", "rounds", "pr_rounds", "pr_findings"]
+    header += ["pr_real", "escalations", "requests", "cost_usd", "hours", "title"]
+    rows = [header]
+    for t in report.tasks:
+        rows.append(
+            [
+                str(t.task_id),
+                t.state.value,
+                t.assignee.value if t.assignee else "-",
+                str(t.rounds),
+                str(t.pr_rounds),
+                str(t.pr_findings),
+                str(t.pr_real),
+                str(sum(t.escalations.values())),
+                f"{t.premium_requests:g}",
+                f"{t.cost_usd:.2f}",
+                "-" if t.duration_h is None else f"{t.duration_h:.1f}",
+                t.title,
+            ]
+        )
+    widths = [max(len(row[i]) for row in rows) for i in range(len(header) - 1)]
+    lines.append("")
+    for row in rows:
+        cells = [cell.ljust(widths[i]) for i, cell in enumerate(row[:-1])]
+        lines.append("  ".join([*cells, row[-1]]))
+    return lines
+
+
+@app.command()
+def metrics(
+    since: Annotated[
+        str | None,
+        typer.Option("--since", help="Only tasks started in the last DAYS days."),
+    ] = None,
+    as_json: Annotated[bool, typer.Option("--json", help="Print JSON.")] = False,
+    config: Path = ConfigOption,
+) -> None:
+    """Show how the loop is doing, derived from the audit log (no services needed)."""
+    cfg = _load(config)
+    since_at = _metrics_since(since)
+    store = TaskStore(cfg.database_url)
+    store.create_all()
+    report = metrics_report(
+        store, cfg.tenant, cfg.thresholds.stale_after, since=since_at
+    )
+    if as_json:
+        typer.echo(json.dumps(dataclasses.asdict(report), indent=2))
+        return
+    for line in _metrics_lines(report):
+        typer.echo(line)
