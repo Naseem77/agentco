@@ -1,7 +1,7 @@
 """Team lead: classifies findings, then code applies the decision order (spec §6)."""
 
 import re
-from collections.abc import Sequence
+from collections.abc import Iterable, Sequence
 from dataclasses import asdict, dataclass, replace
 from typing import Literal
 
@@ -329,19 +329,36 @@ def _fast_lane_eligible(
     )
 
 
-def _file_follow_ups(
-    store: TaskStore, task: TaskRecord, follow_ups: tuple[Finding, ...]
-) -> None:
+_CHORES = (
+    re.compile(r"^(run|re-?run|execute)\b.*\b(tests?|lint|linter|build|ci|suite)\b"),
+    re.compile(r"^(add|write) (more )?tests?$"),
+)
+
+
+def _normalized_title(title: str) -> str:
+    return " ".join(re.sub(r"[^\w\s]", "", title.casefold()).split())
+
+
+def _is_chore(title: str) -> bool:
+    normalized = _normalized_title(title)
+    return any(chore.search(normalized) for chore in _CHORES)
+
+
+def _file_follow_ups(store: TaskStore, task: TaskRecord, titles: Iterable[str]) -> None:
+    """File each new, non-chore title once per task; titles match loosely."""
     source_ref = f"task:{task.id}"
     filed = {
-        t.title
+        _normalized_title(t.title)
         for t in store.list_tasks(task.tenant)
         if t.source == "followup" and t.source_ref == source_ref
     }
-    for finding in follow_ups:
-        if finding.title not in filed:
-            store.create_task(task.tenant, finding.title, "followup", source_ref)
-            filed.add(finding.title)
+    for title in titles:
+        title = title.strip()
+        key = _normalized_title(title)
+        if not key or key in filed or _is_chore(title):
+            continue
+        store.create_task(task.tenant, title, "followup", source_ref)
+        filed.add(key)
 
 
 async def run_lead(
@@ -429,7 +446,16 @@ async def run_lead(
         )
         if reply is None:
             decision = replace(decision, reason="lead unavailable")
-        _file_follow_ups(store, task, decision.follow_ups)
+
+    if decision.outcome == "approve":
+        _file_follow_ups(
+            store,
+            task,
+            [
+                *(f.title for f in decision.follow_ups),
+                *(f.title for f in engineer.follow_ups),
+            ],
+        )
 
     body = asdict(decision)
     body["findings_to_fix"] = [f.model_dump() for f in decision.findings_to_fix]

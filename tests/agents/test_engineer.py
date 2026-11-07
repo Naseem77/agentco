@@ -412,7 +412,7 @@ async def test_first_round_prompt_has_no_fix_sections(make_repo, store, loop_cfg
     )
 
 
-async def test_follow_ups_become_tasks(make_repo, store, loop_cfg):
+async def test_engineer_does_not_file_followups(make_repo, store, loop_cfg):
     def work(call):
         edit_a(call)
         return reply(
@@ -430,10 +430,11 @@ async def test_follow_ups_become_tasks(make_repo, store, loop_cfg):
         FollowUp(title="Clean up lexer", why="dead code"),
         FollowUp(title="Docs for tabs", why="undocumented"),
     ]
-    children = [store.get(i) for i in (2, 3)]
-    assert [(t.tenant, t.title, t.source, t.source_ref) for t in children] == [
-        ("acme", "Clean up lexer", "followup", "task:1"),
-        ("acme", "Docs for tabs", "followup", "task:1"),
+    assert [t.id for t in store.list_tasks("acme")] == [env.task.id]
+    [artifact] = store.artifacts(env.task.id, ArtifactKind.ENGINEER)
+    assert [f["title"] for f in artifact.body["follow_ups"]] == [
+        "Clean up lexer",
+        "Docs for tabs",
     ]
 
 

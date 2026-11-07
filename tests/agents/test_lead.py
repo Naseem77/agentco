@@ -464,22 +464,34 @@ async def test_prompt_reports_failures_check_errors_and_hits(store, loop_cfg):
         assert part in call.prompt
 
 
+def followups(store, env):
+    return [
+        t.title
+        for t in store.list_tasks("acme")
+        if t.source == "followup" and t.source_ref == f"task:{env.task.id}"
+    ]
+
+
 async def test_edge_case_follow_ups_become_tasks(store, loop_cfg):
-    env = Env(store, loop_cfg, [], await gate_with("src/calc.py arithmetic"))
-    reply = lead_json(("e", "edge_case"))
-    env.runtime = FakeRuntime({Role.LEAD: [reply]})
-    env.asker = Asker(env.runtime, store, env.task.id, loop_cfg.price_per_request_usd)
+    env = Env(
+        store,
+        loop_cfg,
+        [lead_json(("e", "edge_case"))],
+        await gate_with("src/calc.py arithmetic"),
+    )
     review = REVIEW(F("e", "edge_case", "minor"))
 
     d = await env.run(checks=CheckOutcome(review, QA_OK, ()))
 
+    assert d.outcome == "approve"
     assert ids(d.follow_ups) == ["e"]
-    [_, followup] = store.list_tasks("acme")
+    followup = store.list_tasks("acme")[1]
     assert (followup.title, followup.source, followup.source_ref) == (
         "e",
         "followup",
         f"task:{env.task.id}",
     )
+    assert followups(store, env) == ["e", "later"]
 
 
 async def test_follow_up_title_is_not_filed_twice(store, loop_cfg):
@@ -493,7 +505,108 @@ async def test_follow_up_title_is_not_filed_twice(store, loop_cfg):
         )
         await env.run(checks=CheckOutcome(review, QA_OK, ()))
 
-    assert [t.title for t in store.list_tasks("acme")] == ["tabs", "e"]
+    assert [t.title for t in store.list_tasks("acme")] == ["tabs", "e", "later"]
+
+
+async def test_no_followups_on_send_back(store, loop_cfg):
+    env = Env(
+        store,
+        loop_cfg,
+        [lead_json(("a", "real_bug"), ("e", "edge_case"))],
+        await gate_with("src/calc.py arithmetic"),
+    )
+    review = REVIEW(F("a"), F("e", "edge_case", "minor"))
+
+    d = await env.run(checks=CheckOutcome(review, QA_OK, ()))
+
+    assert d.outcome == "send_back"
+    assert followups(store, env) == []
+
+
+async def test_no_followups_on_escalate(store, loop_cfg):
+    env = Env(
+        store,
+        loop_cfg,
+        [lead_json(("e", "edge_case"), conf=0.1)],
+        await gate_with("src/calc.py arithmetic"),
+    )
+    review = REVIEW(F("e", "edge_case", "minor"))
+
+    d = await env.run(checks=CheckOutcome(review, QA_OK, ()))
+
+    assert d.outcome == "escalate"
+    assert followups(store, env) == []
+
+
+async def test_followups_deduped(store, loop_cfg):
+    env = Env(
+        store,
+        loop_cfg,
+        [lead_json(("e", "edge_case"), ("f", "edge_case"))],
+        await gate_with("src/calc.py arithmetic"),
+    )
+    store.create_task("acme", "Handle  EMPTY input!", "followup", f"task:{env.task.id}")
+    review = REVIEW(
+        Finding(
+            id="e", severity="minor", kind="edge_case", title="Tabs in CSV", detail="d"
+        ),
+        Finding(
+            id="f",
+            severity="minor",
+            kind="edge_case",
+            title="handle empty input",
+            detail="d",
+        ),
+    )
+    engineer = ENGINEER.model_copy(
+        update={
+            "follow_ups": [
+                FollowUp(title="tabs in csv.", why="y"),
+                FollowUp(title="Unicode  tabs", why="y"),
+                FollowUp(title="unicode tabs", why="y"),
+            ]
+        }
+    )
+
+    await env.run(checks=CheckOutcome(review, QA_OK, ()), engineer=engineer)
+
+    assert followups(store, env) == [
+        "Handle  EMPTY input!",
+        "Tabs in CSV",
+        "Unicode  tabs",
+    ]
+
+
+@pytest.mark.parametrize(
+    "title",
+    [
+        "Run the tests",
+        "run tests",
+        "Re-run the full test suite",
+        "rerun lint",
+        "Execute the build",
+        "Run CI again",
+        "Run the linter",
+        "Add tests",
+        "Write more tests.",
+        "add test",
+    ],
+)
+async def test_chore_followups_dropped(store, loop_cfg, title):
+    env = Env(store, loop_cfg, [lead_json()], await gate_with("src/calc.py arithmetic"))
+    engineer = ENGINEER.model_copy(
+        update={
+            "follow_ups": [
+                FollowUp(title=title, why="y"),
+                FollowUp(title="Add tests for unicode tabs", why="y"),
+            ]
+        }
+    )
+
+    d = await env.run(engineer=engineer)
+
+    assert d.outcome == "approve"
+    assert followups(store, env) == ["Add tests for unicode tabs"]
 
 
 async def test_artifact_holds_dumped_decision_with_findings_for_triage(store, loop_cfg):

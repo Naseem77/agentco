@@ -220,9 +220,5 @@ async def run_engineer(
         raise EngineerFailed("engineer made no changes")
     if brief.require_invariant and not reply.invariant.strip():
         raise EngineerFailed("no invariant stated")
-    for follow_up in reply.follow_ups:
-        store.create_task(
-            task.tenant, follow_up.title, "followup", source_ref=f"task:{task.id}"
-        )
     store.put_artifact(task.id, ArtifactKind.ENGINEER, role, reply.model_dump())
     return reply
