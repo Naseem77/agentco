@@ -191,6 +191,8 @@ def test_report_totals_and_since_filter(store):
         "pool_hits": 0.0,
         "pool_misses": 0.0,
         "setup_saved_s": 0.0,
+        "trees": 0.0,
+        "trees_done": 0.0,
     }
     assert report.stale_rules == []
     assert old in {t.task_id for t in report.tasks}
@@ -250,3 +252,27 @@ def test_metrics_pool_totals(store):
     assert totals["pool_hits"] == 3.0  # a bad value still counts as a claim
     assert totals["pool_misses"] == 1.0
     assert totals["setup_saved_s"] == 120.5
+
+
+def test_metrics_trees_excluded_from_averages(store):
+    solo = finished(store, "solo", Role.JUNIOR, 2)
+    parent = store.create_task("acme", "tree", "cli").id
+    walk(store, parent, S.PM, S.TRIAGE, S.ARCHITECT, S.AWAITING_HUMAN)
+    walk(store, parent, S.WAITING_CHILDREN)
+    store.set_meta(f"task:{parent}:adr", "1")
+    kid = store.create_task("acme", "kid", "adr", "tree:x", parent).id
+    walk(store, kid, *FIRST_FLOOR, S.LEAD_DECISION, S.PR_OPEN)
+    store.assign(kid, Role.SENIOR)
+    walk(store, kid, S.MERGED)
+    walk(store, parent, S.MERGED)
+
+    report = metrics_report(store, "acme", 3)
+
+    by_id = {t.task_id: t for t in report.tasks}
+    assert by_id[parent].is_parent and not by_id[solo].is_parent
+    assert not by_id[kid].is_parent
+    totals = report.totals
+    assert (totals["trees"], totals["trees_done"]) == (1.0, 1.0)
+    assert totals["tasks"] == 3.0
+    assert totals["merged"] == 2.0  # the solo task and the kid, not the parent
+    assert totals["pct_junior"] == 50.0

@@ -61,6 +61,25 @@ def triage_json(route: str = "junior", size: str = "m") -> str:
     return json.dumps({"route": route, "size": size, "risk": "low", "reason": "small"})
 
 
+def adr_json(n: int = 2, title: str = "Plugin registry") -> str:
+    return json.dumps(
+        {
+            "title": title,
+            "context": "no extension point",
+            "decision": "add a registry",
+            "consequences": "plugins run in-process",
+            "sub_tasks": [
+                {
+                    "title": f"{title} step {i}",
+                    "acceptance_criteria": [f"step {i} works"],
+                    "size": "s",
+                }
+                for i in range(n)
+            ],
+        }
+    )
+
+
 def engineer(
     version: int = 1,
     *,

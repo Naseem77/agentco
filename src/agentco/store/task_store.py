@@ -107,6 +107,15 @@ class TaskStore:
             )
         )
 
+    def children(self, parent_id: int) -> list[TaskRecord]:
+        with self._sessions() as session:
+            rows = session.scalars(
+                select(TaskRow)
+                .where(TaskRow.parent_id == parent_id)
+                .order_by(TaskRow.id)
+            )
+            return [_record(r) for r in rows]
+
     def create_task(
         self,
         tenant: str,

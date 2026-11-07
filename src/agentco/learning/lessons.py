@@ -16,7 +16,7 @@ from agentco.memory.entities import ENTITY_TYPES
 from agentco.memory.gate import MemoryGate
 from agentco.memory.scopes import Scope
 from agentco.roles import Role
-from agentco.store.models import Artifact
+from agentco.store.models import Artifact, ArtifactKind
 from agentco.store.task_store import TaskStore
 
 LessonKind = Literal[
@@ -29,6 +29,7 @@ LessonKind = Literal[
     "AgentProfile",
     "EscapedBug",
     "NeighbourCase",
+    "Decision",
 ]
 MAX_TEXT = 500
 _ELLIPSIS = "…"
@@ -154,6 +155,28 @@ def lessons_from_lead(a: Artifact, modules: Iterable[str]) -> list[Lesson]:
         )
         for comment in comments
         if isinstance(comment, str) and comment.strip()
+    ]
+
+
+def lessons_from_adr(adr: Artifact, artifacts: list[Artifact]) -> list[Lesson] | None:
+    """The approved design becomes a Decision; None until a human has ruled on it."""
+    later = [
+        a for a in artifacts if a.kind is ArtifactKind.HUMAN_DECISION and a.id > adr.id
+    ]
+    if not later:
+        return None
+    if later[0].body.get("decision") != "approve":
+        return []
+    body = adr.body["adr"]
+    text = f"{body['title']}: {body['decision']} Consequences: {body['consequences']}"
+    return [
+        Lesson(
+            kind="Decision",
+            text=clip(text, MAX_TEXT),
+            source=artifact_source(adr),
+            modules=(),
+            origin="human",
+        )
     ]
 
 

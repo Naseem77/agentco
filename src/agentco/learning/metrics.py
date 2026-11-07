@@ -7,6 +7,7 @@ from agentco.roles import Role
 from agentco.store.models import ArtifactKind, AuditEntry, TaskRecord
 from agentco.store.task_store import TaskStore
 from agentco.workflow.states import BACK_TO_FIRST_FLOOR, TaskState
+from agentco.workflow.tree import ADR_SOURCE
 
 
 @dataclass(frozen=True)
@@ -27,6 +28,7 @@ class TaskMetrics:
     cost_usd: float
     duration_h: float | None
     recurrences: int
+    is_parent: bool = False
 
 
 @dataclass(frozen=True)
@@ -97,6 +99,7 @@ def _task_metrics(
         cost_usd=task.cost_usd,
         duration_h=_duration_h(audit),
         recurrences=sum(_count(a.body, "recurrences") for a in pr_reviews),
+        is_parent=any(c.source == ADR_SOURCE for c in store.children(task.id)),
     )
 
 
@@ -109,14 +112,16 @@ def _mean(values: list[int]) -> float:
 
 
 def _totals(tasks: list[TaskMetrics], prs: int) -> dict[str, float]:
-    merged = [t for t in tasks if t.state is TaskState.MERGED]
-    durations = [t.duration_h for t in tasks if t.duration_h is not None]
+    parents = [t for t in tasks if t.is_parent]
+    singles = [t for t in tasks if not t.is_parent]
+    merged = [t for t in singles if t.state is TaskState.MERGED]
+    durations = [t.duration_h for t in singles if t.duration_h is not None]
     return {
         "tasks": float(len(tasks)),
         "merged": float(len(merged)),
         "cancelled": float(sum(t.state is TaskState.CANCELLED for t in tasks)),
-        "avg_rounds": _mean([t.rounds for t in tasks]),
-        "avg_pr_rounds": _mean([t.pr_rounds for t in tasks]),
+        "avg_rounds": _mean([t.rounds for t in singles]),
+        "avg_pr_rounds": _mean([t.pr_rounds for t in singles]),
         "pr_comments_per_pr": sum(t.pr_findings for t in tasks) / prs if prs else 0.0,
         "escaped_real_bugs": float(sum(t.pr_real for t in tasks)),
         "fix_round_findings": float(sum(t.fix_round_findings for t in tasks)),
@@ -130,6 +135,8 @@ def _totals(tasks: list[TaskMetrics], prs: int) -> dict[str, float]:
             else 0.0
         ),
         "recurrences": float(sum(t.recurrences for t in tasks)),
+        "trees": float(len(parents)),
+        "trees_done": float(sum(t.state is TaskState.MERGED for t in parents)),
     }
 
 

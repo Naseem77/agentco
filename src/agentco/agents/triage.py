@@ -74,7 +74,10 @@ async def run_triage(
     issue: PMReply,
     *,
     human_ok: bool = False,
+    allow_architect: bool = False,
+    known_ok: bool = False,
 ) -> TriageDecision:
+    """`known_ok` skips only the unknown-area check; `human_ok` also allows a new design."""
     call = AgentCall(
         role=Role.TRIAGE,
         model=role_model(cfg, Role.TRIAGE).model,
@@ -88,23 +91,28 @@ async def run_triage(
     route = Role.JUNIOR if reply.route == "junior" else Role.SENIOR
     reason = reply.reason
     escalate: str | None = None
+    architect = reply.route == "new_design" and allow_architect
 
-    query = f"{issue.summary} {' '.join(issue.acceptance_criteria)}"
-    facts = await gate.for_role(Role.TRIAGE).search(query, [Scope.RND])
-    if len(facts) < cfg.thresholds.known_min_facts and not human_ok:
-        escalate = "new"
-        reason = (
-            f"unknown area: {len(facts)} rnd facts, "
-            f"need {cfg.thresholds.known_min_facts}; a human decides first"
-        )
-    elif reply.route == "new_design" and not human_ok:
-        escalate = "new"
-        reason = (
-            "new design needs the Architect (Plan 5); "
-            f"a human decides for now. Triage: {reply.reason}"
-        )
+    if architect:
+        # the ADR is itself the "new" escalation: a human approves it before any work
+        route = Role.ARCHITECT
+    else:
+        query = f"{issue.summary} {' '.join(issue.acceptance_criteria)}"
+        facts = await gate.for_role(Role.TRIAGE).search(query, [Scope.RND])
+        if len(facts) < cfg.thresholds.known_min_facts and not (human_ok or known_ok):
+            escalate = "new"
+            reason = (
+                f"unknown area: {len(facts)} rnd facts, "
+                f"need {cfg.thresholds.known_min_facts}; a human decides first"
+            )
+        elif reply.route == "new_design" and not human_ok:
+            escalate = "new"
+            reason = (
+                "a new design inside a sub-task or PR round; "
+                f"a human decides. Triage: {reply.reason}"
+            )
 
-    repeated = _repeat_paths(store, task.id)
+    repeated = [] if architect else _repeat_paths(store, task.id)
     require_invariant = bool(repeated)
     if repeated:
         route = Role.SENIOR

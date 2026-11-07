@@ -1281,8 +1281,8 @@ def test_inbox_lists_escalations(env, repo):
 
     assert result.exit_code == 0
     assert result.stdout.splitlines() == [
-        "id\ttitle\tcategory\tfrom_state\treason\toptions\tcost",
-        "1\tFix add\tstuck\tengineering\tbudget\tadd budget; reject\t$8.00",
+        "id\ttitle\tcategory\tfrom_state\treason\toptions\tcost\tparent",
+        "1\tFix add\tstuck\tengineering\tbudget\tadd budget; reject\t$8.00\t",
     ]
 
 
@@ -2216,3 +2216,112 @@ def test_task_run_without_setup_passes_no_pool(env, repo, monkeypatch):
     _over_budget(env)
     _run_task(env, repo, str(_new_task(env)))
     assert seen == [None]
+
+
+ADR_BODY = {
+    "adr": {
+        "title": "Plugin registry",
+        "context": "ctx",
+        "decision": "Use a registry.",
+        "consequences": "One more module.",
+        "alternatives": [],
+        "new_dependencies": [],
+        "sub_tasks": [
+            {"title": "step 0", "acceptance_criteria": ["works"], "size": "s"}
+        ],
+    },
+    "human_note": "",
+}
+_TO_PR = (
+    TaskState.PM,
+    TaskState.TRIAGE,
+    TaskState.ENGINEERING,
+    TaskState.PREFLIGHT,
+    TaskState.INTERNAL_REVIEW,
+    TaskState.LEAD_DECISION,
+    TaskState.PR_OPEN,
+)
+
+
+def _parent_with_children(env, *child_states):
+    """A parent waiting on ADR children, each moved to the given state."""
+    store = env.store
+    store.create_all()
+    parent = store.create_task("acme", "Big feature", "cli")
+    adr = store.put_artifact(parent.id, ArtifactKind.ADR, Role.ARCHITECT, ADR_BODY)
+    store.set_meta(f"task:{parent.id}:adr", str(adr.id))
+    for step in (TaskState.PM, TaskState.TRIAGE, TaskState.ARCHITECT):
+        store.transition(parent.id, step, Role.LEAD, "t")
+    store.transition(parent.id, TaskState.AWAITING_HUMAN, Role.LEAD, "t")
+    store.transition(parent.id, TaskState.WAITING_CHILDREN, Role.HUMAN, "t")
+    kids = []
+    for i, state in enumerate(child_states):
+        kid = store.create_task(
+            "acme", f"sub {i}", "adr", f"tree:{parent.id}:{adr.id}:{i}", parent.id
+        )
+        if state is TaskState.CANCELLED:
+            store.transition(kid.id, TaskState.CANCELLED, Role.HUMAN, "t")
+        elif state is not TaskState.INTAKE:
+            for step in _TO_PR[: _TO_PR.index(TaskState.PR_OPEN) + 1]:
+                store.transition(kid.id, step, Role.LEAD, "t")
+                if step is state:
+                    break
+            if state is TaskState.MERGED:
+                store.transition(kid.id, TaskState.MERGED, Role.HUMAN, "t")
+        kids.append(kid.id)
+    return parent.id, kids
+
+
+def test_run_all_picks_up_waiting_parent(env, repo):
+    parent, _ = _parent_with_children(env, TaskState.MERGED, TaskState.CANCELLED)
+
+    result = _run_task(env, repo, "--all")
+
+    assert result.exit_code == 0
+    assert f"task {parent}: awaiting_human" in result.stdout
+    assert env.store.get(parent).state is TaskState.AWAITING_HUMAN
+
+
+def test_inbox_shows_parent_column(env):
+    parent, [child] = _parent_with_children(env, TaskState.INTAKE)
+    plain = _new_task(env, "Plain")
+    for task in (child, plain):
+        for step in (TaskState.PM, TaskState.TRIAGE, TaskState.AWAITING_HUMAN):
+            env.store.transition(task, step, Role.LEAD, "t")
+
+    lines = env("inbox").stdout.splitlines()
+
+    assert lines[0].endswith("\tparent")
+    rows = {row.split("\t")[0]: row.split("\t") for row in lines[1:]}
+    assert rows[str(child)][-1] == f"#{parent}"
+    assert rows[str(plain)][-1] == ""
+
+
+def test_adr_command_prints_markdown_and_exits_1_without_adr(env):
+    parent, _ = _parent_with_children(env)
+    plain = _new_task(env, "No design")
+
+    shown = env("adr", str(parent))
+    missing = env("adr", str(plain))
+
+    assert shown.exit_code == 0
+    assert shown.stdout.startswith("# ADR: Plugin registry\n")
+    assert "1. step 0 (s)" in shown.stdout
+    assert missing.exit_code == 1
+    assert "has no ADR" in missing.output
+
+
+def test_decide_reject_parent_cancels_open_children(env, repo):
+    parent, (done, running, open_pr) = _parent_with_children(
+        env, TaskState.MERGED, TaskState.ENGINEERING, TaskState.PR_OPEN
+    )
+    env.store.transition(parent, TaskState.AWAITING_HUMAN, Role.LEAD, "t")
+
+    result = env("decide", str(parent), "reject")
+
+    assert result.exit_code == 0
+    assert f"cancelled sub-tasks: #{running}" in result.stdout
+    assert env.store.get(parent).state is TaskState.CANCELLED
+    assert env.store.get(done).state is TaskState.MERGED
+    assert env.store.get(running).state is TaskState.CANCELLED
+    assert env.store.get(open_pr).state is TaskState.PR_OPEN

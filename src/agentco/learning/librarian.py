@@ -28,6 +28,7 @@ from agentco.learning.lessons import (
     artifact_source,
     bump_overrides,
     clip,
+    lessons_from_adr,
     lessons_from_lead,
     lessons_from_pr_review,
     lessons_from_qa,
@@ -47,6 +48,7 @@ LEARNED_KINDS = frozenset(
         ArtifactKind.QA,
         ArtifactKind.PR_REVIEW,
         ArtifactKind.HUMAN_DECISION,
+        ArtifactKind.ADR,
     }
 )
 NO_MODEL = "no model for librarian"
@@ -206,11 +208,13 @@ class Librarian:
 
     def _deterministic_lessons(
         self, a: Artifact, artifacts: list[Artifact]
-    ) -> list[Lesson]:
+    ) -> list[Lesson] | None:
         try:
             if a.kind is ArtifactKind.LEAD:
                 engineer = _before(artifacts, ArtifactKind.ENGINEER, a.id)
                 return lessons_from_lead(a, _modules(engineer))
+            if a.kind is ArtifactKind.ADR:
+                return lessons_from_adr(a, artifacts)
             if a.kind is ArtifactKind.QA:
                 return lessons_from_qa(a)
             qa = _before(artifacts, ArtifactKind.QA, a.id)

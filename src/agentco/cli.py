@@ -24,6 +24,7 @@ from graphiti_core.llm_client.errors import (
     RefusalError,
 )
 
+from agentco.agents.architect import ADRReply, adr_markdown
 from agentco.code.falkor_graph import build_falkor_code_graph
 from agentco.code.graph import CodeGraphBackend, code_graph_for
 from agentco.code.indexer import NotAGitRepo, index_repo, repo_root
@@ -57,6 +58,7 @@ from agentco.webhook import IntakeTrigger, make_server
 from agentco.workflow.orchestrator import StepFailed, TaskContext, run_many
 from agentco.workflow.preflight import RestoreError
 from agentco.workflow.states import TaskState
+from agentco.workflow.tree import ADR_SOURCE, cancel_open_children
 
 # Seam: CLI tests replace this with an in-memory backend.
 make_backend: Callable[[TenantConfig], MemoryBackend] = build_graphiti_backend
@@ -384,6 +386,7 @@ _RUNNABLE = (
     TaskState.PREFLIGHT,
     TaskState.INTERNAL_REVIEW,
     TaskState.LEAD_DECISION,
+    TaskState.WAITING_CHILDREN,
 )
 
 
@@ -794,7 +797,7 @@ def inbox(config: Path = ConfigOption) -> None:
     if not waiting:
         typer.echo("nothing is waiting for a human")
         return
-    typer.echo("id\ttitle\tcategory\tfrom_state\treason\toptions\tcost")
+    typer.echo("id\ttitle\tcategory\tfrom_state\treason\toptions\tcost\tparent")
     for task in waiting:
         body = _escalation_of(store, task.id)
         fields = [
@@ -805,8 +808,22 @@ def inbox(config: Path = ConfigOption) -> None:
             str(body.get("reason", "")),
             "; ".join(str(o) for o in body.get("options", [])),
             f"${task.cost_usd:.2f}",
+            f"#{task.parent_id}" if task.parent_id else "",
         ]
         typer.echo("\t".join(_one_line(f) for f in fields))
+
+
+@app.command()
+def adr(task_id: int, config: Path = ConfigOption) -> None:
+    """Print the task's latest architecture decision record."""
+    cfg = _load(config)
+    store = TaskStore(cfg.database_url)
+    store.create_all()
+    _task_of(store, cfg, task_id)
+    latest = store.latest_artifact(task_id, ArtifactKind.ADR)
+    if latest is None:
+        raise _fail(f"task {task_id} has no ADR")
+    typer.echo(adr_markdown(ADRReply.model_validate(latest.body["adr"])), nl=False)
 
 
 def _decision_text(task: TaskRecord, decision: Decision, note: str, body: dict) -> str:
@@ -865,6 +882,10 @@ def decide(
             task_id, TaskState.CANCELLED, Role.HUMAN, "rejected by a human"
         )
         typer.echo(f"task {task_id}: cancelled")
+        if any(c.source == ADR_SOURCE for c in store.children(task_id)):
+            ids = cancel_open_children(store, task_id, Role.HUMAN, "parent rejected")
+            if ids:
+                typer.echo("cancelled sub-tasks: " + ", ".join(f"#{i}" for i in ids))
         _learn_after_decision(cfg, store, task_id)
         return
     if add_budget is not None:

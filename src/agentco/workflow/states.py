@@ -13,6 +13,7 @@ class TaskState(StrEnum):
     INTERNAL_REVIEW = "internal_review"
     LEAD_DECISION = "lead_decision"
     AWAITING_HUMAN = "awaiting_human"
+    WAITING_CHILDREN = "waiting_children"
     PR_OPEN = "pr_open"
     MERGED = "merged"
     CANCELLED = "cancelled"
@@ -36,7 +37,16 @@ _EDGES: dict[TaskState, set[TaskState]] = {
     _S.LEAD_DECISION: {_S.TRIAGE, _S.AWAITING_HUMAN, _S.PR_OPEN},
     _S.PR_OPEN: {_S.TRIAGE, _S.AWAITING_HUMAN, _S.MERGED},
     # A human may merge on GitHub while agentco waits on them.
-    _S.AWAITING_HUMAN: {_S.TRIAGE, _S.ENGINEERING, _S.PR_OPEN, _S.MERGED},
+    _S.AWAITING_HUMAN: {
+        _S.TRIAGE,
+        _S.ENGINEERING,
+        _S.ARCHITECT,
+        _S.PR_OPEN,
+        _S.WAITING_CHILDREN,
+        _S.MERGED,
+    },
+    # A parent waits for its sub-tasks; the lead approves the whole, or a human decides.
+    _S.WAITING_CHILDREN: {_S.MERGED, _S.AWAITING_HUMAN},
     _S.MERGED: set(),
     _S.CANCELLED: set(),
 }

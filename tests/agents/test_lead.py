@@ -7,6 +7,7 @@ import pytest
 from agentco.agents.checks import CheckOutcome
 from agentco.agents.engineer import EngineerReply, FollowUp
 from agentco.agents.lead import (
+    ChildSummary,
     Classified,
     LeadDecision,
     LeadReply,
@@ -14,6 +15,7 @@ from agentco.agents.lead import (
     decide,
     diff_paths,
     new_hits,
+    review_parent,
     run_lead,
 )
 from agentco.agents.prompts import load_prompt
@@ -694,3 +696,85 @@ def test_prompts_mention_playbooks_and_one_rule():
     assert "one rule" in load_prompt(Role.SENIOR).lower()
     assert "invariant" in load_prompt(Role.LEAD)
     assert "handled by code" in load_prompt(Role.TRIAGE)
+
+
+def parent_reply(**kw):
+    return json.dumps(
+        {"approve": True, "confidence": 0.9, "reason": "covered", "summary": "done"}
+        | kw
+    )
+
+
+def _adr():
+    from agentco.agents.architect import ADRReply
+
+    return ADRReply.model_validate(
+        {
+            "title": "Plugin registry",
+            "context": "c",
+            "decision": "d",
+            "consequences": "q",
+            "sub_tasks": [
+                {"title": "step 0", "acceptance_criteria": ["works"], "size": "s"}
+            ],
+        }
+    )
+
+
+CHILDREN = [
+    ChildSummary(2, "step 0", "merged", "https://x/pull/9", "adds the registry")
+]
+
+
+async def _review_parent(store, loop_cfg, reply, *, repeat=1, **kwargs):
+    runtime = FakeRuntime({Role.LEAD: [reply] * repeat})
+    task = store.create_task("acme", "tree", "cli")
+    store.put_artifact(task.id, ArtifactKind.ISSUE, Role.PM, ISSUE.model_dump())
+    asker = Asker(runtime, store, task.id, loop_cfg.price_per_request_usd)
+    gate = MemoryGate("acme", InMemoryBackend())
+    out = await review_parent(
+        asker, loop_cfg, gate, store, task, adr=_adr(), children=CHILDREN, **kwargs
+    )
+    return runtime, task, out
+
+
+async def test_review_parent_stores_lead_artifact_in_plan4_shape(store, loop_cfg):
+    runtime, task, reply = await _review_parent(store, loop_cfg, parent_reply())
+
+    assert reply.approve and reply.confidence == 0.9
+    [call] = runtime.calls
+    assert call.role is Role.LEAD and call.model == "m-lead" and call.edits is False
+    assert call.system.startswith(load_prompt(Role.LEAD, "parent"))
+    assert "# ADR: Plugin registry" in call.prompt
+    assert "Parser must accept tabs" in call.prompt
+    assert "#2 step 0 [merged] https://x/pull/9" in call.prompt
+    assert "lead summary: adds the registry" in call.prompt
+    [lead] = store.artifacts(task.id, ArtifactKind.LEAD)
+    assert lead.body["source"] == "parent"
+    assert lead.body["outcome"] == "approve" and lead.body["category"] == ""
+    assert {"findings_to_fix", "follow_ups", "comments", "options"} <= set(lead.body)
+
+
+async def test_review_parent_low_confidence_or_no_approve_escalates(store, loop_cfg):
+    _, task, _ = await _review_parent(
+        store, loop_cfg, parent_reply(confidence=0.2, reason="unsure")
+    )
+    [lead] = store.artifacts(task.id, ArtifactKind.LEAD)
+    assert (lead.body["outcome"], lead.body["category"]) == ("escalate", "tradeoff")
+    assert lead.body["reason"] == "unsure"
+
+    _, task, _ = await _review_parent(store, loop_cfg, parent_reply(approve=False))
+    [lead] = store.artifacts(task.id, ArtifactKind.LEAD)
+    assert lead.body["outcome"] == "escalate"
+
+
+async def test_review_parent_human_note_in_prompt(store, loop_cfg):
+    runtime, _, _ = await _review_parent(
+        store, loop_cfg, parent_reply(), human_note="criterion 2 is out of scope"
+    )
+    assert "Human guidance:\ncriterion 2 is out of scope" in runtime.calls[0].prompt
+
+
+async def test_review_parent_rejects_out_of_range_confidence(store, loop_cfg):
+    with pytest.raises(ReplyInvalid):
+        await _review_parent(store, loop_cfg, parent_reply(confidence=1.5), repeat=2)

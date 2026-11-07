@@ -56,6 +56,7 @@ class ArtifactKind(StrEnum):
     PR = "pr"
     PR_FEEDBACK = "pr_feedback"
     PR_REVIEW = "pr_review"
+    ADR = "adr"
 
 
 class TaskRow(Base):
