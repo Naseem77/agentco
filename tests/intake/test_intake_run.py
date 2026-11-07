@@ -9,6 +9,7 @@ from agentco.github.errors import GitHubError
 from agentco.github.models import GhCheckRun, GhPull, GhReviewComment, GhUser
 from agentco.intake.findings import PRFinding
 from agentco.intake.run import IntakeReport, run_intake
+from agentco.learning.recurrence import area_recurrences
 from agentco.llm.fake import FakeRuntime
 from agentco.memory.backend import InMemoryBackend
 from agentco.memory.gate import MemoryGate
@@ -786,3 +787,28 @@ async def test_lease_released_after_error(env, monkeypatch):
     with pytest.raises(RuntimeError):
         await env.run()
     assert env.store.try_lease("intake:acme:acme/app", "next", 60)
+
+
+async def test_pr_recurrence_recorded_once(store, loop_cfg):
+    env = with_lead(store, loop_cfg, lead_json(("c1", "real_bug")))
+    path = "src/calc/add.py"
+    env.gh.add_comment(C(1, "alice", "MEMBER", "crash on empty list", path=path))
+    await env.run()
+    assert area_recurrences(store, "acme", ["src/calc"]) == {"src/calc": 0}
+    reopen(store, env.tid)
+
+    # the same complaint on the same file again: the fix did not hold
+    again = BASE + timedelta(hours=3)
+    env.gh.add_comment(
+        C(2, "alice", "MEMBER", "crash on empty list", path=path, at=again)
+    )
+    await env.run(now=T2)
+    review = env.kinds(ArtifactKind.PR_REVIEW)[-1]
+    assert review.body["recurrences"] != []
+    assert area_recurrences(store, "acme", ["src/calc"]) == {"src/calc": 1}
+
+    await env.run(now=T2 + timedelta(hours=1))
+    assert area_recurrences(store, "acme", ["src/calc"]) == {"src/calc": 1}
+    assert [k for k in store.meta_with_prefix("recur:acme:src/calc:")] == [
+        f"recur:acme:src/calc:{env.tid}:pr-review-{review.id}"
+    ]

@@ -126,11 +126,19 @@ def test_intake_override(tmp_path):
         {"thresholds": {"lead_min_confidence": 1.1}},
         {"thresholds": {"lead_min_confidence": -0.1}},
         {"thresholds": {"bogus": 1}},
+        {"thresholds": {"root_cause_after": 0}},
     ],
 )
 def test_loop_invalid(tmp_path, extra):
     with pytest.raises(ConfigError):
         load_config(write(tmp_path, yaml.safe_dump(BASE | extra)))
+
+
+def test_root_cause_after_default_and_validation(tmp_path):
+    assert load_config(write(tmp_path, EXAMPLE)).thresholds.root_cause_after == 2
+    raw = BASE | {"thresholds": {"root_cause_after": 3}}
+    cfg = load_config(write(tmp_path, yaml.safe_dump(raw)))
+    assert cfg.thresholds.root_cause_after == 3
 
 
 def test_budgets_default_when_omitted(tmp_path):

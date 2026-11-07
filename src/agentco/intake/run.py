@@ -28,6 +28,7 @@ from agentco.intake.findings import (
     collect_findings,
     tracked_pulls,
 )
+from agentco.learning.recurrence import record_recurrence
 from agentco.llm.replies import AgentStuck, Asker, ReplyInvalid
 from agentco.llm.runtime import AgentRuntime
 from agentco.memory.gate import MemoryGate
@@ -169,6 +170,20 @@ def _store_send_back(store: TaskStore, task_id: int, review: Artifact) -> None:
         "pr_review": review.id,
     }
     store.put_artifact(task_id, ArtifactKind.LEAD, Role.LEAD, body)
+
+
+def _recurring_paths(review: Artifact) -> list[str]:
+    """Paths of the findings that came back after being reported as real bugs."""
+    recurring = set(review.body.get("recurrences") or [])
+    fingerprints = {
+        c["finding_id"]: c.get("fingerprint")
+        for c in review.body.get("classifications", [])
+    }
+    return [
+        f["path"]
+        for f in review.body["decision"]["findings_to_fix"]
+        if f.get("path") and fingerprints.get(f["id"]) in recurring
+    ]
 
 
 def _move_to_triage(store: TaskStore, task_id: int) -> None:
@@ -362,6 +377,13 @@ class _Intake:
                     parent_id=task.id,
                 )
                 self.store.set_meta(marker, str(created.id))
+        record_recurrence(
+            self.store,
+            task.tenant,
+            task.id,
+            _recurring_paths(review),
+            f"pr-review-{review.id}",
+        )
         if self.store.get(task.id).state is _S.PR_OPEN:
             _move_to_triage(self.store, task.id)
         task = self.store.get(task.id)
