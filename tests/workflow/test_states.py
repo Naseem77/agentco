@@ -42,3 +42,13 @@ def test_back_to_first_floor_edges_are_allowed():
 
 def test_awaiting_human_can_be_merged():
     assert TaskState.MERGED in ALLOWED_TRANSITIONS[TaskState.AWAITING_HUMAN]
+
+
+def test_waiting_children_edges():
+    assert TaskState.WAITING_CHILDREN in ALLOWED_TRANSITIONS[TaskState.AWAITING_HUMAN]
+    assert {
+        TaskState.MERGED,
+        TaskState.AWAITING_HUMAN,
+        TaskState.CANCELLED,
+    } == ALLOWED_TRANSITIONS[TaskState.WAITING_CHILDREN]
+    assert TaskState.ARCHITECT in ALLOWED_TRANSITIONS[TaskState.AWAITING_HUMAN]
