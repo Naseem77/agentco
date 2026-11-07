@@ -20,6 +20,7 @@ from agentco.github.errors import GitHubError
 from agentco.github.models import GhUser
 from agentco.importer.episodes import module_of, review_item, review_threads
 from agentco.importer.locate import linkable
+from agentco.learning.followup import create_qa_followup
 from agentco.learning.lessons import (
     MAX_TEXT,
     Lesson,
@@ -339,7 +340,7 @@ class Librarian:
         self.store.set_meta(key, "done")
 
     async def _create_qa_followup(self, task: TaskRecord) -> None:
-        """Hook for a merged task's QA regression follow-up; Task 9 fills it in."""
+        await asyncio.to_thread(create_qa_followup, self.store, task)
 
     async def _learn_review_threads(
         self, prs: list[Artifact], report: LearnReport

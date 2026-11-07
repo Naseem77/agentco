@@ -35,6 +35,7 @@ class EngineerBrief:
     human_note: str = ""
     untrusted_finding_ids: frozenset[str] = frozenset()
     """Findings quoted from PR comments or checks: rendered as fenced data."""
+    tests_precommitted: bool = False
 
 
 class FollowUp(BaseModel):
@@ -131,6 +132,13 @@ async def _invariant_only_retry(
     return bool(await asyncio.to_thread(changed_files, wt, wt.base))
 
 
+async def _tests_precommitted(wt: Worktree, brief: EngineerBrief) -> bool:
+    # The orchestrator already committed tests the engineer may find need no change.
+    return brief.tests_precommitted and bool(
+        await asyncio.to_thread(changed_files, wt, wt.base)
+    )
+
+
 async def run_engineer(
     asker: Asker,
     cfg: TenantConfig,
@@ -169,7 +177,10 @@ async def run_engineer(
     sha = await asyncio.to_thread(
         commit_all, wt, f"agentco: task {task.id} round {brief.round}"
     )
-    if sha is None and not await _invariant_only_retry(wt, brief, reply):
+    if sha is None and not (
+        await _invariant_only_retry(wt, brief, reply)
+        or await _tests_precommitted(wt, brief)
+    ):
         raise EngineerFailed("engineer made no changes")
     if brief.require_invariant and not reply.invariant.strip():
         raise EngineerFailed("no invariant stated")

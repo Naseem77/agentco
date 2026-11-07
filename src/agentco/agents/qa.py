@@ -6,11 +6,13 @@ from pathlib import Path
 from typing import Literal
 
 from pydantic import BaseModel, Field
+from pydantic.json_schema import SkipJsonSchema
 
 from agentco.agents.models import role_model
 from agentco.agents.prompts import load_prompt
 from agentco.agents.replies import PMReply, issue_text
 from agentco.config import TenantConfig
+from agentco.learning.followup import collect_test_sources
 from agentco.llm.replies import Asker, Reply
 from agentco.llm.runtime import AgentCall
 from agentco.llm.tools import memory_tools
@@ -46,6 +48,8 @@ class QAReply(Reply):
     failures: list[QAFailure] = Field(default_factory=list)
     regression_of_escaped_bug: bool = False
     new_tests: list[str] = Field(default_factory=list)
+    # Filled by run_qa from the snapshot; never taken from the model.
+    new_test_sources: SkipJsonSchema[dict[str, str]] = Field(default_factory=dict)
 
 
 def qa_input(issue: PMReply, neighbour_cases: list[str]) -> str:
@@ -160,6 +164,10 @@ async def run_qa(
                     "failures": [*failures, *reply.failures],
                 }
             )
+        sources = await asyncio.to_thread(
+            collect_test_sources, snapshot_path, reply.new_tests
+        )
+        reply = reply.model_copy(update={"new_test_sources": sources})
         return reply
     finally:
         shutil.rmtree(snapshot_path, ignore_errors=True)

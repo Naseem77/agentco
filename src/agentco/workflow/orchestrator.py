@@ -34,6 +34,7 @@ from agentco.config import Budgets, TenantConfig
 from agentco.github.client import GitHubWriter
 from agentco.github.errors import GitHubError
 from agentco.github.models import PullRef
+from agentco.learning.followup import FOLLOWUP_SOURCE, write_test_files
 from agentco.llm.replies import AgentStuck, Asker, ReplyInvalid
 from agentco.llm.runtime import AgentRuntime
 from agentco.memory.gate import MemoryGate
@@ -44,6 +45,7 @@ from agentco.sandbox.worktree import (
     GitError,
     Worktree,
     changed_lines,
+    commit_all,
     count_commits,
     create_worktree,
     diff,
@@ -68,6 +70,7 @@ _MAX_STEPS = 500
 _BUDGET_OPTIONS = ["add budget", "reject"]
 _ROUND_OPTIONS = ["answer: one more round", "reject"]
 _NO_LEAD = "no lead decision to open a PR from"
+_NO_QA_TESTS = "the QA test files in the request are missing or unsafe"
 
 
 class StepFailed(RuntimeError):
@@ -449,6 +452,12 @@ class _Run:
             round=task.round,
             human_note=human_note,
             untrusted_finding_ids=untrusted,
+            tests_precommitted=(
+                task.source == FOLLOWUP_SOURCE
+                and task.round == 0
+                and not findings
+                and not failures
+            ),
         )
 
     async def _engineering(self, task: TaskRecord) -> None:
@@ -456,6 +465,8 @@ class _Run:
             return
         wt = await self._worktree()
         role = task.assignee or Role.JUNIOR
+        if not await self._seed_qa_tests(task, wt, role):
+            return
         brief = self._brief(task)
         try:
             await run_engineer(
@@ -478,6 +489,24 @@ class _Run:
             return
         self._go(_S.PREFLIGHT, role, "engineer committed")
 
+    async def _seed_qa_tests(self, task: TaskRecord, wt: Worktree, role: Role) -> bool:
+        """Commit QA's tests into the follow-up task's branch, once, before the engineer."""
+        if (
+            task.source != FOLLOWUP_SOURCE
+            or task.round != 0
+            or self._meta("qa-tests") is not None
+        ):
+            return True
+        request = self._latest(ArtifactKind.REQUEST)
+        sources = request.body.get("test_files") if request else None
+        written = await asyncio.to_thread(write_test_files, wt.path, sources)
+        if not written:
+            await self._escalate("stuck", _NO_QA_TESTS, actor=role)
+            return False
+        await asyncio.to_thread(commit_all, wt, "agentco: QA regression tests")
+        self._set("qa-tests", "done")
+        return True
+
     async def _run_preflight(
         self,
         wt: Worktree,
@@ -495,6 +524,7 @@ class _Run:
                 final=final,
                 lead_comments=lead_comments,
                 no_test_reason=self._no_test_reason(),
+                test_only=self.task().source == FOLLOWUP_SOURCE,
             )
         except (ReplyInvalid, AgentStuck) as exc:
             failed = CheckResult(

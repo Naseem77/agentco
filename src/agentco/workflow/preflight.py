@@ -171,6 +171,7 @@ class Preflight:
         final: bool,
         lead_comments: list[str],
         no_test_reason: str = "",
+        test_only: bool = False,
     ) -> PreflightReport:
         if not await asyncio.to_thread(rebase_onto, wt, base):
             return _report(
@@ -193,7 +194,14 @@ class Preflight:
 
         try:
             return await self._gate(
-                wt, base, checks, fix_since, final, lead_comments, no_test_reason
+                wt,
+                base,
+                checks,
+                fix_since,
+                final,
+                lead_comments,
+                no_test_reason,
+                test_only,
             )
         finally:
             # the tree was clean, so this only removes what the commands wrote
@@ -208,6 +216,7 @@ class Preflight:
         final: bool,
         lead_comments: list[str],
         no_test_reason: str,
+        test_only: bool,
     ) -> PreflightReport:
         if fix_since is not None:
             lines = await asyncio.to_thread(changed_lines, wt, fix_since)
@@ -240,7 +249,7 @@ class Preflight:
             affected = await affected_tests(self.repo, wt, base)
             command = test_command(self.contract, affected)
         checks.append(await self._command("tests", command, wt))
-        checks.append(await self._red(wt, base, no_test_reason))
+        checks.append(await self._red(wt, base, no_test_reason, test_only))
         if final and self.contract.e2e:
             checks.append(await self._command("e2e", self.contract.e2e, wt))
         return _report(checks)
@@ -287,8 +296,14 @@ class Preflight:
             return CheckResult("rules", False, "\n".join(reply.violations))
         return CheckResult("rules", True, f"checked {len(rules)} rule(s)")
 
-    async def _red(self, wt: Worktree, base: str, no_test_reason: str) -> CheckResult:
+    async def _red(
+        self, wt: Worktree, base: str, no_test_reason: str, test_only: bool
+    ) -> CheckResult:
         files = await asyncio.to_thread(changed_files, wt, base)
+        if test_only and files and all(is_test_path(p) for p in files):
+            return CheckResult(
+                "red", True, "test-only change: regression tests for a merged fix"
+            )
         tests = [p for p in files if is_test_path(p) and (wt.path / p).is_file()]
         if not tests:
             if no_test_reason:
