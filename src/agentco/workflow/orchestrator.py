@@ -420,6 +420,9 @@ class _Run:
     # -- states ----------------------------------------------------------
 
     async def _intake(self, task: TaskRecord) -> None:
+        if task.source == ADR_SOURCE and self._latest(ArtifactKind.REQUEST) is None:
+            # a crashed spawn: the parent's next run writes the request
+            raise StepFailed(_S.INTAKE, "sub-task has no request yet; run its parent")
         self._go(_S.PM, Role.PM, "intake")
 
     async def _pm(self, task: TaskRecord) -> None:

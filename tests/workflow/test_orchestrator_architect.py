@@ -4,7 +4,7 @@ from orch_helpers import PM_JSON, adr_json, happy, triage_json
 from agentco.roles import Role
 from agentco.store.models import ArtifactKind
 from agentco.store.task_store import TaskStore
-from agentco.workflow.orchestrator import Orchestrator
+from agentco.workflow.orchestrator import Orchestrator, StepFailed
 from agentco.workflow.states import TaskState
 from agentco.workflow.tree import ADR_SOURCE, adr_children
 
@@ -238,3 +238,16 @@ async def test_task_with_an_existing_worktree_never_becomes_an_adr_parent(make_r
     assert task.state is TaskState.AWAITING_HUMAN
     assert rig.calls(Role.ARCHITECT) == []
     assert rig.escalations()[-1]["from_state"] == "triage"
+
+
+async def test_child_without_its_request_is_not_run_on_its_title_alone(make_rig):
+    rig = await make_rig(happy(), seed=False)
+    child = rig.store.create_task(  # the spawn crashed before writing the REQUEST
+        "acme", "sub", ADR_SOURCE, source_ref="task:1:adr:1:0", parent_id=rig.task_id
+    )
+
+    with pytest.raises(StepFailed, match="no request"):
+        await Orchestrator(rig.ctx).run(child.id)
+
+    assert rig.calls(Role.PM) == []
+    assert rig.store.get(child.id).state is TaskState.INTAKE
