@@ -1,0 +1,528 @@
+import json
+from dataclasses import asdict
+from datetime import UTC, datetime
+
+import pytest
+
+from agentco.agents.checks import CheckOutcome
+from agentco.agents.engineer import EngineerReply, FollowUp
+from agentco.agents.lead import (
+    Classified,
+    LeadDecision,
+    LeadReply,
+    critical_hits,
+    decide,
+    new_hits,
+    run_lead,
+)
+from agentco.agents.prompts import load_prompt
+from agentco.agents.qa import QAFailure, QAReply
+from agentco.agents.replies import Finding, PMReply
+from agentco.agents.review import ReviewReply
+from agentco.llm.fake import FakeRuntime
+from agentco.llm.replies import Asker
+from agentco.memory.backend import InMemoryBackend, MemoryItem
+from agentco.memory.gate import MemoryGate
+from agentco.memory.scopes import Scope, graph_name
+from agentco.roles import Role
+from agentco.store.models import ArtifactKind
+from agentco.workflow.preflight import CheckResult, PreflightReport
+
+ISSUE = PMReply(
+    summary="Parser must accept tabs",
+    why="Users paste tab-separated data",
+    acceptance_criteria=["Given a tab, when parsed, then no error"],
+)
+QA_OK = QAReply(
+    passed=True, bug_class="tabs", tests_run=["pytest"], neighbour_matrix=[]
+)
+QA_FAIL = QAReply(
+    passed=False,
+    bug_class="tabs",
+    tests_run=["pytest"],
+    neighbour_matrix=[],
+    failures=[
+        QAFailure(
+            title="tests failed", steps="pytest -q", expected="exit 0", actual="exit 1"
+        )
+    ],
+)
+ENGINEER = EngineerReply(
+    summary="Accept tabs",
+    files_touched=["src/calc.py"],
+    tests_added=["tests/test_calc.py"],
+    invariant="tabs are whitespace",
+    follow_ups=[FollowUp(title="later", why="y")],
+)
+PREFLIGHT = PreflightReport(
+    ok=True, checks=(CheckResult("size", True, "12 lines"),), conflict=False
+)
+DIFF = (
+    "diff --git a/src/calc.py b/src/calc.py\n--- a/src/calc.py\n+++ b/src/calc.py\n"
+    "@@ -1 +1 @@\n-x = 1\n+x = 2\n"
+)
+
+
+def F(i, kind="bug", sev="major", path=""):
+    return Finding(id=i, severity=sev, kind=kind, path=path, title=i, detail="d")
+
+
+def L(*cls, conf=0.9, **extra):
+    return LeadReply(
+        confidence=conf,
+        classifications=[Classified(finding_id=i, category=c, note="") for i, c in cls],
+        summary="s",
+        **extra,
+    )
+
+
+def REVIEW(*findings):
+    return ReviewReply(findings=list(findings), summary="r")
+
+
+def ids(findings):
+    return [f.id for f in findings]
+
+
+def test_critical_beats_everything():
+    d = decide(
+        L(), REVIEW(), QA_OK, (), ["security: src/auth.py"], ["new dependency: x"], 0.7
+    )
+
+    assert (d.outcome, d.category) == ("escalate", "critical")
+    assert d.reason == "critical change: security: src/auth.py"
+
+
+def test_new_beats_send_back():
+    d = decide(
+        L(("a", "real_bug")),
+        REVIEW(F("a")),
+        QA_FAIL,
+        (),
+        [],
+        ["new dependency: x"],
+        0.7,
+    )
+
+    assert (d.outcome, d.category) == ("escalate", "new")
+    assert d.reason == "new or unknown: new dependency: x"
+
+
+def test_real_bug_sends_back_with_style_riding_along():
+    d = decide(
+        L(("a", "real_bug"), ("b", "covered_style")),
+        REVIEW(F("a"), F("b", "style", "nit")),
+        QA_OK,
+        (),
+        [],
+        [],
+        0.7,
+    )
+
+    assert (d.outcome, d.category) == ("send_back", "")
+    assert ids(d.findings_to_fix) == ["a", "b"]
+
+
+def test_send_back_carries_lead_comments_and_summary():
+    d = decide(
+        L(("a", "real_bug"), comments=["fix a only"]),
+        REVIEW(F("a")),
+        QA_OK,
+        (),
+        [],
+        [],
+        0.7,
+    )
+
+    assert (d.summary, d.comments) == ("s", ("fix a only",))
+
+
+def test_style_alone_approves():
+    d = decide(
+        L(("b", "covered_style")),
+        REVIEW(F("b", "style", "nit")),
+        QA_OK,
+        (),
+        [],
+        [],
+        0.7,
+    )
+
+    assert (d.outcome, d.category) == ("approve", "")
+    assert d.findings_to_fix == ()
+    assert d.summary == "s"
+
+
+def test_unclassified_finding_is_real_bug():
+    d = decide(L(), REVIEW(F("a")), QA_OK, (), [], [], 0.7)
+
+    assert d.outcome == "send_back"
+    assert ids(d.findings_to_fix) == ["a"]
+
+
+def test_missing_reply_counts_every_finding_as_real_bug():
+    d = decide(None, REVIEW(F("a")), QA_OK, (), [], [], 0.7)
+
+    assert d.outcome == "send_back"
+    assert ids(d.findings_to_fix) == ["a"]
+
+
+def test_edge_case_becomes_follow_up_not_blocker():
+    d = decide(
+        L(("e", "edge_case")),
+        REVIEW(F("e", "edge_case", "minor")),
+        QA_OK,
+        (),
+        [],
+        [],
+        0.7,
+    )
+
+    assert d.outcome == "approve"
+    assert ids(d.follow_ups) == ["e"]
+    assert d.findings_to_fix == ()
+
+
+def test_edge_case_alongside_real_bug_is_still_a_follow_up():
+    d = decide(
+        L(("a", "real_bug"), ("e", "edge_case")),
+        REVIEW(F("a"), F("e", "edge_case")),
+        QA_OK,
+        (),
+        [],
+        [],
+        0.7,
+    )
+
+    assert d.outcome == "send_back"
+    assert ids(d.findings_to_fix) == ["a"]
+    assert ids(d.follow_ups) == ["e"]
+
+
+def test_tradeoff_escalates_with_options():
+    d = decide(
+        L(("t", "tradeoff"), question="Which?", options=["A", "B"]),
+        REVIEW(F("t", "tradeoff")),
+        QA_OK,
+        (),
+        [],
+        [],
+        0.7,
+    )
+
+    assert (d.outcome, d.category) == ("escalate", "tradeoff")
+    assert (d.question, d.options) == ("Which?", ("A", "B"))
+
+
+def test_real_bug_beats_tradeoff():
+    d = decide(
+        L(("a", "real_bug"), ("t", "tradeoff")),
+        REVIEW(F("a"), F("t", "tradeoff")),
+        QA_OK,
+        (),
+        [],
+        [],
+        0.7,
+    )
+
+    assert d.outcome == "send_back"
+
+
+def test_low_confidence_escalates():
+    d = decide(L(conf=0.69), REVIEW(), QA_OK, (), [], [], 0.7)
+
+    assert (d.outcome, d.category) == ("escalate", "not_confident")
+    assert d.reason == "lead confidence 0.69 is below 0.7"
+
+
+def test_confidence_at_threshold_approves():
+    d = decide(L(conf=0.7), REVIEW(), QA_OK, (), [], [], 0.7)
+
+    assert d.outcome == "approve"
+
+
+def test_qa_failure_sends_back_with_its_failures_as_findings():
+    d = decide(L(), REVIEW(), QA_FAIL, (), [], [], 0.7)
+
+    assert d.outcome == "send_back"
+    assert d.reason == "QA failed"
+    assert d.findings_to_fix == (
+        Finding(
+            id="qa-1",
+            severity="major",
+            kind="bug",
+            title="tests failed",
+            detail="Steps: pytest -q\nExpected: exit 0\nActual: exit 1",
+        ),
+    )
+
+
+def test_check_error_sends_back():
+    d = decide(L(), None, QA_OK, ("qa: TimeoutError: slow",), [], [], 0.7)
+
+    assert d.outcome == "send_back"
+    assert d.reason == "check error: qa: TimeoutError: slow"
+    assert d.findings_to_fix == ()
+
+
+def test_missing_qa_without_error_does_not_block():
+    d = decide(L(), REVIEW(), None, (), [], [], 0.7)
+
+    assert d.outcome == "approve"
+
+
+@pytest.mark.parametrize(
+    "path,hit",
+    [
+        ("src/auth/login.py", "security: src/auth/login.py"),
+        ("db/migrations/001.sql", "data: db/migrations/001.sql"),
+        (".github/workflows/ci.yml", "infra: .github/workflows/ci.yml"),
+        ("src/billing.py", "money: src/billing.py"),
+        ("src/calc.py", None),
+        ("docs/.github/workflows/ci.yml", None),
+    ],
+)
+def test_critical_patterns(path, hit):
+    assert critical_hits([path], None) == ([hit] if hit else [])
+
+
+def test_escaped_bug_regression_is_critical():
+    qa = QA_OK.model_copy(update={"regression_of_escaped_bug": True})
+
+    assert critical_hits(["src/calc.py"], qa) == ["escaped-bug regression"]
+
+
+async def gate_with(*bodies: str) -> MemoryGate:
+    backend = InMemoryBackend()
+    for body in bodies:
+        await backend.add(
+            graph_name("acme", Scope.RND),
+            Scope.RND,
+            MemoryItem("n", body, "t", datetime.now(UTC)),
+        )
+    return MemoryGate("acme", backend)
+
+
+async def test_new_hits_lists_dependencies_and_paths_without_rnd_facts():
+    gate = await gate_with("src/calc.py holds the arithmetic helpers")
+
+    hits = await new_hits(
+        gate, ["src/calc.py", "src/fresh.py", "tests/test_fresh.py"], ["left-pad"]
+    )
+
+    assert hits == ["new dependency: left-pad", "unknown area: src/fresh.py"]
+
+
+async def test_new_hits_empty_for_known_paths():
+    gate = await gate_with("src/calc.py holds the arithmetic helpers")
+
+    assert await new_hits(gate, ["src/calc.py"], []) == []
+
+
+class Env:
+    def __init__(self, store, loop_cfg, replies, gate):
+        self.store = store
+        self.cfg = loop_cfg
+        self.runtime = FakeRuntime({Role.LEAD: replies})
+        self.task = store.create_task("acme", "tabs", "cli")
+        self.asker = Asker(
+            self.runtime, store, self.task.id, loop_cfg.price_per_request_usd
+        )
+        self.gate = gate
+
+    async def run(self, **overrides):
+        args = {
+            "issue": ISSUE,
+            "diff_text": DIFF,
+            "engineer": ENGINEER,
+            "preflight": PREFLIGHT,
+            "checks": CheckOutcome(REVIEW(), QA_OK, ()),
+            "changed_lines": 2,
+            "fast_lane": False,
+        }
+        args.update(overrides)
+        return await run_lead(
+            self.asker, self.cfg, self.gate, self.store, self.task, **args
+        )
+
+
+def lead_json(*cls, conf=0.9, **extra):
+    return json.dumps(
+        {
+            "confidence": conf,
+            "classifications": [
+                {"finding_id": i, "category": c, "note": "n"} for i, c in cls
+            ],
+            "summary": "ships tabs",
+            **extra,
+        }
+    )
+
+
+async def test_fast_lane_approves_without_llm(store, loop_cfg):
+    env = Env(store, loop_cfg, [], await gate_with("src/calc.py arithmetic"))
+
+    d = await env.run(
+        fast_lane=True,
+        checks=CheckOutcome(REVIEW(F("n", "style", "nit")), QA_OK, ()),
+    )
+
+    assert d == LeadDecision(
+        outcome="approve",
+        category="",
+        findings_to_fix=(),
+        follow_ups=(),
+        reason="fast lane: no critical or new changes, checks passed",
+        summary="fast lane: rule-based approval",
+        comments=(),
+        question="",
+        options=(),
+    )
+    assert env.runtime.calls == []
+    [artifact] = store.artifacts(env.task.id, ArtifactKind.LEAD)
+    assert artifact.role is Role.LEAD
+    assert artifact.body == json.loads(json.dumps(asdict(d)))
+
+
+@pytest.mark.parametrize(
+    "overrides",
+    [
+        {"changed_lines": 61},
+        {"checks": CheckOutcome(REVIEW(F("a", sev="minor")), QA_OK, ())},
+        {"checks": CheckOutcome(REVIEW(), QA_FAIL, ())},
+        {"checks": CheckOutcome(None, QA_OK, ("review: X: y",))},
+        {"diff_text": DIFF.replace("src/calc.py", "src/auth.py")},
+    ],
+)
+async def test_fast_lane_still_calls_llm_when_a_condition_fails(
+    store, loop_cfg, overrides
+):
+    env = Env(store, loop_cfg, [lead_json()], await gate_with("src/calc.py arithmetic"))
+
+    await env.run(fast_lane=True, **overrides)
+
+    assert len(env.runtime.calls) == 1
+
+
+async def test_fast_lane_with_new_dependency_calls_llm(store, loop_cfg):
+    env = Env(store, loop_cfg, [lead_json()], await gate_with("src/calc.py arithmetic"))
+    engineer = ENGINEER.model_copy(update={"new_dependencies": ["left-pad"]})
+
+    d = await env.run(fast_lane=True, engineer=engineer)
+
+    assert len(env.runtime.calls) == 1
+    assert (d.outcome, d.category) == ("escalate", "new")
+
+
+async def test_lead_sees_everything_and_searches_memory_only(store, loop_cfg):
+    reply = lead_json(("a", "edge_case"))
+    env = Env(store, loop_cfg, [reply], await gate_with("src/calc.py arithmetic"))
+    review = REVIEW(F("a", "edge_case", "minor", path="src/calc.py"))
+
+    d = await env.run(checks=CheckOutcome(review, QA_OK, ()))
+
+    [call] = env.runtime.calls
+    assert (call.role, call.model) == (Role.LEAD, "m-lead")
+    assert call.system.startswith(load_prompt(Role.LEAD))
+    assert [tool.name for tool in call.tools] == ["memory_search"]
+    assert call.workdir is None and call.edits is False
+    assert call.commands == () and call.command_prefixes == ()
+    assert (call.max_turns, call.timeout_s) == (40, 1200)
+    for part in (
+        "Issue: Parser must accept tabs",
+        DIFF,
+        "Accept tabs",
+        "tabs are whitespace",
+        "tests/test_calc.py",
+        "size: ok (12 lines)",
+        "Blind review: r",
+        "- [minor/edge_case] a src/calc.py: a\n  d",
+        "QA: passed",
+    ):
+        assert part in call.prompt
+    assert d.outcome == "approve"
+
+
+async def test_prompt_reports_failures_check_errors_and_hits(store, loop_cfg):
+    env = Env(store, loop_cfg, [lead_json()], await gate_with("src/auth.py auth"))
+    diff = DIFF.replace("src/calc.py", "src/auth.py")
+    checks = CheckOutcome(None, QA_FAIL, ("review: ReplyInvalid: bad json",))
+
+    await env.run(diff_text=diff, checks=checks)
+
+    [call] = env.runtime.calls
+    for part in (
+        "QA: failed",
+        "- tests failed: pytest -q -> exit 1",
+        "Check errors:\n- review: ReplyInvalid: bad json",
+        "Blind review: unavailable",
+        "Critical changes:\n- security: src/auth.py",
+    ):
+        assert part in call.prompt
+
+
+async def test_edge_case_follow_ups_become_tasks(store, loop_cfg):
+    env = Env(store, loop_cfg, [], await gate_with("src/calc.py arithmetic"))
+    reply = lead_json(("e", "edge_case"))
+    env.runtime = FakeRuntime({Role.LEAD: [reply]})
+    env.asker = Asker(env.runtime, store, env.task.id, loop_cfg.price_per_request_usd)
+    review = REVIEW(F("e", "edge_case", "minor"))
+
+    d = await env.run(checks=CheckOutcome(review, QA_OK, ()))
+
+    assert ids(d.follow_ups) == ["e"]
+    [_, followup] = store.list_tasks("acme")
+    assert (followup.title, followup.source, followup.source_ref) == (
+        "e",
+        "followup",
+        f"task:{env.task.id}",
+    )
+
+
+async def test_follow_up_title_is_not_filed_twice(store, loop_cfg):
+    env = Env(store, loop_cfg, [], await gate_with("src/calc.py arithmetic"))
+    reply = lead_json(("e", "edge_case"))
+    review = REVIEW(F("e", "edge_case", "minor"))
+    for _ in range(2):
+        env.runtime = FakeRuntime({Role.LEAD: [reply]})
+        env.asker = Asker(
+            env.runtime, store, env.task.id, loop_cfg.price_per_request_usd
+        )
+        await env.run(checks=CheckOutcome(review, QA_OK, ()))
+
+    assert [t.title for t in store.list_tasks("acme")] == ["tabs", "e"]
+
+
+async def test_artifact_holds_dumped_decision_with_findings_for_triage(store, loop_cfg):
+    reply = lead_json(("a", "real_bug"), comments=["fix a"])
+    env = Env(store, loop_cfg, [reply], await gate_with("src/calc.py arithmetic"))
+    finding = F("a", path="src/calc.py")
+
+    d = await env.run(checks=CheckOutcome(REVIEW(finding), QA_OK, ()))
+
+    assert d.outcome == "send_back"
+    [artifact] = store.artifacts(env.task.id, ArtifactKind.LEAD)
+    assert artifact.body["findings_to_fix"] == [finding.model_dump()]
+    assert artifact.body["comments"] == ["fix a"]
+    assert artifact.body["outcome"] == "send_back"
+    assert json.loads(json.dumps(artifact.body)) == artifact.body
+
+
+async def test_threshold_comes_from_config(store, loop_cfg):
+    env = Env(
+        store,
+        loop_cfg,
+        [lead_json(conf=0.6)],
+        await gate_with("src/calc.py arithmetic"),
+    )
+
+    d = await env.run()
+
+    assert (d.outcome, d.category) == ("escalate", "not_confident")
+
+
+def test_lead_prompt_names_findings_by_id():
+    prompt = load_prompt(Role.LEAD)
+
+    assert "`finding_id`" in prompt
+    assert "its `id`" in prompt
