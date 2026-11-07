@@ -13,7 +13,13 @@ from agentco.llm.tools import memory_tools
 from agentco.memory.gate import MemoryGate
 from agentco.repo_contract import RepoContract
 from agentco.roles import Role
-from agentco.sandbox.worktree import Worktree, commit_all
+from agentco.sandbox.worktree import (
+    Worktree,
+    changed_files,
+    commit_all,
+    head_sha,
+    reset_worktree,
+)
 from agentco.store.models import ArtifactKind, TaskRecord
 from agentco.store.task_store import TaskStore
 
@@ -95,6 +101,15 @@ def _commands(contract: RepoContract) -> tuple[str, ...]:
     return tuple(command for command in commands if command)
 
 
+async def _invariant_only_retry(
+    wt: Worktree, brief: EngineerBrief, reply: EngineerReply
+) -> bool:
+    # An earlier round already committed the fix; only the invariant was missing.
+    if not (brief.require_invariant and reply.invariant.strip()):
+        return False
+    return bool(await asyncio.to_thread(changed_files, wt, wt.base))
+
+
 async def run_engineer(
     asker: Asker,
     cfg: TenantConfig,
@@ -120,16 +135,20 @@ async def run_engineer(
         max_turns=cfg.loop.agent_max_turns,
         timeout_s=cfg.loop.agent_timeout_s,
     )
+    head = await asyncio.to_thread(head_sha, wt)
     try:
         reply = await asker.ask(call, EngineerReply)
-    except AgentStuck as exc:
-        raise EngineerFailed(exc.reason, stuck=True) from exc
-    except ReplyInvalid as exc:
-        raise EngineerFailed(str(exc)) from exc
+    except Exception as exc:
+        await asyncio.to_thread(reset_worktree, wt.path, head)
+        if isinstance(exc, AgentStuck):
+            raise EngineerFailed(exc.reason, stuck=True) from exc
+        if isinstance(exc, ReplyInvalid):
+            raise EngineerFailed(str(exc)) from exc
+        raise
     sha = await asyncio.to_thread(
         commit_all, wt, f"agentco: task {task.id} round {brief.round}"
     )
-    if sha is None:
+    if sha is None and not await _invariant_only_retry(wt, brief, reply):
         raise EngineerFailed("engineer made no changes")
     if brief.require_invariant and not reply.invariant.strip():
         raise EngineerFailed("no invariant stated")

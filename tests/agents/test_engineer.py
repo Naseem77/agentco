@@ -176,6 +176,8 @@ async def test_stuck_raises_engineer_failed_stuck(make_repo, store, loop_cfg):
     assert exc.value.stuck is True
     assert exc.value.reason == "cannot find the parser"
     assert store.artifacts(env.task.id, ArtifactKind.ENGINEER) == []
+    [cost] = [e for e in store.audit(env.task.id) if e.action == "cost"]
+    assert cost.cost_usd == pytest.approx(0.04)
 
 
 async def test_invalid_reply_raises_engineer_failed(make_repo, store, loop_cfg):
@@ -186,6 +188,109 @@ async def test_invalid_reply_raises_engineer_failed(make_repo, store, loop_cfg):
 
     assert exc.value.stuck is False
     assert exc.value.reason.startswith("junior reply is not a valid EngineerReply")
+    assert store.artifacts(env.task.id, ArtifactKind.ENGINEER) == []
+    costs = [e for e in store.audit(env.task.id) if e.action == "cost"]
+    assert len(costs) == 2
+
+
+def dirty_worktree(call):
+    (call.workdir / "a.py").write_text("x = 99\n")
+    (call.workdir / "scratch.txt").write_text("junk\n")
+
+
+async def test_stuck_resets_partial_edits(make_repo, store, loop_cfg):
+    def stuck(call):
+        dirty_worktree(call)
+        return AgentResult("", 1.0, stuck=True, stuck_reason="lost")
+
+    env = Env(make_repo, store, loop_cfg, [stuck])
+    head = git(env.wt.path, "rev-parse", "HEAD")
+
+    with pytest.raises(EngineerFailed) as exc:
+        await env.run()
+
+    assert exc.value.stuck is True
+    assert git(env.wt.path, "status", "--porcelain") == ""
+    assert git(env.wt.path, "rev-parse", "HEAD") == head
+    assert (env.wt.path / "a.py").read_text() == "x = 1\n"
+    assert not (env.wt.path / "scratch.txt").exists()
+    [cost] = [e for e in store.audit(env.task.id) if e.action == "cost"]
+    assert cost.cost_usd == pytest.approx(0.04)
+
+
+async def test_invalid_reply_resets_partial_edits(make_repo, store, loop_cfg):
+    def garbled(call):
+        dirty_worktree(call)
+        return "not json"
+
+    env = Env(make_repo, store, loop_cfg, [garbled, garbled])
+
+    with pytest.raises(EngineerFailed):
+        await env.run()
+
+    assert git(env.wt.path, "status", "--porcelain") == ""
+    assert (env.wt.path / "a.py").read_text() == "x = 1\n"
+    assert not (env.wt.path / "scratch.txt").exists()
+
+
+async def test_reset_returns_to_head_before_the_call(make_repo, store, loop_cfg):
+    def stuck(call):
+        dirty_worktree(call)
+        return AgentResult("", 1.0, stuck=True, stuck_reason="lost")
+
+    env = Env(make_repo, store, loop_cfg, [edit_a, stuck])
+    await env.run()
+    head = git(env.wt.path, "rev-parse", "HEAD")
+
+    with pytest.raises(EngineerFailed):
+        await env.run(EngineerBrief(issue=ISSUE, round=1))
+
+    assert git(env.wt.path, "rev-parse", "HEAD") == head
+    assert (env.wt.path / "a.py").read_text() == "x = 2\n"
+    assert git(env.wt.path, "status", "--porcelain") == ""
+
+
+async def test_runtime_error_resets_and_propagates(make_repo, store, loop_cfg):
+    def boom(call):
+        dirty_worktree(call)
+        raise RuntimeError("runtime exploded")
+
+    env = Env(make_repo, store, loop_cfg, [boom])
+
+    with pytest.raises(RuntimeError, match="runtime exploded"):
+        await env.run()
+
+    assert git(env.wt.path, "status", "--porcelain") == ""
+
+
+async def test_invariant_only_retry_succeeds_after_committed_round(
+    make_repo, store, loop_cfg
+):
+    env = Env(make_repo, store, loop_cfg, [edit_a, reply(invariant="Normalise once")])
+    brief = EngineerBrief(issue=ISSUE, require_invariant=True)
+
+    with pytest.raises(EngineerFailed) as exc:
+        await env.run(brief)
+    assert exc.value.reason == "no invariant stated"
+    head = git(env.wt.path, "rev-parse", "HEAD")
+
+    result = await env.run(brief)
+
+    assert result.invariant == "Normalise once"
+    assert git(env.wt.path, "rev-parse", "HEAD") == head
+    [artifact] = store.artifacts(env.task.id, ArtifactKind.ENGINEER)
+    assert artifact.body == result.model_dump()
+
+
+async def test_invariant_without_changes_fails_on_first_round(
+    make_repo, store, loop_cfg
+):
+    env = Env(make_repo, store, loop_cfg, [reply(invariant="Normalise once")])
+
+    with pytest.raises(EngineerFailed) as exc:
+        await env.run(EngineerBrief(issue=ISSUE, require_invariant=True))
+
+    assert exc.value.reason == "engineer made no changes"
     assert store.artifacts(env.task.id, ArtifactKind.ENGINEER) == []
 
 
