@@ -177,3 +177,15 @@ def test_pr_body_is_capped_and_truncates_qa_table():
     assert "… truncated" in body
     assert "| case 0 |" in body
     assert body.rstrip("\n").splitlines()[-1] == LAST_LINE
+
+
+def test_defang_covers_gh_refs_and_colon_urls():
+    from agentco.workflow.pr import _defang
+
+    for nasty in ("FIXES GH-9", "closes gh-9", "fixes:https://github.com/o/r/issues/9"):
+        out = _defang(nasty)
+        assert not re.search(r"(?i)\b(close[sd]?|fix(?:e[sd])?|resolve[sd]?)\b", out), (
+            out
+        )
+    assert not re.search(r"(?i)\bgh-\d", _defang("see GH-12"))
+    assert _defang("Fix login redirect") == "Fix login redirect"

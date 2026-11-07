@@ -14,13 +14,15 @@ BODY_LIMIT = 60000
 _ZWSP = "\u200b"
 # Only a keyword that precedes a reference acts on GitHub; plain "fix" stays readable.
 _CLOSING = re.compile(
-    r"(?i)\b(close[sd]?|fix(?:e[sd])?|resolve[sd]?)\b(?=:?\s+(?:\S*#\d|https?://))"
+    r"(?i)\b(close[sd]?|fix(?:e[sd])?|resolve[sd]?)\b(?=:?\s*(?:\S*#\d|https?://|gh-\d))"
 )
+_GH_REF = re.compile(r"(?i)\b(gh)-(?=\d)")
 
 
 def _defang(text: str) -> str:
     text = _CLOSING.sub(lambda m: m.group(1)[0] + _ZWSP + m.group(1)[1:], text)
     text = text.replace("@", "@" + _ZWSP)
+    text = _GH_REF.sub(lambda m: m.group(1) + "-" + _ZWSP, text)
     return re.sub(r"#(?=\d)", "#" + _ZWSP, text)
 
 
