@@ -81,6 +81,16 @@ class PoolConfig(BaseModel):
     setup_timeout_s: float = Field(1800, gt=0, allow_inf_nan=False)
 
 
+class MemoryModels(BaseModel):
+    """OpenAI models Graphiti uses for extraction, reranking and embeddings."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    model: str = "gpt-5.5"
+    small_model: str = "gpt-4.1-mini"  # also the reranker
+    embedder: str = "text-embedding-3-small"
+
+
 class TenantConfig(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
@@ -97,6 +107,7 @@ class TenantConfig(BaseModel):
     intake: IntakeConfig = IntakeConfig()
     webhook: WebhookConfig = WebhookConfig()
     pool: PoolConfig = PoolConfig()
+    memory_models: MemoryModels = MemoryModels()
 
     @field_validator("tenant")
     @classmethod

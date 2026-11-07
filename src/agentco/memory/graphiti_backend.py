@@ -1,9 +1,13 @@
 import asyncio
+import os
 from itertools import chain, zip_longest
 
 from graphiti_core import Graphiti
+from graphiti_core.cross_encoder import OpenAIRerankerClient
 from graphiti_core.driver.driver import GraphDriver
 from graphiti_core.driver.falkordb_driver import FalkorDriver
+from graphiti_core.embedder import OpenAIEmbedder, OpenAIEmbedderConfig
+from graphiti_core.llm_client import LLMConfig, OpenAIClient
 from graphiti_core.nodes import EpisodeType
 from graphiti_core.search.search_config_recipes import EDGE_HYBRID_SEARCH_RRF
 
@@ -85,5 +89,18 @@ class GraphitiBackend:
 
 
 def build_graphiti_backend(cfg: TenantConfig) -> GraphitiBackend:
+    # Graphiti's own defaults include retired models, so always pass ours.
+    models = cfg.memory_models
+    model = os.environ.get("AGENTCO_GRAPHITI_MODEL") or models.model
+    small_model = os.environ.get("AGENTCO_GRAPHITI_SMALL_MODEL") or models.small_model
     driver = FalkorDriver(host=cfg.falkordb_host, port=cfg.falkordb_port)
-    return GraphitiBackend(Graphiti(graph_driver=driver))
+    return GraphitiBackend(
+        Graphiti(
+            graph_driver=driver,
+            llm_client=OpenAIClient(LLMConfig(model=model, small_model=small_model)),
+            embedder=OpenAIEmbedder(
+                OpenAIEmbedderConfig(embedding_model=models.embedder)
+            ),
+            cross_encoder=OpenAIRerankerClient(config=LLMConfig(model=small_model)),
+        )
+    )
