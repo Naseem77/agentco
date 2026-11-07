@@ -257,6 +257,7 @@ class FakeGitHub:
         fail_writes: bool = False,
         reviews: dict[int, list[GhReview]] | None = None,
         check_runs: dict[str, list[GhCheckRun]] | None = None,
+        fail_reads: bool = False,
     ) -> None:
         self._issues = issues
         self._pulls = pulls
@@ -266,6 +267,7 @@ class FakeGitHub:
         self._checks = {sha: list(rs) for sha, rs in (check_runs or {}).items()}
         self.calls: list[tuple[str, object]] = []
         self.fail_writes = fail_writes
+        self.fail_reads = fail_reads
         self.created: list[dict] = []
         self.edited: list[dict] = []
 
@@ -290,11 +292,13 @@ class FakeGitHub:
 
     def issues(self, repo: str, since: datetime | None = None) -> list[GhIssue]:
         validate_repo(repo)
+        self._check_readable()
         self.calls.append(("issues", since))
         return [i for i in self._issues if _updated_since(i.updated_at, since)]
 
     def pulls(self, repo: str) -> list[GhPull]:
         validate_repo(repo)
+        self._check_readable()
         self.calls.append(("pulls", None))
         return list(self._pulls)
 
@@ -302,16 +306,19 @@ class FakeGitHub:
         self, repo: str, since: datetime | None = None
     ) -> list[GhReviewComment]:
         validate_repo(repo)
+        self._check_readable()
         self.calls.append(("review_comments", since))
         return [c for c in self._comments if _updated_since(c.updated_at, since)]
 
     def pull_files(self, repo: str, number: int) -> list[str]:
         validate_repo(repo)
+        self._check_readable()
         self.calls.append(("pull_files", number))
         return list(self._files.get(number, []))
 
     def get_pull(self, repo: str, number: int) -> GhPull:
         validate_repo(repo)
+        self._check_readable()
         self.calls.append(("get_pull", number))
         for pull in self._pulls:
             if pull.number == number:
@@ -320,11 +327,13 @@ class FakeGitHub:
 
     def pull_reviews(self, repo: str, number: int) -> list[GhReview]:
         validate_repo(repo)
+        self._check_readable()
         self.calls.append(("pull_reviews", number))
         return list(self._reviews.get(number, []))
 
     def check_runs(self, repo: str, sha: str) -> list[GhCheckRun]:
         validate_repo(repo)
+        self._check_readable()
         self.calls.append(("check_runs", sha))
         return list(self._checks.get(sha, []))
 
@@ -396,6 +405,10 @@ class FakeGitHub:
         validate_repo(repo)
         self._check_writable()
         self.edited.append({"repo": repo, "number": number, "body": body})
+
+    def _check_readable(self) -> None:
+        if self.fail_reads:
+            raise GitHubError("gh read failed: simulated failure")
 
     def _check_writable(self) -> None:
         if self.fail_writes:

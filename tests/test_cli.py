@@ -1,8 +1,9 @@
 import asyncio
 import dataclasses
+import json
 import subprocess
 import sys
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 import httpx
@@ -20,6 +21,7 @@ from typer.testing import CliRunner
 from agentco import cli
 from agentco.code.graph import InMemoryCodeGraph
 from agentco.github.client import FakeGitHub, GhCli, GitHubError
+from agentco.github.models import GhPull, GhReviewComment, GhUser
 from agentco.llm.fake import FakeRuntime
 from agentco.memory.backend import InMemoryBackend, MemoryItem
 from agentco.memory.scopes import Scope
@@ -1437,3 +1439,214 @@ def test_task_run_all_keeps_other_tasks_lines_when_git_fails(env, repo, monkeypa
     assert result.stdout == (
         "task 1: failed: worktree add failed\ntask 2: failed: pm: SECRET_REASON_XYZ\n"
     )
+
+
+def _intake_gh(env, monkeypatch, **kw) -> FakeGitHub:
+    gh = FakeGitHub([], [], [], {}, **kw)
+    monkeypatch.setattr(cli, "make_github", lambda: gh)
+    return gh
+
+
+def _pr_task(env, gh, number=7, repo="acme/app") -> int:
+    store = env.store
+    store.create_all()
+    task = store.create_task("acme", "fix tabs", "issue", "5")
+    store.put_artifact(task.id, ArtifactKind.TARGET, Role.PM, {"repo": repo})
+    for state in (
+        TaskState.PM,
+        TaskState.TRIAGE,
+        TaskState.ENGINEERING,
+        TaskState.PREFLIGHT,
+        TaskState.INTERNAL_REVIEW,
+        TaskState.LEAD_DECISION,
+        TaskState.PR_OPEN,
+    ):
+        store.transition(task.id, state, Role.LEAD, "test")
+    url = f"https://github.com/{repo}/pull/{number}"
+    store.put_artifact(
+        task.id, ArtifactKind.PR, Role.LEAD, {"number": number, "url": url}
+    )
+    now = datetime.now(UTC)
+    gh.upsert_pull(
+        GhPull(
+            number=number,
+            title="t",
+            body="b",
+            author=GhUser("agentco", False),
+            state="open",
+            merged_at=None,
+            created_at=now,
+            updated_at=now,
+            base_sha="base",
+            head_sha="sha1",
+            labels=(),
+            url=url,
+            closes_issues=(),
+        )
+    )
+    return task.id
+
+
+def _comment(id, number=7, body="crash on empty list") -> GhReviewComment:
+    at = datetime.now(UTC) + timedelta(hours=1)
+    return GhReviewComment(
+        id=id,
+        pr_number=number,
+        author=GhUser("alice", False),
+        association="MEMBER",
+        body=body,
+        path="a.py",
+        line=3,
+        original_line=3,
+        side="RIGHT",
+        subject_type="line",
+        commit_id="sha1",
+        original_commit_id="sha1",
+        diff_hunk="",
+        in_reply_to=None,
+        created_at=at,
+        updated_at=at,
+        url=f"https://github.com/acme/app/pull/{number}#discussion_r{id}",
+    )
+
+
+def _lead_says(*classes) -> str:
+    return json.dumps(
+        {
+            "confidence": 0.9,
+            "classifications": [
+                {"finding_id": i, "category": c, "note": "n"} for i, c in classes
+            ],
+            "summary": "decided",
+        }
+    )
+
+
+def _intake(env, *args):
+    return env("intake", "--repo", "acme/app", *args)
+
+
+def test_intake_reenters_a_real_bug_and_prints_it(env, monkeypatch):
+    gh = _intake_gh(env, monkeypatch)
+    task_id = _pr_task(env, gh)
+    gh.add_comment(_comment(1))
+    env.seams.script({Role.LEAD: [_lead_says(("c1", "real_bug"))]})
+
+    result = _intake(env)
+
+    assert result.exit_code == 0, result.stdout
+    assert result.stdout.splitlines() == [
+        f"#{task_id} back to triage (round 1): 1 finding(s)",
+        "0 known, 0 deferred",
+    ]
+    assert env.store.get(task_id).state is TaskState.TRIAGE
+    assert gh.created == [] and gh.edited == []
+
+
+def test_intake_twice_is_idempotent(env, monkeypatch):
+    gh = _intake_gh(env, monkeypatch)
+    task_id = _pr_task(env, gh)
+    gh.add_comment(_comment(1))
+    env.seams.script({Role.LEAD: [_lead_says(("c1", "real_bug"))]})
+    _intake(env)
+    lead_calls = len([c for c in env.seams.runtime.calls if c.role is Role.LEAD])
+
+    second = _intake(env)
+
+    assert (second.exit_code, second.stdout) == (0, "0 known, 0 deferred\n")
+    assert env.store.get(task_id).round == 1
+    assert len(env.seams.runtime.calls) == lead_calls
+
+
+def test_intake_rejects_a_bad_repo_exit_1(env):
+    result = env("intake", "--repo", "not a repo")
+    assert result.exit_code == 1
+    assert "repo" in result.stdout
+
+
+def test_intake_github_failure_exit_3(env, monkeypatch):
+    gh = _intake_gh(env, monkeypatch, fail_reads=True)
+    task_id = _pr_task(env, gh)
+    result = _intake(env)
+    assert result.exit_code == 3
+    assert "gh read failed" in result.stdout
+    assert env.store.get(task_id).state is TaskState.PR_OPEN
+
+
+def test_intake_agent_failure_exit_4(env, monkeypatch):
+    gh = _intake_gh(env, monkeypatch)
+    task_id = _pr_task(env, gh)
+    gh.add_comment(_comment(1))
+    env.seams.script({Role.LEAD: [STUCK]})
+
+    result = _intake(env)
+
+    assert result.exit_code == 4
+    assert result.stdout.splitlines()[-1].startswith("error: ")
+    assert env.store.get(task_id).state is TaskState.PR_OPEN
+
+
+def test_intake_prints_merged_and_closed(env, monkeypatch):
+    gh = _intake_gh(env, monkeypatch)
+    merged = _pr_task(env, gh, number=7)
+    closed = _pr_task(env, gh, number=8)
+    for n, at in ((7, datetime.now(UTC)), (8, None)):
+        pull = gh.get_pull("acme/app", n)
+        gh.upsert_pull(dataclasses.replace(pull, state="closed", merged_at=at))
+
+    result = _intake(env)
+
+    assert result.exit_code == 0, result.stdout
+    assert result.stdout.splitlines() == [
+        f"#{merged} merged",
+        f"#{closed} closed",
+        "0 known, 0 deferred",
+    ]
+
+
+def test_intake_prints_a_task_that_needs_a_human(env, monkeypatch):
+    gh = _intake_gh(env, monkeypatch)
+    task_id = _pr_task(env, gh)
+    gh.add_comment(_comment(1, body="rename this var"))
+    env.seams.script({Role.LEAD: [_lead_says(("c1", "tradeoff"))]})
+
+    result = _intake(env)
+
+    assert result.exit_code == 0, result.stdout
+    assert f"#{task_id} needs a human: " in result.stdout
+    assert env.store.get(task_id).state is TaskState.AWAITING_HUMAN
+    assert env.store.latest_artifact(task_id, ArtifactKind.ESCALATION).body.get(
+        "open_pr"
+    ) in (None, False)
+
+
+def test_intake_falkordb_down_exit_2(env, monkeypatch):
+    def down(cfg):
+        raise redis.exceptions.ConnectionError("refused")
+
+    gh = _intake_gh(env, monkeypatch)
+    _pr_task(env, gh)
+    gh.add_comment(_comment(1))
+    monkeypatch.setattr(cli, "make_backend", down)
+    result = _intake(env)
+    assert (result.exit_code, result.stdout) == (
+        2,
+        "cannot reach FalkorDB at localhost:6379\n",
+    )
+
+
+def test_fake_github_fail_reads_blocks_every_read():
+    gh = FakeGitHub.from_fixtures(GITHUB_FIXTURES)
+    gh.fail_reads = True
+    reads = [
+        lambda: gh.issues("acme/app"),
+        lambda: gh.pulls("acme/app"),
+        lambda: gh.review_comments("acme/app"),
+        lambda: gh.pull_files("acme/app", 1),
+        lambda: gh.get_pull("acme/app", 1),
+        lambda: gh.pull_reviews("acme/app", 1),
+        lambda: gh.check_runs("acme/app", "sha"),
+    ]
+    for read in reads:
+        with pytest.raises(GitHubError, match="simulated failure"):
+            read()

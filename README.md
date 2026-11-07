@@ -168,6 +168,36 @@ Exit codes of `task run`: 1 bad arguments, config, checkout or repo contract, 2 
 unreachable, 3 `gh` unavailable or failing or a git operation failed, 4 a step failed and the task stayed where it was
 (run it again to retry). `decide` uses 1 and 2.
 
+## PR feedback
+
+After a PR is open, `agentco intake` reads what people said about it and sends real problems
+back to the team:
+
+```bash
+agentco intake --repo acme/app
+```
+
+It looks at review comments and reviews from your team (owners, members, collaborators), from
+review bots you allow-listed in the config, and at failing checks. The lead classifies each
+finding: a real bug goes back to triage and the same PR is updated (the branch is pushed with
+`--force-with-lease`, the PR body is edited); nits are not worth a round and a tradeoff is
+your call. When only nits or tradeoffs are left, you decide: the task stops in
+`awaiting_human` and `agentco decide` continues it. A real bug that keeps coming back is bounded by the same round limit as any
+task, after which it also stops for you.
+
+Intake never comments on a PR and never merges. It only reads, and a PR you merged or closed
+yourself marks its task `merged` or `cancelled`. Running it twice does the same as running it
+once. Run it on a timer, then let the team pick the work up:
+
+```cron
+*/15 * * * * cd /path/to/repo && agentco intake --repo acme/app && agentco task run --all --repo acme/app
+```
+
+Intake prints one line per task (`#3 back to triage (round 1): 2 finding(s)`, `#4 needs a
+human: stuck`, `#5 merged`) and a summary (`7 known, 1 deferred`). Exit codes: 1 bad
+arguments or config, 2 FalkorDB unreachable, 3 `gh` unavailable or failing, 4 an agent step
+failed (a rerun is safe), 0 otherwise.
+
 ## Tests
 
 ```bash
