@@ -1,7 +1,9 @@
 import asyncio
+import math
 from collections.abc import Callable, Iterator
-from contextlib import contextmanager
+from contextlib import AbstractAsyncContextManager, AsyncExitStack, contextmanager
 from datetime import UTC, datetime
+from enum import StrEnum
 from pathlib import Path
 from typing import Annotated
 
@@ -18,17 +20,28 @@ from agentco.code.falkor_graph import build_falkor_code_graph
 from agentco.code.graph import CodeGraphBackend, code_graph_for
 from agentco.code.indexer import NotAGitRepo, index_repo, repo_root
 from agentco.config import ConfigError, TenantConfig, family_warnings, load_config
-from agentco.github.client import GhCli, GitHub, validate_repo
+from agentco.github.client import GhCli, GitHub, GitHubWriter, validate_repo
 from agentco.github.errors import GitHubError
 from agentco.importer.locate import SymbolLocator
 from agentco.importer.run import ImportOptions, ImportReport, run_import
+from agentco.llm.copilot import CopilotRuntime
+from agentco.llm.runtime import AgentRuntime
 from agentco.memory.backend import Fact, MemoryBackend, MemoryItem
 from agentco.memory.gate import MemoryGate
 from agentco.memory.graphiti_backend import build_graphiti_backend
 from agentco.memory.scopes import Scope, graph_name
 from agentco.memory.seed import seed_company
+from agentco.repo_contract import (
+    RepoContract,
+    RepoContractMissing,
+    load_repo_contract,
+)
 from agentco.roles import Role
+from agentco.sandbox.runner import CommandRunner, runner_for
+from agentco.store.models import ArtifactKind, TaskRecord
 from agentco.store.task_store import TaskStore
+from agentco.workflow.orchestrator import StepFailed, TaskContext, run_many
+from agentco.workflow.states import TaskState
 
 # Seam: CLI tests replace this with an in-memory backend.
 make_backend: Callable[[TenantConfig], MemoryBackend] = build_graphiti_backend
@@ -38,6 +51,15 @@ make_code_graph: Callable[[TenantConfig], CodeGraphBackend] = build_falkor_code_
 
 # Seam: CLI tests replace this with an in-memory GitHub.
 make_github: Callable[[], GitHub] = GhCli
+
+# Seam: CLI tests replace this with a scripted runtime.
+make_runtime: Callable[[TenantConfig], AgentRuntime] = lambda cfg: CopilotRuntime()
+
+# Seam: CLI tests replace this with a scripted command runner.
+make_command_runner: Callable[[RepoContract, Path, bool], CommandRunner] = runner_for
+
+# Seam: CLI tests replace this with an in-memory GitHub writer.
+make_github_writer: Callable[[], GitHubWriter] = GhCli
 
 app = typer.Typer(no_args_is_help=True, help="A company of AI agents.")
 memory_app = typer.Typer(no_args_is_help=True, help="Query company memory.")
@@ -140,12 +162,23 @@ def memory_search(
 
 
 @task_app.command("new")
-def task_new(title: str, config: Path = ConfigOption) -> None:
+def task_new(
+    title: str,
+    body: Annotated[
+        str | None,
+        typer.Option("--body", help="What to do, in full; defaults to the title."),
+    ] = None,
+    config: Path = ConfigOption,
+) -> None:
     """Create a task from the CLI and print its id."""
     cfg = _load(config)
     store = TaskStore(cfg.database_url)
     store.create_all()
-    typer.echo(store.create_task(cfg.tenant, title, source="cli").id)
+    task = store.create_task(cfg.tenant, title, source="cli")
+    store.put_artifact(
+        task.id, ArtifactKind.REQUEST, Role.HUMAN, {"body": body or title}
+    )
+    typer.echo(task.id)
 
 
 @app.command()
@@ -323,3 +356,242 @@ def import_(
     lines = _dry_run_lines(report) if dry_run else _result_lines(report, max_items)
     for line in lines:
         typer.echo(line)
+
+
+# States `task run --all` picks up; AWAITING_HUMAN only once a decision is waiting.
+_RUNNABLE = (
+    TaskState.INTAKE,
+    TaskState.PM,
+    TaskState.TRIAGE,
+    TaskState.ENGINEERING,
+    TaskState.PREFLIGHT,
+    TaskState.INTERNAL_REVIEW,
+    TaskState.LEAD_DECISION,
+)
+
+
+class Decision(StrEnum):
+    APPROVE = "approve"
+    REJECT = "reject"
+    ANSWER = "answer"
+
+
+def _task_of(store: TaskStore, cfg: TenantConfig, task_id: int) -> TaskRecord:
+    try:
+        task = store.get(task_id)
+    except KeyError:
+        task = None
+    if task is None or task.tenant != cfg.tenant:
+        raise _fail(f"task {task_id} not found")
+    return task
+
+
+def _has_waiting_decision(store: TaskStore, task: TaskRecord) -> bool:
+    escalation = store.latest_artifact(task.id, ArtifactKind.ESCALATION)
+    decision = store.latest_artifact(task.id, ArtifactKind.HUMAN_DECISION)
+    return decision is not None and (escalation is None or decision.id > escalation.id)
+
+
+def _tasks_to_run(
+    store: TaskStore, cfg: TenantConfig, task_id: int | None
+) -> list[TaskRecord]:
+    if task_id is not None:
+        return [_task_of(store, cfg, task_id)]
+    states = (*_RUNNABLE, TaskState.AWAITING_HUMAN)
+    return [
+        t
+        for t in store.list_tasks(cfg.tenant, states)
+        if t.state is not TaskState.AWAITING_HUMAN or _has_waiting_decision(store, t)
+    ]
+
+
+def _remember_target(store: TaskStore, task_id: int, repo: str, main: str) -> None:
+    target = {"repo": repo, "main": main}
+    latest = store.latest_artifact(task_id, ArtifactKind.TARGET)
+    if latest is None or latest.body != target:
+        store.put_artifact(task_id, ArtifactKind.TARGET, Role.HUMAN, target)
+
+
+def _final_line(store: TaskStore, task: TaskRecord) -> str:
+    line = f"task {task.id}: {task.state.value}"
+    pr = store.latest_artifact(task.id, ArtifactKind.PR)
+    if task.state is TaskState.PR_OPEN and pr is not None:
+        line += f" {pr.body['url']}"
+    return line
+
+
+@task_app.command("run")
+def task_run(
+    repo: Annotated[str, typer.Option("--repo", help="GitHub repo as OWNER/NAME.")],
+    task_id: Annotated[
+        int | None, typer.Argument(help="Task id; omit with --all.")
+    ] = None,
+    all_tasks: Annotated[
+        bool, typer.Option("--all", help="Run every task that can make progress.")
+    ] = False,
+    repo_path: Annotated[
+        Path, typer.Option("--repo-path", help="Local checkout to work in.")
+    ] = Path("."),
+    main: Annotated[str, typer.Option("--main", help="The base branch.")] = "main",
+    host: Annotated[
+        bool,
+        typer.Option(
+            "--host", help="Run repo commands on this machine, not in the sandbox."
+        ),
+    ] = False,
+    config: Path = ConfigOption,
+) -> None:
+    """Run a task until it opens a PR, needs a human, or is cancelled (resumes)."""
+    if (task_id is not None) == all_tasks:
+        raise _fail("give exactly one of a task id or --all")
+    try:
+        validate_repo(repo)
+        checkout = repo_root(repo_path)
+        contract = load_repo_contract(checkout)
+    except (ValueError, NotAGitRepo, RepoContractMissing) as e:
+        raise _fail(str(e)) from e
+    cfg = _load(config)
+    store = TaskStore(cfg.database_url)
+    store.create_all()
+    tasks = _tasks_to_run(store, cfg, task_id)
+    if not tasks:
+        typer.echo("no tasks to run")
+        return
+    for task in tasks:
+        _remember_target(store, task.id, repo, main)
+
+    async def _run() -> list[TaskRecord | BaseException]:
+        runtime = make_runtime(cfg)
+        async with AsyncExitStack() as stack:
+            if isinstance(runtime, AbstractAsyncContextManager):
+                runtime = await stack.enter_async_context(runtime)
+            ctx = TaskContext(
+                cfg=cfg,
+                store=store,
+                runtime=runtime,
+                gate=MemoryGate(cfg.tenant, _build_backend(cfg)),
+                github=make_github_writer(),
+                repo=repo,
+                repo_root=checkout,
+                contract=contract,
+                runner=make_command_runner(contract, checkout, host),
+                main=main,
+            )
+            return await run_many([(ctx, t.id) for t in tasks], cfg.concurrency)
+
+    try:
+        with _falkordb_guard(cfg):
+            results = asyncio.run(_run())
+            for result in results:
+                if isinstance(result, BaseException) and not isinstance(
+                    result, StepFailed | GitHubError
+                ):
+                    raise result
+    except GitHubError as e:
+        raise _fail(str(e), 3) from e
+    except LLM_ERRORS as e:
+        raise _fail(f"LLM request failed: {_one_line(e)}") from e
+    code = 0
+    for task, result in zip(tasks, results, strict=True):
+        if isinstance(result, TaskRecord):
+            typer.echo(_final_line(store, result))
+            continue
+        typer.echo(f"task {task.id}: failed: {_one_line(result)}")
+        code = code or (4 if isinstance(result, StepFailed) else 3)
+    if code:
+        raise typer.Exit(code)
+
+
+def _escalation_of(store: TaskStore, task_id: int) -> dict:
+    escalation = store.latest_artifact(task_id, ArtifactKind.ESCALATION)
+    return escalation.body if escalation else {}
+
+
+@app.command()
+def inbox(config: Path = ConfigOption) -> None:
+    """List the tasks waiting for a human decision."""
+    cfg = _load(config)
+    store = TaskStore(cfg.database_url)
+    store.create_all()
+    waiting = store.list_tasks(cfg.tenant, [TaskState.AWAITING_HUMAN])
+    if not waiting:
+        typer.echo("nothing is waiting for a human")
+        return
+    typer.echo("id\ttitle\tcategory\tfrom_state\treason\toptions\tcost")
+    for task in waiting:
+        body = _escalation_of(store, task.id)
+        fields = [
+            str(task.id),
+            task.title,
+            str(body.get("category", "")),
+            str(body.get("from_state", "")),
+            str(body.get("reason", "")),
+            "; ".join(str(o) for o in body.get("options", [])),
+            f"${task.cost_usd:.2f}",
+        ]
+        typer.echo("\t".join(_one_line(f) for f in fields))
+
+
+def _decision_text(task: TaskRecord, decision: Decision, note: str, body: dict) -> str:
+    reason = body.get("reason", "")
+    text = (
+        f"Human decision ({decision.value}) on task {task.id} '{task.title}': "
+        f"the team escalated from {body.get('from_state', 'unknown')} "
+        f"({body.get('category', 'unknown')}) because: {reason}."
+    )
+    return f"{text} Note: {note}" if note else text
+
+
+@app.command()
+def decide(
+    task_id: int,
+    decision: Decision,
+    note: Annotated[
+        str, typer.Option("--note", help="Your guidance; required for answer.")
+    ] = "",
+    add_budget: Annotated[
+        float | None,
+        typer.Option("--add-budget", help="Extra USD this task may spend."),
+    ] = None,
+    config: Path = ConfigOption,
+) -> None:
+    """Answer an escalated task; `reject` cancels it, the rest resume on `task run`."""
+    if decision is Decision.ANSWER and not note.strip():
+        raise _fail("answer needs --note with your answer")
+    if add_budget is not None and not (math.isfinite(add_budget) and add_budget > 0):
+        raise _fail(f"--add-budget must be a positive amount, got {add_budget}")
+    cfg = _load(config)
+    store = TaskStore(cfg.database_url)
+    store.create_all()
+    task = _task_of(store, cfg, task_id)
+    if task.state is not TaskState.AWAITING_HUMAN:
+        raise _fail(f"task {task_id} is {task.state.value}, not awaiting_human")
+    earlier = store.artifacts(task_id, ArtifactKind.HUMAN_DECISION)
+    item = MemoryItem(
+        f"human-decision:{task_id}:{len(earlier) + 1}",
+        _decision_text(task, decision, note, _escalation_of(store, task_id)),
+        "human decision",
+        datetime.now(UTC),
+    )
+    # Memory first: if FalkorDB is down nothing about the task has changed.
+    with _falkordb_guard(cfg):
+        mem = MemoryGate(cfg.tenant, _build_backend(cfg)).for_role(Role.HUMAN)
+        asyncio.run(mem.add(Scope.COMPANY, item))
+    store.put_artifact(
+        task_id,
+        ArtifactKind.HUMAN_DECISION,
+        Role.HUMAN,
+        {"decision": decision.value, "note": note},
+    )
+    if decision is Decision.REJECT:
+        store.transition(
+            task_id, TaskState.CANCELLED, Role.HUMAN, "rejected by a human"
+        )
+        typer.echo(f"task {task_id}: cancelled")
+        return
+    if add_budget is not None:
+        key = f"task:{task_id}:extra_budget"
+        store.set_meta(key, str(float(store.get_meta(key) or 0) + add_budget))
+    typer.echo(
+        f"task {task_id}: {decision.value} recorded; run `agentco task run {task_id}`"
+    )

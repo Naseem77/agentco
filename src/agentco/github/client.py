@@ -1,3 +1,4 @@
+import inspect
 import json
 import re
 import subprocess
@@ -11,6 +12,7 @@ from agentco.github.models import (
     GhIssue,
     GhPull,
     GhReviewComment,
+    PullRef,
     parse_issue,
     parse_pull,
     parse_review_comment,
@@ -40,12 +42,26 @@ class GitHub(Protocol):
     def pull_files(self, repo: str, number: int) -> list[str]: ...
 
 
-Runner = Callable[[list[str]], str]
+class GitHubWriter(Protocol):
+    def create_pull(
+        self, repo: str, head: str, base: str, title: str, body: str
+    ) -> PullRef: ...
+
+    def find_open_pull(self, repo: str, head: str) -> PullRef | None: ...
+
+    def edit_pull(self, repo: str, number: int, body: str) -> None: ...
 
 
-def _subprocess_runner(argv: list[str]) -> str:
+Runner = Callable[[list[str], str | None], str]
+_PULL_URL_RE = re.compile(r"^https?://\S+/pull/(\d+)$")
+
+
+def _subprocess_runner(argv: list[str], input: str | None = None) -> str:
     try:
-        proc = subprocess.run(argv, capture_output=True, text=True, check=False)
+        stdin = {} if input is None else {"input": input}
+        proc = subprocess.run(
+            argv, capture_output=True, text=True, check=False, **stdin
+        )
     except FileNotFoundError as e:
         raise GitHubError(_GH_MISSING) from e
     if proc.returncode != 0:
@@ -80,13 +96,43 @@ def _filename(raw: dict) -> str:
         raise GitHubError(f"malformed GitHub pull file: {type(e).__name__}: {e}") from e
 
 
+def _accepts_input(runner: Callable[..., str]) -> bool:
+    params = inspect.signature(runner).parameters.values()
+    return any(p.kind is p.VAR_POSITIONAL for p in params) or (
+        sum(p.kind in (p.POSITIONAL_ONLY, p.POSITIONAL_OR_KEYWORD) for p in params) >= 2
+    )
+
+
+def _pull_ref(raw: dict) -> PullRef:
+    try:
+        return PullRef(number=raw["number"], url=raw["url"])
+    except (KeyError, TypeError, ValueError) as e:
+        raise GitHubError(
+            f"malformed GitHub pull request: {type(e).__name__}: {e}"
+        ) from e
+
+
+def _read_only(runner: Callable[..., str]) -> Runner:
+    def run(argv: list[str], input: str | None = None) -> str:
+        if input is not None:
+            raise ValueError("this runner takes no stdin, so it cannot serve writes")
+        return runner(argv)
+
+    return run
+
+
 class GhCli:
-    def __init__(self, runner: Runner | None = None) -> None:
-        self._runner = runner or _subprocess_runner
+    def __init__(self, runner: Callable[..., str] | None = None) -> None:
+        if runner is None:
+            self._runner: Runner = _subprocess_runner
+        elif _accepts_input(runner):
+            self._runner = runner
+        else:
+            self._runner = _read_only(runner)
 
     def _get(self, path: str) -> list[dict]:
         return _flatten_pages(
-            self._runner(["gh", "api", "--paginate", "--slurp", path])
+            self._runner(["gh", "api", "--paginate", "--slurp", path], None)
         )
 
     def issues(self, repo: str, since: datetime | None = None) -> list[GhIssue]:
@@ -111,6 +157,39 @@ class GhCli:
         path = f"repos/{validate_repo(repo)}/pulls/{number}/files?per_page=100"
         return [_filename(raw) for raw in self._get(path)]
 
+    def create_pull(
+        self, repo: str, head: str, base: str, title: str, body: str
+    ) -> PullRef:
+        argv = [
+            "gh", "pr", "create", "--repo", validate_repo(repo),
+            "--head", head, "--base", base, "--title", title, "--body-file", "-",
+        ]  # fmt: skip
+        lines = self._runner(argv, body).split()
+        match = _PULL_URL_RE.match(lines[-1]) if lines else None
+        if match is None:
+            raise GitHubError("gh pr create did not print a pull request URL")
+        return PullRef(number=int(match.group(1)), url=lines[-1])
+
+    def find_open_pull(self, repo: str, head: str) -> PullRef | None:
+        argv = [
+            "gh", "pr", "list", "--repo", validate_repo(repo), "--head", head,
+            "--state", "open", "--json", "number,url",
+        ]  # fmt: skip
+        try:
+            found = json.loads(self._runner(argv, None))
+        except json.JSONDecodeError as e:
+            raise GitHubError(f"gh pr list returned invalid JSON: {e}") from e
+        if not isinstance(found, list):
+            raise GitHubError("gh pr list returned unexpected JSON: expected a list")
+        return _pull_ref(found[0]) if found else None
+
+    def edit_pull(self, repo: str, number: int, body: str) -> None:
+        argv = [
+            "gh", "pr", "edit", str(int(number)), "--repo", validate_repo(repo),
+            "--body-file", "-",
+        ]  # fmt: skip
+        self._runner(argv, body)
+
 
 class FakeGitHub:
     """In-memory GitHub for tests; filters on `since` like the API does."""
@@ -121,12 +200,16 @@ class FakeGitHub:
         pulls: list[GhPull],
         comments: list[GhReviewComment],
         files: dict[int, list[str]],
+        fail_writes: bool = False,
     ) -> None:
         self._issues = issues
         self._pulls = pulls
         self._comments = comments
         self._files = files
         self.calls: list[tuple[str, object]] = []
+        self.fail_writes = fail_writes
+        self.created: list[dict] = []
+        self.edited: list[dict] = []
 
     @classmethod
     def from_fixtures(cls, directory: Path) -> "FakeGitHub":
@@ -168,6 +251,42 @@ class FakeGitHub:
         validate_repo(repo)
         self.calls.append(("pull_files", number))
         return list(self._files.get(number, []))
+
+    def create_pull(
+        self, repo: str, head: str, base: str, title: str, body: str
+    ) -> PullRef:
+        validate_repo(repo)
+        self._check_writable()
+        number = len(self.created) + 1
+        url = f"https://github.com/{repo}/pull/{number}"
+        self.created.append(
+            {
+                "repo": repo,
+                "head": head,
+                "base": base,
+                "title": title,
+                "body": body,
+                "number": number,
+                "url": url,
+            }
+        )
+        return PullRef(number=number, url=url)
+
+    def find_open_pull(self, repo: str, head: str) -> PullRef | None:
+        validate_repo(repo)
+        for pull in self.created:
+            if pull["repo"] == repo and pull["head"] == head:
+                return PullRef(number=pull["number"], url=pull["url"])
+        return None
+
+    def edit_pull(self, repo: str, number: int, body: str) -> None:
+        validate_repo(repo)
+        self._check_writable()
+        self.edited.append({"repo": repo, "number": number, "body": body})
+
+    def _check_writable(self) -> None:
+        if self.fail_writes:
+            raise GitHubError("gh write failed: simulated failure")
 
 
 def _updated_since(updated_at: datetime, since: datetime | None) -> bool:

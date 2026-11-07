@@ -7,6 +7,7 @@ no prompts, and a fixed agentco identity.
 
 import os
 import posixpath
+import re
 import shutil
 import subprocess
 import unicodedata
@@ -342,8 +343,42 @@ def _clean(dest: Path, keep_dir: bool) -> None:
             child.unlink(missing_ok=True)
 
 
+def head_ancestor(wt: Worktree, steps: int) -> str:
+    """The commit `steps` parents before HEAD."""
+    return _git(wt.path, "rev-parse", f"HEAD~{steps}").strip()
+
+
+def count_commits(wt: Worktree, since: str) -> int:
+    """How many commits HEAD has that `since` does not."""
+    return int(_git(wt.path, "rev-list", "--count", f"{since}..HEAD"))
+
+
+def is_ancestor(wt: Worktree, commit: str) -> bool:
+    """Whether `commit` is HEAD or one of its ancestors."""
+    proc = _run(wt.path, "merge-base", "--is-ancestor", commit, "HEAD")
+    return proc.returncode == 0  # 1: not an ancestor; other codes: unknown commit
+
+
+_TASK_BRANCH = re.compile(r"agentco/task-\d+")
+
+
 def push_branch(wt: Worktree) -> None:
-    _git(wt.path, "push", "-u", "origin", wt.branch)
+    """Publish the task branch, replacing what is there if a rebase rewrote it.
+
+    Only agentco's own `agentco/task-<id>` branch may be forced; it is never main.
+    The lease names the remote tip seen just now, so a push from anyone else in
+    between is still refused.
+    """
+    if not _TASK_BRANCH.fullmatch(wt.branch):
+        raise GitError(f"refusing to push {wt.branch!r}: not an agentco task branch")
+    ref = f"refs/heads/{wt.branch}"
+    listing = _git(wt.path, "ls-remote", "--heads", "origin", ref).split()
+    lease = (
+        f"--force-with-lease={ref}:{listing[0]}"
+        if listing
+        else f"--force-with-lease={ref}:"
+    )
+    _git(wt.path, "push", "-u", lease, "origin", f"{wt.branch}:{ref}")
 
 
 def remove_worktree(repo_root: Path, path: Path) -> None:

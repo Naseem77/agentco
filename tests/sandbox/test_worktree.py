@@ -5,12 +5,17 @@ import pytest
 
 from agentco.sandbox.worktree import (
     GitError,
+    Worktree,
     branch_name,
     changed_files,
     changed_lines,
     commit_all,
+    count_commits,
     create_worktree,
     diff,
+    head_ancestor,
+    head_sha,
+    is_ancestor,
     make_snapshot,
     push_branch,
     rebase_onto,
@@ -353,6 +358,77 @@ def test_push_branch_failure_raises(make_repo, tmp_path):
     git(root, "remote", "set-url", "origin", str(tmp_path / "missing.git"))
     with pytest.raises(GitError):
         push_branch(wt)
+
+
+def _remote_sha(root: Path, tmp_path: Path, branch: str) -> str:
+    bare = tmp_path / "repo.git"
+    return git(
+        root, "--git-dir", str(bare), "rev-parse", f"refs/heads/{branch}"
+    ).strip()
+
+
+def test_push_branch_replaces_a_branch_rewritten_by_a_rebase(make_repo, tmp_path):
+    root = make_repo({"a.py": "x = 1\n"})
+    wt = create_worktree(root, 5, "main")
+    (wt.path / "b.py").write_text("y = 1\n")
+    commit_all(wt, "task")
+    push_branch(wt)
+    commit_on_main(root, "c.py", "z = 1\n", "upstream")
+    git(root, "push", "origin", "main")
+    base = refresh_main(root, "main")
+    assert rebase_onto(wt, base)
+
+    push_branch(wt)
+
+    assert _remote_sha(root, tmp_path, "agentco/task-5") == head_sha(wt)
+
+
+def test_push_branch_replaces_a_remote_branch_without_a_tracking_ref(
+    make_repo, tmp_path
+):
+    root = make_repo({"a.py": "x = 1\n"})
+    wt = create_worktree(root, 5, "main")
+    (wt.path / "b.py").write_text("y = 1\n")
+    commit_all(wt, "task")
+    push_branch(wt)
+    git(root, "update-ref", "-d", "refs/remotes/origin/agentco/task-5")
+    git(wt.path, "commit", "--amend", "-m", "reworded", "--allow-empty")
+
+    push_branch(wt)
+
+    assert _remote_sha(root, tmp_path, "agentco/task-5") == head_sha(wt)
+
+
+def test_push_branch_never_forces_a_branch_that_is_not_a_task_branch(
+    make_repo, tmp_path
+):
+    root = make_repo({"a.py": "x = 1\n"})
+    main_sha = git(root, "rev-parse", "main").strip()
+    wt = Worktree(path=root, branch="main", base="main")
+
+    with pytest.raises(GitError) as err:
+        push_branch(wt)
+
+    assert str(err.value) == "refusing to push 'main': not an agentco task branch"
+    assert _remote_sha(root, tmp_path, "main") == main_sha
+
+
+def test_commit_counting_helpers(make_repo):
+    root = make_repo({"a.py": "x = 1\n"})
+    wt = create_worktree(root, 3, "main")
+    shas = []
+    for i in range(3):
+        (wt.path / f"f{i}.py").write_text(f"v = {i}\n")
+        shas.append(commit_all(wt, f"c{i}"))
+
+    assert count_commits(wt, "main") == 3
+    assert count_commits(wt, shas[0]) == 2
+    assert head_ancestor(wt, 0) == shas[2]
+    assert head_ancestor(wt, 2) == shas[0]
+    assert is_ancestor(wt, shas[0]) and is_ancestor(wt, shas[2])
+    assert not is_ancestor(wt, "0" * 40)
+    git(wt.path, "reset", "--hard", shas[0])
+    assert not is_ancestor(wt, shas[2])
 
 
 def test_remove_worktree(make_repo):
