@@ -1,7 +1,12 @@
 import asyncio
 import math
-from collections.abc import Callable, Iterator
-from contextlib import AbstractAsyncContextManager, AsyncExitStack, contextmanager
+from collections.abc import AsyncIterator, Callable, Iterable, Iterator
+from contextlib import (
+    AbstractAsyncContextManager,
+    AsyncExitStack,
+    asynccontextmanager,
+    contextmanager,
+)
 from datetime import UTC, datetime
 from enum import StrEnum
 from pathlib import Path
@@ -25,6 +30,7 @@ from agentco.github.errors import GitHubError
 from agentco.importer.locate import SymbolLocator
 from agentco.importer.run import ImportOptions, ImportReport, run_import
 from agentco.intake.run import IntakeReport, run_intake
+from agentco.learning.librarian import LearnReport, Librarian
 from agentco.llm.copilot import CopilotRuntime
 from agentco.llm.runtime import AgentRuntime
 from agentco.memory.backend import Fact, MemoryBackend, MemoryItem
@@ -415,6 +421,76 @@ def _remember_target(store: TaskStore, task_id: int, repo: str, main: str) -> No
         store.put_artifact(task_id, ArtifactKind.TARGET, Role.HUMAN, target)
 
 
+@asynccontextmanager
+async def _started(runtime: AgentRuntime) -> AsyncIterator[AgentRuntime]:
+    async with AsyncExitStack() as stack:
+        if isinstance(runtime, AbstractAsyncContextManager):
+            runtime = await stack.enter_async_context(runtime)
+        yield runtime
+
+
+def _best_effort_github() -> GitHub | None:
+    """The Librarian reads review threads when it can; its absence is not an error."""
+    try:
+        return make_github()
+    except GitHubError:
+        return None
+
+
+async def _learn(
+    cfg: TenantConfig,
+    store: TaskStore,
+    gate: MemoryGate,
+    runtime: AgentRuntime,
+    gh: GitHub | None,
+    task_ids: Iterable[int],
+    *,
+    only_needed: bool = False,
+) -> list[LearnReport]:
+    """Run the Librarian per task; what it cannot do becomes a report error, not a crash."""
+    librarian = Librarian(cfg, store, gate, runtime, gh)
+    reports = []
+    for task_id in task_ids:
+        if only_needed and not librarian.needs_learning(task_id):
+            continue
+        try:
+            reports.append(await librarian.learn_task(task_id))
+        except LLM_ERRORS as e:
+            reports.append(
+                LearnReport(task_id, errors=[f"LLM request failed: {_one_line(e)}"])
+            )
+    return reports
+
+
+def _echo_warnings(reports: Iterable[LearnReport]) -> None:
+    for report in reports:
+        for error in report.errors:
+            typer.echo(f"warning: librarian #{report.task_id}: {_one_line(error)}")
+
+
+def _learn_from(
+    cfg: TenantConfig,
+    store: TaskStore,
+    task_ids: list[int],
+    gh: GitHub | None = None,
+    *,
+    only_needed: bool = False,
+) -> list[LearnReport]:
+    """Run the Librarian outside `task run` and `intake`; its warnings are printed."""
+
+    async def _run() -> list[LearnReport]:
+        async with _started(make_runtime(cfg)) as runtime:
+            gate = MemoryGate(cfg.tenant, _build_backend(cfg))
+            return await _learn(
+                cfg, store, gate, runtime, gh, task_ids, only_needed=only_needed
+            )
+
+    with _falkordb_guard(cfg):
+        reports = asyncio.run(_run())
+    _echo_warnings(reports)
+    return reports
+
+
 def _final_line(store: TaskStore, task: TaskRecord) -> str:
     line = f"task {task.id}: {task.state.value}"
     pr = store.latest_artifact(task.id, ArtifactKind.PR)
@@ -463,16 +539,14 @@ def task_run(
     for task in tasks:
         _remember_target(store, task.id, repo, main)
 
-    async def _run() -> list[TaskRecord | BaseException]:
-        runtime = make_runtime(cfg)
-        async with AsyncExitStack() as stack:
-            if isinstance(runtime, AbstractAsyncContextManager):
-                runtime = await stack.enter_async_context(runtime)
+    async def _run() -> tuple[list[TaskRecord | BaseException], list[LearnReport]]:
+        async with _started(make_runtime(cfg)) as runtime:
+            gate = MemoryGate(cfg.tenant, _build_backend(cfg))
             ctx = TaskContext(
                 cfg=cfg,
                 store=store,
                 runtime=runtime,
-                gate=MemoryGate(cfg.tenant, _build_backend(cfg)),
+                gate=gate,
                 github=make_github_writer(),
                 repo=repo,
                 repo_root=checkout,
@@ -480,11 +554,16 @@ def task_run(
                 runner=make_command_runner(contract, checkout, host),
                 main=main,
             )
-            return await run_many([(ctx, t.id) for t in tasks], cfg.concurrency)
+            outcomes = await run_many([(ctx, t.id) for t in tasks], cfg.concurrency)
+            finished = [r.id for r in outcomes if isinstance(r, TaskRecord)]
+            learned = await _learn(
+                cfg, store, gate, runtime, _best_effort_github(), finished
+            )
+            return outcomes, learned
 
     try:
         with _falkordb_guard(cfg):
-            results = asyncio.run(_run())
+            results, learned = asyncio.run(_run())
             for result in results:
                 if isinstance(result, BaseException) and not isinstance(
                     result, StepFailed | GitHubError | GitError | RestoreError
@@ -501,6 +580,7 @@ def task_run(
             continue
         typer.echo(f"task {task.id}: failed: {_one_line(result)}")
         code = code or (4 if isinstance(result, StepFailed) else 3)
+    _echo_warnings(learned)
     if code:
         raise typer.Exit(code)
 
@@ -548,23 +628,24 @@ def intake(
     store = TaskStore(cfg.database_url)
     store.create_all()
 
-    async def _run() -> IntakeReport:
-        runtime = make_runtime(cfg)
-        async with AsyncExitStack() as stack:
-            if isinstance(runtime, AbstractAsyncContextManager):
-                runtime = await stack.enter_async_context(runtime)
+    async def _run() -> tuple[IntakeReport, list[LearnReport]]:
+        async with _started(make_runtime(cfg)) as runtime:
             gate = MemoryGate(cfg.tenant, _build_backend(cfg))
-            return await run_intake(cfg, store, make_github(), runtime, gate, repo)
+            gh = make_github()
+            report = await run_intake(cfg, store, gh, runtime, gate, repo)
+            learned = await _learn(cfg, store, gate, runtime, gh, report.touched)
+            return report, learned
 
     try:
         with _falkordb_guard(cfg):
-            report = asyncio.run(_run())
+            report, learned = asyncio.run(_run())
     except GitHubError as e:
         raise _fail(str(e), 3) from e
     except LLM_ERRORS as e:
         raise _fail(f"LLM request failed: {_one_line(e)}") from e
     for line in _intake_lines(store, report):
         typer.echo(line)
+    _echo_warnings(learned)
     if report.github_failed:
         raise typer.Exit(3)
     if report.errors:
@@ -652,6 +733,7 @@ def decide(
             task_id, TaskState.CANCELLED, Role.HUMAN, "rejected by a human"
         )
         typer.echo(f"task {task_id}: cancelled")
+        _learn_from(cfg, store, [task_id], _best_effort_github())
         return
     if add_budget is not None:
         key = f"task:{task_id}:extra_budget"
@@ -659,3 +741,37 @@ def decide(
     typer.echo(
         f"task {task_id}: {decision.value} recorded; run `agentco task run {task_id}`"
     )
+    _learn_from(cfg, store, [task_id], _best_effort_github())
+
+
+@app.command()
+def learn(
+    task_id: Annotated[
+        int | None, typer.Argument(help="Task id; omit with --all.")
+    ] = None,
+    all_tasks: Annotated[
+        bool,
+        typer.Option("--all", help="Every task the Librarian has not finished with."),
+    ] = False,
+    config: Path = ConfigOption,
+) -> None:
+    """Run the Librarian again (re-runnable): it writes only what is not in memory yet."""
+    if (task_id is not None) == all_tasks:
+        raise _fail("give exactly one of a task id or --all")
+    cfg = _load(config)
+    store = TaskStore(cfg.database_url)
+    store.create_all()
+    if task_id is not None:
+        ids = [_task_of(store, cfg, task_id).id]
+    else:
+        ids = [t.id for t in store.list_tasks(cfg.tenant)]
+    try:
+        reports = _learn_from(cfg, store, ids, make_github(), only_needed=all_tasks)
+    except GitHubError as e:
+        raise _fail(str(e), 3) from e
+    if not reports:
+        typer.echo("nothing to learn")
+    for report in reports:
+        typer.echo(
+            f"#{report.task_id}: {report.added} added, {report.duplicates} duplicate"
+        )
