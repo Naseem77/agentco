@@ -628,3 +628,69 @@ def test_qa_failed_without_details_gets_a_synthetic_finding():
             detail="QA reported a failure but listed no failing cases.",
         ),
     )
+
+
+ROOT_CAUSE_LINE = (
+    "Root cause required: does the invariant remove the cause, not just this symptom?"
+)
+
+
+async def test_lead_sends_back_missing_invariant_without_llm(store, loop_cfg):
+    env = Env(store, loop_cfg, [], await gate_with("src/calc.py arithmetic"))
+    engineer = ENGINEER.model_copy(update={"invariant": "  "})
+
+    d = await env.run(engineer=engineer, fast_lane=True, require_invariant=True)
+
+    assert env.runtime.calls == []
+    assert d.outcome == "send_back"
+    [finding] = d.findings_to_fix
+    assert finding == Finding(
+        id="root-cause",
+        severity="major",
+        kind="bug",
+        title="State one invariant",
+        detail=(
+            "This area came back again: state the one rule that removes the cause, "
+            "apply it, and test it."
+        ),
+    )
+    [artifact] = store.artifacts(env.task.id, ArtifactKind.LEAD)
+    assert artifact.body["outcome"] == "send_back"
+    assert artifact.body["findings_to_fix"][0]["id"] == "root-cause"
+
+
+async def test_lead_prompt_mentions_root_cause_when_required(store, loop_cfg):
+    env = Env(store, loop_cfg, [lead_json()], await gate_with("src/calc.py arithmetic"))
+
+    d = await env.run(require_invariant=True)
+
+    [call] = env.runtime.calls
+    assert ROOT_CAUSE_LINE in call.prompt
+    assert d.outcome == "approve"
+
+
+async def test_root_cause_turns_the_fast_lane_off(store, loop_cfg):
+    env = Env(store, loop_cfg, [lead_json()], await gate_with("src/calc.py arithmetic"))
+
+    await env.run(
+        fast_lane=True,
+        require_invariant=True,
+        checks=CheckOutcome(REVIEW(F("n", "style", "nit")), QA_OK, ()),
+    )
+
+    assert len(env.runtime.calls) == 1
+
+
+async def test_lead_prompt_is_unchanged_without_root_cause(store, loop_cfg):
+    env = Env(store, loop_cfg, [lead_json()], await gate_with("src/calc.py arithmetic"))
+
+    await env.run()
+
+    assert "Root cause required" not in env.runtime.calls[0].prompt
+
+
+def test_prompts_mention_playbooks_and_one_rule():
+    assert "playbooks" in load_prompt(Role.SENIOR).lower()
+    assert "one rule" in load_prompt(Role.SENIOR).lower()
+    assert "invariant" in load_prompt(Role.LEAD)
+    assert "handled by code" in load_prompt(Role.TRIAGE)

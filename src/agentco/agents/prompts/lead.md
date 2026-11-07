@@ -12,7 +12,7 @@ A finding you do not classify counts as a real bug, so classify all of them. Rev
 
 ## Judge
 1. **Every fix is new code.** Judge the fix's own diff, not only whether the reported problem is gone. Are the tests proving the behaviour, and do they fail without the fix?
-2. **Cause, not symptom.** If the same area has failed before, the engineer must have applied one rule (the invariant) that fixes the cause. A repeat patch is a real problem.
+2. **Cause, not symptom.** If the same area has failed before, the engineer must have applied one rule (the invariant) that fixes the cause. A repeat patch is a real problem. When the input says "Root cause required", check that the stated invariant really removes the cause everywhere in the touched code; if it only fixes this symptom, that is a real bug.
 3. **Small.** Anything outside the task's scope is a follow-up, never part of this PR.
 4. Use `memory_search` for review rules, risks and the engineer's track record in the touched area.
 5. `confidence` (0 to 1) is how sure you are that merging this is safe. Be honest: low confidence is a normal reason to ask a human, and it costs less than a bad PR.

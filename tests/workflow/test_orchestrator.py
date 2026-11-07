@@ -1,5 +1,6 @@
 import json
 import time
+from datetime import UTC, datetime
 from pathlib import Path
 
 import pytest
@@ -21,8 +22,11 @@ from script_runner import FIXED, FULL, LINT, NEW_TEST, RED_CMD, ScriptRunner, gi
 
 from agentco.agents.prompts import load_prompt
 from agentco.github.client import FakeGitHub
+from agentco.learning.recurrence import record_recurrence
 from agentco.llm.fake import FakeRuntime
 from agentco.llm.runtime import AgentResult
+from agentco.memory.backend import MemoryItem
+from agentco.memory.scopes import Scope
 from agentco.roles import Role
 from agentco.sandbox.runner import CommandResult
 from agentco.store.models import ArtifactKind
@@ -759,3 +763,57 @@ async def test_concurrent_tasks_on_one_repo_serialise_their_git_work(
     assert [r.state for r in results] == [TaskState.PR_OPEN] * 2
     assert probe.peak == 1
     assert probe.calls.count("push_branch") == 2
+
+
+def with_invariant(step, invariant):
+    def run(call):
+        return json.dumps({**json.loads(step(call)), "invariant": invariant})
+
+    return run
+
+
+async def test_second_recurrence_sends_the_fix_to_a_senior_who_states_an_invariant(
+    make_rig,
+):
+    script = {
+        Role.PM: [PM_JSON],
+        Role.TRIAGE: [triage_json()] * 2,
+        Role.JUNIOR: [engineer(1)],
+        Role.SENIOR: [
+            with_invariant(
+                engineer(2),
+                "Operands are ordered once, at the boundary",
+            )
+        ],
+        Role.REVIEWER: [RULES_OK, REVIEW_FINDING, RULES_OK, REVIEW_OK, RULES_OK],
+        Role.QA: [QA_OK, QA_OK],
+        Role.LEAD: [LEAD_SEND_BACK, LEAD_OK],
+    }
+    rig = await make_rig(script)
+    for earlier in (98, 99):  # the area came back twice before, in other tasks
+        record_recurrence(rig.store, "acme", earlier, ["src/calc.py"], "pr-review-1")
+    await rig.backend.add(
+        "acme__rnd",
+        Scope.RND,
+        MemoryItem(
+            "pb",
+            "Playbook: order operands once at the boundary",
+            "t",
+            datetime.now(UTC),
+        ),
+    )
+
+    task = await rig.run()
+
+    assert task.state is TaskState.PR_OPEN
+    [first] = rig.calls(Role.JUNIOR)
+    [second] = rig.calls(Role.SENIOR)
+    assert "State in `invariant`" not in first.prompt
+    assert "State in `invariant`" in second.prompt
+    assert "Playbooks for this area (start from these):\n- " in second.prompt
+    assert "order operands once at the boundary" in second.prompt
+    triage = rig.store.artifacts(rig.task_id, ArtifactKind.TRIAGE)[-1]
+    assert triage.body["root_cause"] == ["src"] and triage.body["route"] == "senior"
+    lead1, lead2 = rig.calls(Role.LEAD)
+    assert "Root cause required" not in lead1.prompt
+    assert "Root cause required" in lead2.prompt
