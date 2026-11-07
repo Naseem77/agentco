@@ -67,6 +67,7 @@ def engineer(
     files: dict[str, str] | None = None,
     summary: str = "reordered operands",
     before: Callable[[AgentCall], None] | None = None,
+    no_test_reason: str = "",
 ) -> Callable[[AgentCall], str]:
     """An engineer step that writes real files into the worktree it is given."""
     written = files or {
@@ -87,6 +88,7 @@ def engineer(
                 "summary": summary,
                 "files_touched": list(written),
                 "tests_added": [p for p in written if p.startswith("tests/")],
+                "no_test_reason": no_test_reason,
             }
         )
 

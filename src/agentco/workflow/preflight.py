@@ -46,6 +46,7 @@ from agentco.sandbox.worktree import (
 )
 
 DETAIL_LINES = 60
+NO_TESTS_EXIT = 5  # pytest: no tests collected
 
 
 @dataclass(frozen=True)
@@ -178,7 +179,9 @@ class Preflight:
             )
         checks = [CheckResult("rebase", True, "")]
 
-        status = await asyncio.to_thread(_git, wt.path, "status", "--porcelain")
+        status = await asyncio.to_thread(
+            _git, wt.path, "status", "--porcelain", "--untracked-files=all"
+        )
         if status.strip():
             # the red check's restore would destroy uncommitted work
             checks.append(
@@ -188,6 +191,24 @@ class Preflight:
             )
             return _report(checks)
 
+        try:
+            return await self._gate(
+                wt, base, checks, fix_since, final, lead_comments, no_test_reason
+            )
+        finally:
+            # the tree was clean, so this only removes what the commands wrote
+            await _restore_shielded(wt)
+
+    async def _gate(
+        self,
+        wt: Worktree,
+        base: str,
+        checks: list[CheckResult],
+        fix_since: str | None,
+        final: bool,
+        lead_comments: list[str],
+        no_test_reason: str,
+    ) -> PreflightReport:
         if fix_since is not None:
             lines = await asyncio.to_thread(changed_lines, wt, fix_since)
             limit, scope = self.limits.fix_max_changed_lines, f"since {fix_since}"
@@ -292,6 +313,13 @@ class Preflight:
                 False,
                 f"could not run the new tests without the fix "
                 f"(exit {result.exit_code})\n{self._failure_detail(result)}",
+            )
+        if result.exit_code == NO_TESTS_EXIT:
+            return CheckResult(
+                "red",
+                False,
+                f"new tests were not collected (exit {NO_TESTS_EXIT}): cannot "
+                f"prove they fail without the fix\n{self._failure_detail(result)}",
             )
         if result.exit_code == 0:
             return CheckResult(

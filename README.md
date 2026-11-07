@@ -128,6 +128,7 @@ e2e: null                       # or a command; the key is required
 lint: make lint
 sandbox: { devcontainer: .devcontainer }   # or { compose: docker-compose.yml, service: app }
 test_files: pytest {files}      # optional: run only the tests a change affects
+env_passthrough: []             # optional: host variables the commands may see
 ```
 
 ```bash
@@ -156,8 +157,15 @@ the options. `decide <id> approve|reject|answer` answers it: `answer` needs `--n
 stopped on its budget continues. Every decision is also written to company memory as a human
 decision.
 
+**Security: commands the agents write run on your machine** (`--host`) with a reduced environment:
+only `PATH`, `HOME`, `LANG`, `LC_*`, `TERM`, `TMPDIR`, `USER`, `LOGNAME` and the variables listed in
+`env_passthrough` in `.agentco.yml` are passed on, so API keys and tokens (`OPENAI_API_KEY`,
+`GH_TOKEN`, `AWS_*`, ...) are not visible to them. This does not isolate the filesystem or the
+network, and the agent's own shell tool is limited only by its permission policy. Use the container
+sandbox, and do not feed untrusted text (such as issues from strangers) to the team without it.
+
 Exit codes of `task run`: 1 bad arguments, config, checkout or repo contract, 2 FalkorDB
-unreachable, 3 `gh` unavailable or failing, 4 a step failed and the task stayed where it was
+unreachable, 3 `gh` unavailable or failing or a git operation failed, 4 a step failed and the task stayed where it was
 (run it again to retry). `decide` uses 1 and 2.
 
 ## Tests

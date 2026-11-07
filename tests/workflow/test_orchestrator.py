@@ -1,4 +1,5 @@
 import json
+import time
 from pathlib import Path
 
 import pytest
@@ -662,3 +663,99 @@ async def test_run_many_returns_failures_instead_of_raising(make_rig):
 
     assert isinstance(first_result, StepFailed)
     assert second_result.state is TaskState.AWAITING_HUMAN
+
+
+async def test_no_test_reason_from_the_engineer_reaches_the_preflight(make_rig):
+    script = happy()
+    script[Role.JUNIOR] = [
+        engineer(
+            1,
+            files={"src/calc.py": FIXED + "# v1\n"},
+            no_test_reason="pure refactor, behaviour is covered",
+        )
+    ]
+    rig = await make_rig(script)
+
+    task = await rig.run()
+
+    assert task.state is TaskState.PR_OPEN
+    first = rig.store.artifacts(rig.task_id, ArtifactKind.PREFLIGHT)[0]
+    red = next(c for c in first.body["checks"] if c["name"] == "red")
+    assert red == {
+        "name": "red",
+        "ok": True,
+        "detail": "no new test: pure refactor, behaviour is covered",
+    }
+
+
+async def test_a_change_without_tests_or_reason_still_fails_red(make_rig):
+    script = happy()
+    bare = [engineer(i, files={"src/calc.py": FIXED + f"# v{i}\n"}) for i in (1, 2)]
+    script[Role.JUNIOR] = bare
+    script[Role.SENIOR] = bare
+    script[Role.TRIAGE] = [triage_json()] * 2
+    script[Role.REVIEWER] = [RULES_OK] * 6
+    rig = await make_rig(script, max_rounds=1)
+
+    await rig.run()
+
+    first = rig.store.artifacts(rig.task_id, ArtifactKind.PREFLIGHT)[0]
+    red = next(c for c in first.body["checks"] if c["name"] == "red")
+    assert (red["ok"], red["detail"]) == (False, "no new test")
+
+
+class GitLockProbe:
+    """Records overlap between git operations that touch the shared repository."""
+
+    def __init__(self) -> None:
+        self.active = 0
+        self.peak = 0
+        self.calls: list[str] = []
+
+    def wrap(self, name, real):
+        def wrapped(*args, **kwargs):
+            self.active += 1
+            self.peak = max(self.peak, self.active)
+            self.calls.append(name)
+            time.sleep(0.05)
+            try:
+                return real(*args, **kwargs)
+            finally:
+                self.active -= 1
+
+        return wrapped
+
+
+def by_prompt(call):
+    return (
+        RULES_OK
+        if call.system.startswith(load_prompt(Role.REVIEWER, "rules"))
+        else REVIEW_OK
+    )
+
+
+async def test_concurrent_tasks_on_one_repo_serialise_their_git_work(
+    make_rig, monkeypatch
+):
+    import agentco.workflow.orchestrator as orch
+
+    script = {
+        Role.PM: [PM_JSON] * 2,
+        Role.TRIAGE: [triage_json()] * 2,
+        Role.JUNIOR: [engineer(1), engineer(2)],
+        Role.REVIEWER: [by_prompt] * 8,
+        Role.QA: [QA_OK] * 2,
+        Role.LEAD: [LEAD_OK] * 2,
+    }
+    runtime = CountingRuntime(FakeRuntime(script))
+    rig = await make_rig({}, runtime=runtime)
+    second = rig.new_task("Second task")
+    probe = GitLockProbe()
+    for name in ("refresh_main", "create_worktree", "push_branch"):
+        monkeypatch.setattr(orch, name, probe.wrap(name, getattr(orch, name)))
+
+    results = await run_many([(rig.ctx, rig.task_id), (rig.ctx, second)], limit=2)
+
+    assert [r.state for r in results] == [TaskState.PR_OPEN] * 2
+    assert probe.peak == 1
+    assert probe.calls.count("push_branch") == 2

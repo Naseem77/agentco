@@ -45,6 +45,7 @@ class RepoContract(BaseModel):
     lint: str
     sandbox: Sandbox
     test_files: str | None = None  # command template; must contain {files}
+    env_passthrough: list[str] = []  # host variables the commands may see
 
     @field_validator("build", "test", "e2e", "lint")
     @classmethod

@@ -38,9 +38,11 @@ from agentco.repo_contract import (
 )
 from agentco.roles import Role
 from agentco.sandbox.runner import CommandRunner, runner_for
+from agentco.sandbox.worktree import GitError
 from agentco.store.models import ArtifactKind, TaskRecord
 from agentco.store.task_store import TaskStore
 from agentco.workflow.orchestrator import StepFailed, TaskContext, run_many
+from agentco.workflow.preflight import RestoreError
 from agentco.workflow.states import TaskState
 
 # Seam: CLI tests replace this with an in-memory backend.
@@ -484,7 +486,7 @@ def task_run(
             results = asyncio.run(_run())
             for result in results:
                 if isinstance(result, BaseException) and not isinstance(
-                    result, StepFailed | GitHubError
+                    result, StepFailed | GitHubError | GitError | RestoreError
                 ):
                     raise result
     except GitHubError as e:

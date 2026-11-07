@@ -10,7 +10,7 @@ import os
 import signal
 import subprocess
 import time
-from collections.abc import Callable
+from collections.abc import Callable, Iterable
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Protocol
@@ -22,6 +22,9 @@ NOT_FOUND_EXIT = 127
 KILL_GRACE_S = 2.0
 OUTPUT_LINES = 200
 DEFAULT_PREPARE_TIMEOUT_S = 900
+
+SAFE_ENV = frozenset({"PATH", "HOME", "LANG", "TERM", "TMPDIR", "USER", "LOGNAME"})
+SAFE_ENV_PREFIXES = ("LC_",)
 
 ExecFn = Callable[[list[str], Path, float], tuple[int, str]]
 
@@ -48,12 +51,29 @@ def _tail(text: str) -> str:
     return "".join(lines[-OUTPUT_LINES:])
 
 
-def _exec(argv: list[str], cwd: Path, timeout_s: float) -> tuple[int, str]:
+def safe_env(extra: Iterable[str] = ()) -> dict[str, str]:
+    """The host environment cut down to an allowlist, so LLM-written commands
+    cannot read API keys or tokens. `extra` names variables a repo opts into."""
+    allowed = SAFE_ENV | set(extra)
+    return {
+        k: v
+        for k, v in os.environ.items()
+        if k in allowed or k.startswith(SAFE_ENV_PREFIXES)
+    }
+
+
+def _exec(
+    argv: list[str],
+    cwd: Path,
+    timeout_s: float,
+    env: dict[str, str] | None = None,
+) -> tuple[int, str]:
     """Run argv, merging stderr into stdout; exit 124 on timeout, 127 if not found."""
     try:
         proc = subprocess.Popen(
             argv,
             cwd=cwd,
+            env=env,
             stdin=subprocess.DEVNULL,
             stdout=subprocess.PIPE,
             stderr=subprocess.STDOUT,
@@ -83,9 +103,13 @@ def _exec(argv: list[str], cwd: Path, timeout_s: float) -> tuple[int, str]:
 
 
 class HostRunner:
+    def __init__(self, env_passthrough: Iterable[str] = ()) -> None:
+        self._env_passthrough = tuple(env_passthrough)
+
     def run(self, command: str, cwd: Path, timeout_s: float) -> CommandResult:
         start = time.monotonic()
-        code, output = _exec(["sh", "-lc", command], cwd, timeout_s)
+        env = safe_env(self._env_passthrough)
+        code, output = _exec(["sh", "-lc", command], cwd, timeout_s, env)
         return CommandResult(
             command=command,
             exit_code=code,
@@ -167,5 +191,5 @@ class ContainerRunner:
 
 def runner_for(contract: RepoContract, repo_root: Path, host: bool) -> CommandRunner:
     if host:
-        return HostRunner()
+        return HostRunner(contract.env_passthrough)
     return ContainerRunner(contract, repo_root)
