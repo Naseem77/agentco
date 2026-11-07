@@ -100,7 +100,17 @@ def create_qa_followup(store: TaskStore, task: TaskRecord) -> TaskRecord | None:
         _complete(store, store.get(int(existing)), task, sources)
         return None
     title = f"QA regression tests for #{task.id}: {task.title}"[:_TITLE_LIMIT]
-    created = store.create_task(
+    # A crash between create_task and set_meta must not make the next run create it again.
+    created = next(
+        (
+            t
+            for t in store.list_tasks(task.tenant, tuple(TaskState))
+            if t.parent_id == task.id
+            and t.source == FOLLOWUP_SOURCE
+            and t.title == title
+        ),
+        None,
+    ) or store.create_task(
         task.tenant, title, FOLLOWUP_SOURCE, f"task:{task.id}", parent_id=task.id
     )
     store.set_meta(key, str(created.id))

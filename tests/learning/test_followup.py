@@ -79,6 +79,25 @@ def test_followup_created_once_after_merge(store):
     ]
 
 
+def test_crash_between_create_and_marker_reuses_the_followup(store):
+    parent = task_in(store, TaskState.MERGED, title="Fix the parser")
+    orphan = store.create_task(
+        "acme",
+        "QA regression tests for #1: Fix the parser",
+        FOLLOWUP_SOURCE,
+        "task:1",
+        parent_id=parent.id,
+    )
+    store.create_task(
+        "acme", "an edge case", FOLLOWUP_SOURCE, "task:1", parent_id=parent.id
+    )
+
+    assert create_qa_followup(store, parent).id == orphan.id
+    assert store.get_meta(followup_marker("acme", parent.id)) == str(orphan.id)
+    assert len(store.list_tasks("acme", tuple(TaskState))) == 3
+    assert store.artifacts(orphan.id, K.REQUEST) != []
+
+
 def test_followup_without_a_parent_target_has_no_target(store):
     parent = task_in(store, TaskState.MERGED)
     created = create_qa_followup(store, parent)

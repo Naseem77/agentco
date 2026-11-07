@@ -494,6 +494,18 @@ def _learn_from(
     return reports
 
 
+def _learn_after_decision(cfg: TenantConfig, store: TaskStore, task_id: int) -> None:
+    """The decision is already saved: whatever goes wrong here is a warning, not an exit code."""
+    try:
+        _learn_from(cfg, store, [task_id], _best_effort_github())
+    except typer.Exit:
+        typer.echo(
+            f"warning: librarian #{task_id}: skipped; run `agentco learn {task_id}`"
+        )
+    except Exception as e:  # noqa: BLE001
+        typer.echo(f"warning: librarian #{task_id}: {_one_line(e)}")
+
+
 def _final_line(store: TaskStore, task: TaskRecord) -> str:
     line = f"task {task.id}: {task.state.value}"
     pr = store.latest_artifact(task.id, ArtifactKind.PR)
@@ -736,7 +748,7 @@ def decide(
             task_id, TaskState.CANCELLED, Role.HUMAN, "rejected by a human"
         )
         typer.echo(f"task {task_id}: cancelled")
-        _learn_from(cfg, store, [task_id], _best_effort_github())
+        _learn_after_decision(cfg, store, task_id)
         return
     if add_budget is not None:
         key = f"task:{task_id}:extra_budget"
@@ -744,7 +756,7 @@ def decide(
     typer.echo(
         f"task {task_id}: {decision.value} recorded; run `agentco task run {task_id}`"
     )
-    _learn_from(cfg, store, [task_id], _best_effort_github())
+    _learn_after_decision(cfg, store, task_id)
 
 
 @app.command()
