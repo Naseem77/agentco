@@ -42,6 +42,9 @@ from agentco.sandbox.worktree import (
 _MARKER = re.compile(
     r"(?P<name>[A-Za-z0-9_-]+)\.(?P<state>ready|dead|task-(?P<id>\d+))\.json"
 )
+_ENTRY = re.compile(
+    r"w-[A-Za-z0-9]+"
+)  # what `fill` names an entry; nothing else is ours
 
 
 @dataclass(frozen=True)
@@ -100,7 +103,9 @@ class WorktreePool:
     def _entry_dirs(self) -> list[Path]:
         if not self.dir.is_dir():
             return []
-        return sorted(p for p in self.dir.iterdir() if p.is_dir())
+        return sorted(
+            p for p in self.dir.iterdir() if p.is_dir() and _ENTRY.fullmatch(p.name)
+        )
 
     def _marker(self, name: str, state: str) -> Path:
         return self.dir / f"{name}.{state}.json"

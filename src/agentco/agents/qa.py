@@ -122,7 +122,8 @@ async def run_qa(
     *,
     fast_lane: bool,
 ) -> QAReply:
-    snapshot_path = wt.path.parent / f"{wt.path.name}-qa-r{round_}"
+    snapshot_dir = wt.path.parents[1] / "qa"  # never inside the worktree pool folder
+    snapshot_path = snapshot_dir / f"{wt.path.name}-qa-r{round_}"
     shutil.rmtree(snapshot_path, ignore_errors=True)  # stale crashed run
     try:
         await asyncio.to_thread(make_snapshot, wt, snapshot_path)

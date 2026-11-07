@@ -449,6 +449,13 @@ class _Run:
             and decision.body.get("decision") in ("approve", "answer")
         )
 
+    async def _may_design(self, task: TaskRecord) -> bool:
+        """Only a task that has not started can become an ADR parent.
+
+        Later, an ADR would orphan the task's branch and commits.
+        """
+        return task.parent_id is None and task.round == 0 and not await self._resuming()
+
     async def _triage(self, task: TaskRecord) -> None:
         if await self._escalate_if_over_budget(task):
             return
@@ -462,7 +469,7 @@ class _Run:
                 self._issue(),
                 human_ok=self._human_ok(),
                 known_ok=task.source == ADR_SOURCE,  # the human approved the design
-                allow_architect=task.parent_id is None and not self._is_pr_round(),
+                allow_architect=await self._may_design(task),
             )
         except (ReplyInvalid, AgentStuck) as exc:
             await self._escalate("stuck", _agent_error(exc), actor=Role.TRIAGE)

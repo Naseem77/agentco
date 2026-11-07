@@ -225,3 +225,16 @@ async def test_pr_round_new_design_escalates(make_rig):
     assert task.state is TaskState.AWAITING_HUMAN
     assert rig.calls(Role.ARCHITECT) == []
     assert rig.escalations()[-1]["from_state"] == "triage"
+
+
+async def test_task_with_an_existing_worktree_never_becomes_an_adr_parent(make_rig):
+    rig = await make_rig(design_script())
+    (rig.ctx.repo_root / ".agentco" / "worktrees" / str(rig.task_id)).mkdir(
+        parents=True
+    )
+
+    task = await rig.run()
+
+    assert task.state is TaskState.AWAITING_HUMAN
+    assert rig.calls(Role.ARCHITECT) == []
+    assert rig.escalations()[-1]["from_state"] == "triage"
