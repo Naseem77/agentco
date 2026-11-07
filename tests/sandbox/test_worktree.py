@@ -434,6 +434,82 @@ def test_push_branch_refuses_to_overwrite_a_commit_pushed_after_our_last_fetch(
     assert _remote_sha(root, tmp_path, "agentco/task-5") == theirs
 
 
+def _reviewer_pushes(tmp_path):
+    reviewer = tmp_path / "reviewer"
+    git(tmp_path, "clone", str(tmp_path / "repo.git"), str(reviewer))
+    git(reviewer, "checkout", "agentco/task-5")
+    (reviewer / "c.py").write_text("z = 1\n")
+    git(reviewer, "add", "-A")
+    git(
+        reviewer,
+        "-c",
+        "user.name=r",
+        "-c",
+        "user.email=r@example.com",
+        "commit",
+        "-m",
+        "suggestion",
+    )
+    git(reviewer, "push", "origin", "agentco/task-5")
+    return git(reviewer, "rev-parse", "HEAD").strip()
+
+
+def test_push_branch_refuses_after_a_fetch_moved_the_tracking_ref(make_repo, tmp_path):
+    root = make_repo({"a.py": "x = 1\n"})
+    wt = create_worktree(root, 5, "main")
+    (wt.path / "b.py").write_text("y = 1\n")
+    commit_all(wt, "task")
+    push_branch(wt)
+    theirs = _reviewer_pushes(tmp_path)
+    git(
+        root, "fetch", "origin"
+    )  # a user or an IDE fetching must not arm the force push
+    assert (
+        git(root, "rev-parse", "refs/remotes/origin/agentco/task-5").strip() == theirs
+    )
+    git(wt.path, "commit", "--amend", "-m", "reworded", "--allow-empty")
+
+    with pytest.raises(GitError):
+        push_branch(wt)
+
+    assert _remote_sha(root, tmp_path, "agentco/task-5") == theirs
+
+
+def test_push_branch_records_what_it_pushed_in_a_private_ref(make_repo):
+    root = make_repo({"a.py": "x = 1\n"})
+    wt = create_worktree(root, 5, "main")
+    (wt.path / "b.py").write_text("y = 1\n")
+    sha = commit_all(wt, "task")
+    push_branch(wt)
+    assert git(root, "rev-parse", "refs/agentco/pushed/agentco/task-5").strip() == sha
+    git(wt.path, "commit", "--amend", "-m", "reworded", "--allow-empty")
+    push_branch(wt)
+    assert git(
+        root, "rev-parse", "refs/agentco/pushed/agentco/task-5"
+    ).strip() == head_sha(wt)
+
+
+def test_branch_rebuilt_from_origin_leases_on_what_it_was_built_from(
+    make_repo, tmp_path
+):
+    root = make_repo({"a.py": "x = 1\n"})
+    wt = create_worktree(root, 5, "main")
+    (wt.path / "b.py").write_text("y = 1\n")
+    commit_all(wt, "task")
+    push_branch(wt)
+    theirs = _reviewer_pushes(tmp_path)
+    shutil.rmtree(wt.path)
+    git(root, "worktree", "prune")
+    git(root, "branch", "-D", "agentco/task-5")
+
+    again = create_worktree(root, 5, "main")
+
+    assert head_sha(again) == theirs
+    git(again.path, "commit", "--amend", "-m", "reworded", "--allow-empty")
+    push_branch(again)
+    assert _remote_sha(root, tmp_path, "agentco/task-5") == head_sha(again)
+
+
 def test_push_branch_never_forces_a_branch_that_is_not_a_task_branch(
     make_repo, tmp_path
 ):

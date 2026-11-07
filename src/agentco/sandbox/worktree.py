@@ -143,7 +143,10 @@ def create_worktree(repo_root: Path, task_id: int, base_ref: str) -> Worktree:
             str(path),
             f"origin/{branch}",
         )
+        # What the branch was rebuilt from is what we have seen of the remote.
+        _record_pushed(repo_root, branch, head_sha(wt))
     else:
+        _record_pushed(repo_root, branch, None)
         _git(
             repo_root,
             "worktree",
@@ -389,26 +392,46 @@ def is_ancestor(wt: Worktree, commit: str) -> bool:
 _TASK_BRANCH = re.compile(r"agentco/task-\d+")
 
 
+def _pushed_ref(branch: str) -> str:
+    return f"refs/agentco/pushed/{branch}"
+
+
+def _rev(cwd: Path, ref: str) -> str | None:
+    proc = _run(cwd, "rev-parse", "--verify", "--quiet", ref)
+    return proc.stdout.decode().strip() if proc.returncode == 0 else None
+
+
+def _record_pushed(cwd: Path, branch: str, sha: str | None) -> None:
+    """Remember, in a ref only agentco writes, the last commit we know the remote had."""
+    if sha is None:
+        _run(cwd, "update-ref", "-d", _pushed_ref(branch))
+    else:
+        _run(cwd, "update-ref", _pushed_ref(branch), sha)
+
+
 def push_branch(wt: Worktree) -> None:
     """Publish the task branch, replacing what is there if a rebase rewrote it.
 
     Only agentco's own `agentco/task-<id>` branch may be forced; it is never main.
-    The lease is the remote-tracking ref as last fetched (or pushed), so a commit
-    anyone else pushed since then, such as a reviewer's suggestion, is refused
-    instead of overwritten; the caller escalates the GitError.
+    The lease is the commit agentco itself last pushed (or rebuilt the branch from),
+    kept in the private ref refs/agentco/pushed/<branch>, so a commit anyone else
+    pushed since then, such as a reviewer's suggestion, is refused instead of
+    overwritten even if a `git fetch` has since moved refs/remotes/origin/<branch>;
+    the caller escalates the GitError. Before the first push there is no private ref:
+    the lease is then the remote-tracking ref, or the remote's own branch if never
+    fetched (empty when the branch does not exist there).
     """
     if not _TASK_BRANCH.fullmatch(wt.branch):
         raise GitError(f"refusing to push {wt.branch!r}: not an agentco task branch")
     ref = f"refs/heads/{wt.branch}"
-    tracking = _run(
-        wt.path, "rev-parse", "--verify", "--quiet", f"refs/remotes/origin/{wt.branch}"
-    )
-    if tracking.returncode == 0:
-        expected = tracking.stdout.decode().strip()
-    else:
+    expected = _rev(wt.path, _pushed_ref(wt.branch))
+    if expected is None:
+        expected = _rev(wt.path, f"refs/remotes/origin/{wt.branch}")
+    if expected is None:
         # Never fetched: only the first push (nothing remote) can be proven safe.
         listing = _git(wt.path, "ls-remote", "--heads", "origin", ref).split()
         expected = listing[0] if listing else ""
+    pushed = _rev(wt.path, ref)
     _git(
         wt.path,
         "push",
@@ -417,6 +440,8 @@ def push_branch(wt: Worktree) -> None:
         "origin",
         f"{wt.branch}:{ref}",
     )
+    if pushed is not None:
+        _record_pushed(wt.path, wt.branch, pushed)
 
 
 def remove_worktree(repo_root: Path, path: Path) -> None:
