@@ -74,6 +74,10 @@ class PreflightReport:
         }
 
 
+class RestoreError(RuntimeError):
+    pass
+
+
 class RulesReply(Reply):
     violations: list[str] = Field(default_factory=list)
 
@@ -92,6 +96,27 @@ def _restore(wt: Worktree) -> None:
     # No -x: ignored dependency directories must survive.
     _git(wt.path, "reset", "--hard", "HEAD")
     _git(wt.path, "clean", "-fd")
+
+
+async def _restore_shielded(wt: Worktree) -> None:
+    """Restore to completion even when the task is cancelled (again) meanwhile."""
+    restore = asyncio.ensure_future(asyncio.to_thread(_restore, wt))
+    cancelled = False
+    while not restore.done():
+        try:
+            await asyncio.shield(restore)
+        except asyncio.CancelledError:
+            cancelled = True
+        except Exception:  # noqa: BLE001 - reported below
+            break
+    error = restore.exception() if restore.done() else None
+    if error is not None:
+        raise RestoreError(
+            f"could not restore the worktree at {wt.path}; it may be left "
+            f"reverted to the state without the fix: {error}"
+        ) from error
+    if cancelled:
+        raise asyncio.CancelledError
 
 
 def _revert_source(wt: Worktree, base: str, sources: list[str]) -> None:
@@ -152,6 +177,16 @@ class Preflight:
                 conflict=True,
             )
         checks = [CheckResult("rebase", True, "")]
+
+        status = await asyncio.to_thread(_git, wt.path, "status", "--porcelain")
+        if status.strip():
+            # the red check's restore would destroy uncommitted work
+            checks.append(
+                CheckResult(
+                    "clean", False, "uncommitted changes in the worktree: commit first"
+                )
+            )
+            return _report(checks)
 
         if fix_since is not None:
             lines = await asyncio.to_thread(changed_lines, wt, fix_since)
@@ -241,22 +276,16 @@ class Preflight:
         sources = [p for p in files if not is_test_path(p)]
         if not sources:
             return CheckResult("red", True, "test-only change: no fix to revert")
-        status = await asyncio.to_thread(_git, wt.path, "status", "--porcelain")
-        if status.strip():
-            # the restore below would destroy uncommitted work
-            return CheckResult(
-                "red", False, "uncommitted changes in the worktree: commit first"
-            )
-
         named = [p for p in tests if _is_test_name(p)]
         command = test_command(
             self.contract, AffectedTests(tuple(named), not named, "new tests")
         )
         try:
-            await asyncio.to_thread(_revert_source, wt, base, sources)
+            # blocking on purpose: cancellation can only land at the command await
+            _revert_source(wt, base, sources)
             result = await self._exec(command, wt)
         finally:
-            await asyncio.to_thread(_restore, wt)
+            await _restore_shielded(wt)
         if result.exit_code in (TIMEOUT_EXIT, NOT_FOUND_EXIT):
             return CheckResult(
                 "red",

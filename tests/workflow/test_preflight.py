@@ -1,4 +1,6 @@
+import asyncio
 import subprocess
+import threading
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -15,7 +17,13 @@ from agentco.repo_contract import RepoContract, Sandbox
 from agentco.roles import Role
 from agentco.sandbox.runner import CommandResult, ContainerError
 from agentco.sandbox.worktree import commit_all, create_worktree
-from agentco.workflow.preflight import CheckResult, Preflight, PreflightReport
+from agentco.workflow import preflight as preflight_module
+from agentco.workflow.preflight import (
+    CheckResult,
+    Preflight,
+    PreflightReport,
+    RestoreError,
+)
 
 ORIGINAL = "def add(a, b):\n    return a + b\n\ndef mul(a, b):\n    return a * b\n"
 FIXED = "def add(a, b):\n    return b + a\n\ndef mul(a, b):\n    return a * b\n"
@@ -230,6 +238,97 @@ async def test_red_check_restores_worktree_even_on_crash(make_repo, store):
     assert (wt.path / "src/calc.py").read_text() == FIXED
 
 
+class BlockingRunner(ScriptRunner):
+    """Blocks inside the red command until released."""
+
+    def __init__(self):
+        super().__init__()
+        self.entered = threading.Event()
+        self.release = threading.Event()
+
+    def run(self, command, cwd, timeout_s):
+        if command == RED_CMD:
+            self.entered.set()
+            self.release.wait(10)
+        return super().run(command, cwd, timeout_s)
+
+
+async def start_blocked_red(make_repo, store, runner):
+    _, wt = fixed_worktree(make_repo)
+    task = asyncio.create_task(go(make_preflight(runner, store), wt))
+    while not runner.entered.is_set():
+        await asyncio.sleep(0.01)
+    assert (wt.path / "src/calc.py").read_text() == ORIGINAL
+    return wt, task
+
+
+async def test_cancel_during_red_restores_the_fix(make_repo, store):
+    runner = BlockingRunner()
+    wt, task = await start_blocked_red(make_repo, store, runner)
+    head = git(wt.path, "rev-parse", "HEAD")
+    task.cancel()
+    runner.release.set()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+    assert (wt.path / "src/calc.py").read_text() == FIXED
+    assert git(wt.path, "status", "--porcelain") == ""
+    assert git(wt.path, "rev-parse", "HEAD") == head
+
+
+async def test_second_cancel_cannot_interrupt_the_restore(
+    make_repo, store, monkeypatch
+):
+    real_restore = preflight_module._restore
+
+    def slow_restore(wt):
+        threading.Event().wait(0.3)
+        real_restore(wt)
+
+    monkeypatch.setattr(preflight_module, "_restore", slow_restore)
+    runner = BlockingRunner()
+    wt, task = await start_blocked_red(make_repo, store, runner)
+    task.cancel()
+    runner.release.set()
+    await asyncio.sleep(0.1)  # the restore is now running in its thread
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+    assert (wt.path / "src/calc.py").read_text() == FIXED
+    assert git(wt.path, "status", "--porcelain") == ""
+
+
+async def test_failed_restore_is_reported_as_possibly_reverted(
+    make_repo, store, monkeypatch
+):
+    def broken_restore(wt):
+        raise OSError("disk gone")
+
+    monkeypatch.setattr(preflight_module, "_restore", broken_restore)
+    _, wt = fixed_worktree(make_repo)
+    with pytest.raises(RestoreError) as e:
+        await go(make_preflight(ScriptRunner(codes={RED_CMD: 1}), store), wt)
+    assert str(e.value) == (
+        f"could not restore the worktree at {wt.path}; it may be left reverted "
+        "to the state without the fix: disk gone"
+    )
+
+
+async def test_command_artifacts_do_not_break_red(make_repo, store):
+    _, wt = fixed_worktree(make_repo)
+
+    class Artifacts(ScriptRunner):
+        def run(self, command, cwd, timeout_s):
+            if command == BUILD:
+                (cwd / "dist.txt").write_text("build output")
+            return super().run(command, cwd, timeout_s)
+
+    rep = await go(make_preflight(Artifacts(codes={RED_CMD: 1}), store), wt)
+    red = {c.name: c for c in rep.checks}["red"]
+    assert (red.ok, red.detail) == (True, "new tests fail without the fix (exit 1)")
+    assert git(wt.path, "status", "--porcelain") == ""
+    assert (wt.path / "src/calc.py").read_text() == FIXED
+
+
 async def test_red_keeps_ignored_dependency_dirs(make_repo, store):
     _, wt = fixed_worktree(make_repo)
     exclude = Path(git(wt.path, "rev-parse", "--git-path", "info/exclude"))
@@ -241,15 +340,16 @@ async def test_red_keeps_ignored_dependency_dirs(make_repo, store):
     assert (wt.path / "node_modules/dep.js").read_text() == "x"
 
 
-async def test_red_refuses_to_touch_uncommitted_work(make_repo, store):
+async def test_uncommitted_work_fails_fast_before_any_command(make_repo, store):
     _, wt = fixed_worktree(make_repo)
     (wt.path / "notes.txt").write_text("keep me")
     runner = ScriptRunner()
     rep = await go(make_preflight(runner, store), wt)
-    red = {c.name: c for c in rep.checks}["red"]
-    assert not red.ok
-    assert red.detail == "uncommitted changes in the worktree: commit first"
-    assert RED_CMD not in runner.calls
+    assert [(c.name, c.ok, c.detail) for c in rep.checks] == [
+        ("rebase", True, ""),
+        ("clean", False, "uncommitted changes in the worktree: commit first"),
+    ]
+    assert runner.calls == []
     assert (wt.path / "notes.txt").read_text() == "keep me"
 
 

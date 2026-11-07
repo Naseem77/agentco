@@ -166,7 +166,8 @@ async def affected_tests(
         file_ranges = ranges.get(path, [])
         spans = _function_spans(symbols.get(path, []))
         for hunk in file_ranges:
-            if not _inside_functions(spans, hunk):
+            # a test file is run itself, so its module-level code is not code under test
+            if not _is_test_name(path) and not _inside_functions(spans, hunk):
                 return _full(f"{path}:{hunk[0]} changes code outside any function")
         if (wt.path / path).is_file():
             removed = await asyncio.to_thread(
