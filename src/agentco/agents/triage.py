@@ -15,7 +15,7 @@ from agentco.llm.runtime import AgentCall
 from agentco.memory.gate import MemoryGate
 from agentco.memory.scopes import Scope
 from agentco.roles import Role
-from agentco.store.models import ArtifactKind, TaskRecord
+from agentco.store.models import Artifact, ArtifactKind, TaskRecord
 from agentco.store.task_store import TaskStore
 
 _SMALL = frozenset({"xs", "s"})
@@ -52,16 +52,18 @@ def _repeat_paths(store: TaskStore, task_id: int) -> list[str]:
     return sorted(path for path, seen in rounds.items() if len(seen) >= 2)
 
 
-def _send_back_paths(store: TaskStore, task_id: int) -> list[str]:
-    """Paths of the latest send-back, whether it came from the lead or from the PR."""
+def _latest_send_back(store: TaskStore, task_id: int) -> Artifact | None:
+    """The latest send-back, whether it came from the lead or from the PR."""
     sent_back = [
         a
         for a in store.artifacts(task_id, ArtifactKind.LEAD)
         if a.body.get("outcome") == "send_back"
     ]
-    if not sent_back:
-        return []
-    findings = sent_back[-1].body.get("findings_to_fix", [])
+    return sent_back[-1] if sent_back else None
+
+
+def _send_back_paths(latest: Artifact | None) -> list[str]:
+    findings = latest.body.get("findings_to_fix", []) if latest else []
     return [f["path"] for f in findings if f.get("path")]
 
 
@@ -121,8 +123,17 @@ async def run_triage(
         )
 
     # An area is hot once it has come back `root_cause_after` times, across tasks.
-    record_recurrence(store, task.tenant, task.id, repeated, f"round-{task.round}")
-    back_paths = _send_back_paths(store, task.id)
+    # The PR intake already recorded its own send-back, so that one is not counted again.
+    latest = _latest_send_back(store, task.id)
+    back_paths = _send_back_paths(latest)
+    from_pr = latest is not None and latest.body.get("source") == "pr"
+    record_recurrence(
+        store,
+        task.tenant,
+        task.id,
+        [] if from_pr else [path for path in repeated if path in back_paths],
+        f"round-{task.round}",
+    )
     back_modules = sorted({module_of(path) for path in back_paths})
     counts = area_recurrences(store, task.tenant, back_modules)
     hot = tuple(
@@ -130,7 +141,7 @@ async def run_triage(
         for module in back_modules
         if counts[module] >= cfg.thresholds.root_cause_after
     )
-    if hot:
+    if hot and not architect:  # a root cause never turns a design into plain work
         route = Role.SENIOR
         require_invariant = True
         reason = (

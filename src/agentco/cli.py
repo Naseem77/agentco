@@ -813,15 +813,17 @@ def serve(
     store = TaskStore(cfg.database_url)
     store.create_all()
 
-    def run_once() -> None:
+    def run_once() -> bool:
+        """True when another intake held the lease, so the trigger tries again."""
         with _falkordb_guard(cfg):
             report, learned = _intake_once(cfg, store, repo)
         if report.busy:
             typer.echo(f"another intake for {repo} is running; skipped")
-            return
+            return True
         for line in _intake_lines(store, report):
             typer.echo(line)
         _echo_warnings(learned)
+        return False
 
     trigger = IntakeTrigger(run_once, cfg.webhook.debounce_s)
     server = make_server(

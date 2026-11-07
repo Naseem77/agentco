@@ -240,6 +240,17 @@ def test_recover_removes_half_filled_entry(repo):
     assert "w-half" not in git(repo, "worktree", "list")
 
 
+def test_recover_and_fill_leave_foreign_directories_alone(repo):
+    pool = WorktreePool(repo, 1)
+    pool.fill("main", prepare)
+    foreign = pool.dir / "w-abc123-qa-r1"
+    foreign.mkdir()
+    (foreign / "f.txt").write_text("x")
+    pool.recover()
+    pool.fill("main", prepare)
+    assert (foreign / "f.txt").exists()
+
+
 def test_recover_finishes_a_dead_entry_and_spares_claimed_ones(repo):
     pool = WorktreePool(repo, 2)
     pool.fill("main", prepare)

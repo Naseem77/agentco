@@ -30,6 +30,9 @@ ACCEPTED_EVENTS = frozenset(
     }
 )
 SOCKET_TIMEOUT_S = 10
+BODY_DEADLINE_S = 30  # in total, so a slow trickle cannot hold a connection slot
+BUSY_RETRY_S = 5.0
+BUSY_RETRIES = 6
 MAX_CONNECTIONS = 32  # slow or idle clients must not exhaust threads before auth
 _SIGNATURE_RE = re.compile(r"sha256=[0-9a-f]{64}")
 _DELIVERY_RE = re.compile(r"[A-Za-z0-9._-]{1,128}")
@@ -89,12 +92,25 @@ class IntakeTrigger:
     """Coalescing trigger: one run in progress and at most one more pending.
 
     Requests that arrive during the debounce window or while a run is in progress
-    all collapse into a single follow-up run.
+    all collapse into a single follow-up run. A run that returns `True` found
+    another intake holding the lease: it is requested again after `busy_retry_s`,
+    at most `busy_retries` times in a row, since its delivery is already marked seen.
     """
 
-    def __init__(self, run_once: Callable[[], object], debounce_s: float) -> None:
+    def __init__(
+        self,
+        run_once: Callable[[], object],
+        debounce_s: float,
+        *,
+        busy_retry_s: float = BUSY_RETRY_S,
+        busy_retries: int = BUSY_RETRIES,
+    ) -> None:
         self._run_once = run_once
         self._debounce_s = debounce_s
+        self._busy_retry_s = busy_retry_s
+        self._busy_retries = busy_retries
+        self._busy_streak = 0
+        self._not_before = 0.0
         self._cond = threading.Condition()
         self._pending = False
         self._running = False
@@ -109,6 +125,7 @@ class IntakeTrigger:
             if self._closed:
                 return
             self._pending = True
+            self._busy_streak = 0
             self._cond.notify_all()
 
     def wait_idle(self, timeout: float) -> bool:
@@ -135,19 +152,30 @@ class IntakeTrigger:
                     self._cond.wait()
                 if self._closed:
                     return
-                if self._debounce_s > 0:
-                    self._cond.wait(self._debounce_s)
-                    if self._closed:
-                        return
+                deadline = max(time.monotonic() + self._debounce_s, self._not_before)
+                while not self._closed:  # a request also wakes this wait: keep going
+                    left = deadline - time.monotonic()
+                    if left <= 0:
+                        break
+                    self._cond.wait(left)
+                if self._closed:
+                    return
                 self._pending = False
                 self._running = True
+            busy = False
             try:
-                self._run_once()
+                busy = self._run_once() is True
             except Exception as exc:  # noqa: BLE001 - the worker must survive any failed run
                 print(f"webhook: intake run failed: {exc!r}", file=sys.stderr)
             finally:
                 with self._cond:
                     self._running = False
+                    if busy and self._busy_streak < self._busy_retries:
+                        self._busy_streak += 1
+                        self._pending = not self._closed
+                        self._not_before = time.monotonic() + self._busy_retry_s
+                    else:
+                        self._busy_streak = 0
                     self._cond.notify_all()
 
 
@@ -192,6 +220,25 @@ def make_server(
                 raise WebhookRejected(413, "body too large")
             return length
 
+        def _read_body(self, length: int) -> bytes:
+            deadline = time.monotonic() + BODY_DEADLINE_S
+            chunks: list[bytes] = []
+            got = 0
+            while got < length:
+                left = deadline - time.monotonic()
+                if left <= 0:
+                    raise WebhookRejected(408, "body too slow")
+                self.connection.settimeout(min(left, SOCKET_TIMEOUT_S))
+                try:
+                    chunk = self.rfile.read1(min(length - got, 65536))
+                except TimeoutError as e:
+                    raise WebhookRejected(408, "body too slow") from e
+                if not chunk:
+                    raise WebhookRejected(400, "incomplete body")
+                chunks.append(chunk)
+                got += len(chunk)
+            return b"".join(chunks)
+
         def _drain(self) -> None:
             """Read a small unread body so closing does not reset the reply."""
             try:
@@ -218,10 +265,7 @@ def make_server(
             if self.path != "/webhook":
                 self._drain()
                 raise WebhookRejected(404, "not found")
-            length = self._content_length()
-            body = self.rfile.read(length)
-            if len(body) != length:
-                raise WebhookRejected(400, "incomplete body")
+            body = self._read_body(self._content_length())
             delivery = check_delivery(self.headers, body, secret=secret, repo=repo)
             if delivery is None:
                 self._reply(200, "pong")

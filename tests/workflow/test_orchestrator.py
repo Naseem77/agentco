@@ -817,3 +817,25 @@ async def test_second_recurrence_sends_the_fix_to_a_senior_who_states_an_invaria
     lead1, lead2 = rig.calls(Role.LEAD)
     assert "Root cause required" not in lead1.prompt
     assert "Root cause required" in lead2.prompt
+
+
+async def test_new_design_after_a_send_back_is_never_engineered_unreviewed(make_rig):
+    script = {
+        Role.PM: [PM_JSON],
+        Role.TRIAGE: [triage_json(), triage_json("new_design", "l")],
+        Role.JUNIOR: [engineer(1)],
+        Role.REVIEWER: [RULES_OK, REVIEW_FINDING],
+        Role.QA: [QA_OK],
+        Role.LEAD: [LEAD_SEND_BACK],
+    }
+    rig = await make_rig(script)
+    for earlier in (98, 99):  # the area is already hot
+        record_recurrence(rig.store, "acme", earlier, ["src/calc.py"], "pr-review-1")
+
+    task = await rig.run()
+
+    assert task.state is TaskState.AWAITING_HUMAN
+    assert rig.calls(Role.SENIOR) == [] and rig.calls(Role.ARCHITECT) == []
+    esc = rig.escalations()[-1]
+    assert (esc["category"], esc["from_state"]) == ("new", "triage")
+    assert rig.store.children(rig.task_id) == []

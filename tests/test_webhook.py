@@ -372,3 +372,82 @@ def test_idle_connections_cannot_exhaust_the_server(store, monkeypatch):
     finally:
         idle.close()
         rig.close()
+
+
+def test_debounce_holds_while_requests_keep_arriving():
+    calls = []
+    t = IntakeTrigger(lambda: calls.append(time.monotonic()), debounce_s=0.4)
+    try:
+        start = time.monotonic()
+        t.request()
+        while time.monotonic() - start < 0.25:
+            t.request()  # each one wakes the worker, which must keep waiting
+            time.sleep(0.01)
+        assert calls == []
+        assert t.wait_idle(5)
+        assert len(calls) == 1 and calls[0] - start >= 0.38
+    finally:
+        t.close()
+
+
+def test_busy_run_is_requested_again_a_bounded_number_of_times():
+    calls = []
+
+    def busy():
+        calls.append(1)
+        return True  # another intake held the lease
+
+    t = IntakeTrigger(busy, debounce_s=0, busy_retry_s=0.02, busy_retries=3)
+    try:
+        t.request()
+        assert t.wait_idle(5)
+        assert len(calls) == 4
+    finally:
+        t.close()
+
+
+def test_busy_run_succeeds_on_a_later_attempt():
+    results = iter([True, True, False])
+    calls = []
+
+    def run():
+        calls.append(1)
+        return next(results)
+
+    t = IntakeTrigger(run, debounce_s=0, busy_retry_s=0.02, busy_retries=5)
+    try:
+        t.request()
+        assert t.wait_idle(5)
+        assert len(calls) == 3
+    finally:
+        t.close()
+
+
+def test_slow_trickle_body_hits_a_total_deadline(store, monkeypatch):
+    monkeypatch.setattr(webhook_module, "BODY_DEADLINE_S", 0.5)
+    rig = Rig(store)
+    body = payload()
+    sock = socket.create_connection(rig.httpd.server_address, timeout=5)
+    try:
+        head = (
+            "POST /webhook HTTP/1.1\r\nHost: x\r\n"
+            f"Content-Length: {len(body)}\r\nX-GitHub-Event: issues\r\n"
+            f"X-GitHub-Delivery: slow\r\nX-Hub-Signature-256: {sign(body)}\r\n\r\n"
+        )
+        sock.sendall(head.encode())
+        start = time.monotonic()
+        closed = False
+        for byte in body:
+            try:
+                sock.sendall(bytes([byte]))
+            except OSError:
+                closed = True
+                break
+            time.sleep(0.05)
+            if time.monotonic() - start > 3:
+                break
+        assert closed or sock.recv(100).startswith(b"HTTP/1.0 408")
+        assert rig.calls == 0
+    finally:
+        sock.close()
+        rig.close()

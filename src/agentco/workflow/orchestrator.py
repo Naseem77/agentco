@@ -276,6 +276,7 @@ class _Run:
         open_pr: bool = False,
         actor: Role = Role.LEAD,
         step: str | None = None,
+        child_ids: Sequence[int] = (),
     ) -> None:
         write_escalation(
             self.store,
@@ -289,6 +290,7 @@ class _Run:
             open_pr=open_pr,
             actor=actor,
             step=step,
+            child_ids=child_ids,
         )
 
     def _is_pr_round(self) -> bool:
@@ -418,6 +420,9 @@ class _Run:
     # -- states ----------------------------------------------------------
 
     async def _intake(self, task: TaskRecord) -> None:
+        if task.source == ADR_SOURCE and self._latest(ArtifactKind.REQUEST) is None:
+            # a crashed spawn: the parent's next run writes the request
+            raise StepFailed(_S.INTAKE, "sub-task has no request yet; run its parent")
         self._go(_S.PM, Role.PM, "intake")
 
     async def _pm(self, task: TaskRecord) -> None:
@@ -449,6 +454,13 @@ class _Run:
             and decision.body.get("decision") in ("approve", "answer")
         )
 
+    async def _may_design(self, task: TaskRecord) -> bool:
+        """Only a task that has not started can become an ADR parent.
+
+        Later, an ADR would orphan the task's branch and commits.
+        """
+        return task.parent_id is None and task.round == 0 and not await self._resuming()
+
     async def _triage(self, task: TaskRecord) -> None:
         if await self._escalate_if_over_budget(task):
             return
@@ -462,7 +474,7 @@ class _Run:
                 self._issue(),
                 human_ok=self._human_ok(),
                 known_ok=task.source == ADR_SOURCE,  # the human approved the design
-                allow_architect=task.parent_id is None and not self._is_pr_round(),
+                allow_architect=await self._may_design(task),
             )
         except (ReplyInvalid, AgentStuck) as exc:
             await self._escalate("stuck", _agent_error(exc), actor=Role.TRIAGE)
@@ -553,7 +565,7 @@ class _Run:
             escalation is None
             or decision is None
             or decision.id < escalation.id
-            or escalation.body.get("step") != "parent_review"
+            or escalation.body.get("step") not in ("parent_review", "parent_retry")
         ):
             return ""
         return str(decision.body.get("note", "")).strip()
@@ -572,6 +584,7 @@ class _Run:
                     "reject: cancel the whole task",
                 ),
                 step="child_failed",
+                child_ids=[k.id for k in failed],
             )
             return True
         done = all(
@@ -606,7 +619,10 @@ class _Run:
             )
         except (ReplyInvalid, AgentStuck) as exc:
             await self._escalate(
-                "stuck", f"lead failed: {_agent_error(exc)}", step="parent_review"
+                "stuck",
+                f"lead failed: {_agent_error(exc)}",
+                options=("approve: retry the review", "reject: cancel the whole task"),
+                step="parent_retry",
             )
             return True
         if (
@@ -1110,10 +1126,11 @@ class _Run:
     def _resume_parent(self, choice: str, escalation: Artifact) -> None:
         step = escalation.body.get("step")
         if step == "child_failed":
+            listed = {int(i) for i in escalation.body.get("child_ids", [])}
             cancelled = {
                 k.id
                 for k in adr_children(self.store, self.task())
-                if k.state is _S.CANCELLED
+                if k.state is _S.CANCELLED and k.id in listed
             }
             self._set("accepted", json.dumps(sorted(self._accepted() | cancelled)))
         if step == "parent_review" and choice == "approve":

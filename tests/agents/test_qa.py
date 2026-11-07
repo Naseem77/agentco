@@ -100,6 +100,9 @@ class Env:
         self.gate = MemoryGate("acme", self.backend)
         self.asker = Asker(self.runtime, store, self.task.id, 0.04)
 
+    def snapshot(self, round_: int = 1) -> Path:
+        return self.wt.path.parents[1] / "qa" / f"{self.wt.path.name}-qa-r{round_}"
+
     async def qa(self, runner, repo_contract=None, *, round_=1, fast_lane=False):
         return await run_qa(
             self.asker,
@@ -140,7 +143,7 @@ async def test_qa_runs_build_and_tests_in_snapshot_then_asks_llm(
 
     result = await env.qa(runner, contract(e2e="make e2e"))
 
-    snapshot = env.wt.path.parent / "1-qa-r1"
+    snapshot = env.snapshot()
     assert runner.calls == [("make build", snapshot), ("make test", snapshot)]
     assert result == QAReply(
         passed=True,
@@ -165,7 +168,7 @@ async def test_affected_tests_command_runs_in_snapshot(make_repo, store, loop_cf
 
     await env.qa(runner, contract(test_files="make test FILES={files}"))
 
-    snapshot = env.wt.path.parent / "1-qa-r1"
+    snapshot = env.snapshot()
     assert runner.calls == [
         ("make build", snapshot),
         ("make test FILES=tests/test_a.py", snapshot),
@@ -254,7 +257,7 @@ async def test_snapshot_is_one_commit_and_removed_after_qa(make_repo, store, loo
     await env.qa(FakeRunner(), round_=3)
 
     assert seen == {"exists": True, "commits": "1", "a": "def f():\n    return 2\n"}
-    assert not (env.wt.path.parent / "1-qa-r3").exists()
+    assert not env.snapshot(3).exists()
     assert git(env.wt.path, "log", "-1", "--format=%s").strip() == "agentco: change"
 
 
@@ -264,15 +267,15 @@ async def test_snapshot_removed_when_llm_reply_is_invalid(make_repo, store, loop
     with pytest.raises(ReplyInvalid):
         await env.qa(FakeRunner())
 
-    assert not (env.wt.path.parent / "1-qa-r1").exists()
+    assert not env.snapshot().exists()
 
 
 async def test_stale_snapshot_from_a_crashed_run_is_replaced(
     make_repo, store, loop_cfg
 ):
     env = Env(make_repo, store, loop_cfg, [json.dumps(PASSING)])
-    stale = env.wt.path.parent / "1-qa-r1"
-    stale.mkdir()
+    stale = env.snapshot()
+    stale.mkdir(parents=True)
     (stale / "leftover.txt").write_text("old")
 
     await env.qa(FakeRunner())
@@ -305,7 +308,7 @@ async def test_container_prepare_runs_on_the_snapshot(make_repo, store, loop_cfg
 
     await env.qa(runner)
 
-    assert runner.prepared == [env.wt.path.parent / "1-qa-r1"]
+    assert runner.prepared == [env.snapshot()]
 
 
 async def test_container_prepare_failure_fails_qa_without_running_commands(
@@ -347,7 +350,7 @@ async def test_run_qa_captures_new_tests_before_snapshot_removed(
 
     assert qa.new_tests == ["tests/test_neighbour.py"]
     assert qa.new_test_sources == {"tests/test_neighbour.py": text}
-    assert not (env.wt.path.parent / "1-qa-r1").exists()
+    assert not env.snapshot().exists()
     assert not (env.wt.path / "tests/test_neighbour.py").exists()
 
 

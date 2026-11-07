@@ -2,7 +2,7 @@ import json
 from dataclasses import dataclass
 
 import pytest
-from orch_helpers import PM_JSON, Rig, adr_json, triage_json
+from orch_helpers import PM_JSON, STUCK, Rig, adr_json, triage_json
 
 from agentco.roles import Role
 from agentco.store.models import ArtifactKind
@@ -237,3 +237,36 @@ async def test_followup_children_do_not_block_parent(tree):
     task = await tree.run_parent()
 
     assert task.state is TaskState.MERGED
+
+
+async def test_approve_after_a_failed_parent_review_retries_it(tree):
+    tree.runtime._script[Role.LEAD].clear()
+    tree.runtime._script[Role.LEAD].extend([STUCK, PARENT_NO])
+    tree.finish_children("merged", "merged")
+    task = await tree.run_parent()
+    assert task.state is TaskState.AWAITING_HUMAN
+    assert tree.escalations()[-1]["step"] == "parent_retry"
+    tree.rig.decide("approve")
+
+    task = await tree.run_parent()
+
+    assert len(lead_calls(tree)) == 2  # the whole was reviewed, not waved through
+    assert task.state is TaskState.AWAITING_HUMAN
+    assert tree.escalations()[-1]["step"] == "parent_review"
+
+
+async def test_accepting_a_failed_child_accepts_only_the_listed_ones(tree):
+    a, b = tree.kids()
+    tree.set_state(a.id, "engineering")
+    tree.set_state(b.id, "cancelled")
+    await tree.run_parent()
+    assert tree.escalations()[-1]["child_ids"] == [b.id]
+    tree.set_state(a.id, "cancelled")  # cancelled after the human was asked
+    tree.rig.decide("approve")
+
+    task = await tree.run_parent()
+
+    assert task.state is TaskState.AWAITING_HUMAN
+    assert tree.escalations()[-1]["step"] == "child_failed"
+    assert tree.escalations()[-1]["child_ids"] == [a.id]
+    assert lead_calls(tree) == []

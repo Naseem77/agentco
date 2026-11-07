@@ -22,6 +22,7 @@ def write_escalation(
     open_pr: bool = False,
     actor: Role = Role.LEAD,
     step: str | None = None,
+    child_ids: Sequence[int] = (),
 ) -> TaskRecord:
     """`open_pr` lets a human `approve` open a PR; only lead-approved work sets it."""
     body: dict = {
@@ -37,6 +38,8 @@ def write_escalation(
         body["open_pr"] = True
     if step:
         body["step"] = step
+    if child_ids:
+        body["child_ids"] = list(child_ids)
     store.put_artifact(task.id, ArtifactKind.ESCALATION, actor, body)
     if task.state is TaskState.AWAITING_HUMAN:
         return task

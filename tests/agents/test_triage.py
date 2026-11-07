@@ -424,3 +424,59 @@ async def test_playbooks_are_looked_up_without_a_send_back(store, loop_cfg):
 
     assert any("split on whitespace once" in p for p in d.playbooks)
     assert d.root_cause == () and d.require_invariant is False
+
+
+async def test_hot_area_does_not_override_the_architect_route(store, loop_cfg):
+    reply = triage_json(route="new_design", size="l")
+    _, task, _, asker, gate = await hot_setup(store, loop_cfg, reply)
+
+    d = await run_triage(
+        asker, loop_cfg, gate, store, task, ISSUE, allow_architect=True
+    )
+
+    assert (d.route, d.escalate) == (Role.ARCHITECT, None)
+
+
+async def test_hot_area_does_not_bypass_the_new_design_escalation(store, loop_cfg):
+    reply = triage_json(route="new_design", size="l")
+    _, task, _, asker, gate = await hot_setup(store, loop_cfg, reply)
+
+    d = await run_triage(asker, loop_cfg, gate, store, task, ISSUE)
+
+    assert d.escalate == "new" and d.route is not Role.ARCHITECT
+
+
+async def test_recurrence_counts_only_paths_of_the_latest_send_back(store, loop_cfg):
+    _, task, _, asker, gate = await setup(store, loop_cfg, triage_json(size="m"))
+    task = to_round(
+        store, task.id, [["src/a/x.py"], ["src/a/x.py"], ["src/b/y.py"]]
+    )  # a came back twice, but the latest send-back is about b only
+
+    await run_triage(asker, loop_cfg, gate, store, task, ISSUE)
+
+    assert area_recurrences(store, "acme", ["src/a", "src/b"]) == {
+        "src/a": 0,
+        "src/b": 0,
+    }
+
+
+async def test_pr_recurrence_is_not_counted_again_by_triage(store, loop_cfg):
+    _, task, _, asker, gate = await setup(store, loop_cfg, triage_json(size="m"))
+    task = to_round(store, task.id, [["src/calc/add.py"]])
+    store.put_artifact(
+        task.id,
+        ArtifactKind.LEAD,
+        Role.LEAD,
+        {
+            "outcome": "send_back",
+            "source": "pr",
+            "findings_to_fix": [lead_finding("src/calc/add.py")],
+        },
+    )
+    # what the PR intake recorded for this very event
+    record_recurrence(store, "acme", task.id, ["src/calc/add.py"], "pr-review-7")
+
+    d = await run_triage(asker, loop_cfg, gate, store, task, ISSUE)
+
+    assert area_recurrences(store, "acme", ["src/calc"]) == {"src/calc": 1}
+    assert d.root_cause == ()
