@@ -14,6 +14,8 @@ from collections.abc import Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
 
+from pydantic import TypeAdapter
+
 from agentco.agents.checks import CheckOutcome, run_checks
 from agentco.agents.engineer import (
     EngineerBrief,
@@ -31,6 +33,7 @@ from agentco.agents.triage import run_triage
 from agentco.config import Budgets, TenantConfig
 from agentco.github.client import GitHubWriter
 from agentco.github.errors import GitHubError
+from agentco.github.models import PullRef
 from agentco.llm.replies import AgentStuck, Asker, ReplyInvalid
 from agentco.llm.runtime import AgentRuntime
 from agentco.memory.gate import MemoryGate
@@ -53,9 +56,10 @@ from agentco.sandbox.worktree import (
 )
 from agentco.store.models import Artifact, ArtifactKind, TaskRecord
 from agentco.store.task_store import TaskStore
+from agentco.workflow.escalation import effective_budgets, write_escalation
 from agentco.workflow.pr import pr_body, pr_title
 from agentco.workflow.preflight import CheckResult, Preflight, PreflightReport
-from agentco.workflow.states import TaskState
+from agentco.workflow.states import InvalidTransition, TaskState
 from agentco.workflow.stop_rules import StopDecision, apply_stop_rules
 
 _S = TaskState
@@ -95,7 +99,14 @@ class Orchestrator:
 
     async def run(self, task_id: int) -> TaskRecord:
         """Advance a task until it needs a human, opens its PR, or is cancelled."""
-        return await _Run(self.ctx, task_id).loop()
+        try:
+            return await _Run(self.ctx, task_id).loop()
+        except InvalidTransition:
+            # intake may see a human merge or close the PR while a step is running
+            task = self.ctx.store.get(task_id)
+            if task.state in (TaskState.MERGED, TaskState.CANCELLED):
+                return task
+            raise
 
 
 async def run_many(
@@ -192,6 +203,9 @@ class _Run:
                 if not await self._resume(task):
                     return task
                 continue
+            if task.state is _S.PR_OPEN and self._answer_interrupted():
+                await self._start_answer_round()
+                continue
             handler = handlers.get(task.state)
             if task.state in _DONE or handler is None:
                 return task
@@ -219,15 +233,7 @@ class _Run:
         return self.store.transition(self.task_id, to, actor, reason)
 
     def _budgets(self) -> Budgets:
-        budgets = self.ctx.cfg.budgets
-        extra = float(self._meta("extra_budget") or 0)
-        rounds = self._meta("max_rounds")
-        return budgets.model_copy(
-            update={
-                "per_task_usd": budgets.per_task_usd + extra,
-                "max_rounds": int(rounds) if rounds else budgets.max_rounds,
-            }
-        )
+        return effective_budgets(self.ctx.cfg, self.store, self.task_id)
 
     def _issue(self) -> PMReply:
         artifact = self._latest(ArtifactKind.ISSUE)
@@ -247,21 +253,21 @@ class _Run:
         open_pr: bool = False,
         actor: Role = Role.LEAD,
     ) -> None:
-        task = self.task()
-        body: dict = {
-            "from_state": from_state or task.state.value,
-            "category": category,
-            "reason": reason,
-            "options": list(options),
-            "question": question,
-        }
-        if stop:
-            body["stop"] = stop
-        if open_pr:
-            body["open_pr"] = True  # only these escalations let `approve` open a PR
-        self.store.put_artifact(self.task_id, ArtifactKind.ESCALATION, actor, body)
-        if task.state is not _S.AWAITING_HUMAN:
-            self._go(_S.AWAITING_HUMAN, actor, f"{category}: {reason}")
+        write_escalation(
+            self.store,
+            self.task(),
+            category,
+            reason,
+            options=options,
+            question=question,
+            stop=stop,
+            from_state=from_state,
+            open_pr=open_pr,
+            actor=actor,
+        )
+
+    def _is_pr_round(self) -> bool:
+        return self._latest(ArtifactKind.PR) is not None
 
     async def _escalate_if_over_budget(self, task: TaskRecord) -> bool:
         if task.cost_usd <= self._budgets().per_task_usd:
@@ -378,7 +384,9 @@ class _Run:
             return
         if not task.reassigned:
             self.store.assign(self.task_id, decision.route)
-        self._set("fast_lane", "1" if decision.fast_lane else "0")
+        # review feedback on an open PR is always reviewed as new code
+        fast_lane = decision.fast_lane and not self._is_pr_round()
+        self._set("fast_lane", "1" if fast_lane else "0")
         self._go(_S.ENGINEERING, Role.TRIAGE, decision.reason)
 
     def _human_input(self) -> tuple[str, str] | None:
@@ -404,9 +412,12 @@ class _Run:
     def _brief(self, task: TaskRecord) -> EngineerBrief:
         """Built from lead, QA/review (via the lead), pre-flight and human input only."""
         findings: list[Finding] = []
+        untrusted: frozenset[str] = frozenset()
         lead = self._latest(ArtifactKind.LEAD)
         if lead and lead.body.get("outcome") == "send_back":
             findings = list(_lead_from(lead.body).findings_to_fix)
+            if lead.body.get("source") == "pr":
+                untrusted = frozenset(f.id for f in findings)
         human_note = ""
         human = self._human_input()
         if human:
@@ -421,7 +432,7 @@ class _Run:
                         detail=note,
                     )
                 )
-            else:
+            elif origin != "pr_open":  # a PR answer is already a LEAD finding
                 human_note = note
         failures: tuple[str, ...] = ()
         pre = self._latest(ArtifactKind.PREFLIGHT)
@@ -437,6 +448,7 @@ class _Run:
             require_invariant=bool(triage and triage.body.get("require_invariant")),
             round=task.round,
             human_note=human_note,
+            untrusted_finding_ids=untrusted,
         )
 
     async def _engineering(self, task: TaskRecord) -> None:
@@ -679,24 +691,30 @@ class _Run:
                 await self._stop_rules()
                 return
             body = self._pr_body(task, lead, report)
-            async with _repo_lock(self.ctx.repo_root):
-                await asyncio.to_thread(push_branch, wt)
-            pull = await asyncio.to_thread(
-                self.ctx.github.find_open_pull, self.ctx.repo, wt.branch
-            )
-            if pull is None:
-                pull = await asyncio.to_thread(
-                    self.ctx.github.create_pull,
-                    self.ctx.repo,
-                    wt.branch,
-                    self.ctx.main,
-                    pr_title(task, self._issue()),
-                    body,
-                )
+            opened = self._latest(ArtifactKind.PR)
+            if opened is not None:
+                pull = await self._update_pr(wt, opened, body)
+                if pull is None:
+                    return
             else:
-                await asyncio.to_thread(
-                    self.ctx.github.edit_pull, self.ctx.repo, pull.number, body
+                async with _repo_lock(self.ctx.repo_root):
+                    await asyncio.to_thread(push_branch, wt)
+                pull = await asyncio.to_thread(
+                    self.ctx.github.find_open_pull, self.ctx.repo, wt.branch
                 )
+                if pull is None:
+                    pull = await asyncio.to_thread(
+                        self.ctx.github.create_pull,
+                        self.ctx.repo,
+                        wt.branch,
+                        self.ctx.main,
+                        pr_title(task, self._issue()),
+                        body,
+                    )
+                else:
+                    await asyncio.to_thread(
+                        self.ctx.github.edit_pull, self.ctx.repo, pull.number, body
+                    )
         except (GitError, GitHubError) as exc:
             await self._escalate(
                 "stuck",
@@ -712,6 +730,45 @@ class _Run:
             {"number": pull.number, "url": pull.url},
         )
         self._go(_S.PR_OPEN, Role.LEAD, f"pull request #{pull.number}")
+
+    async def _update_pr(
+        self, wt: Worktree, opened: Artifact, body: str
+    ) -> PullRef | None:
+        """Push the rewritten branch and edit the PR; None when the PR is gone.
+
+        A PR that was already opened is never created again: a human closed it
+        or it is not ours any more, so a person decides.
+        """
+        number = opened.body["number"]
+        pull = await asyncio.to_thread(
+            self.ctx.github.find_open_pull, self.ctx.repo, wt.branch
+        )
+        if pull is None or pull.number != number:
+            await self._escalate(
+                "stuck",
+                f"PR #{number} is no longer open",
+                options=["reject"],
+                from_state=_S.LEAD_DECISION.value,
+            )
+            return None
+        async with _repo_lock(self.ctx.repo_root):
+            await asyncio.to_thread(push_branch, wt)
+        await asyncio.to_thread(
+            self.ctx.github.edit_pull, self.ctx.repo, pull.number, body
+        )
+        return pull
+
+    def _feedback_titles(self) -> list[str]:
+        """Titles of the PR/human findings sent back since the PR was last updated."""
+        floor = _id(self._latest(ArtifactKind.PR))
+        titles: list[str] = []
+        for lead in self.store.artifacts(self.task_id, ArtifactKind.LEAD):
+            if lead.id < floor or lead.body.get("source") not in ("pr", "human"):
+                continue
+            for finding in lead.body.get("findings_to_fix", []):
+                if finding["title"] not in titles:
+                    titles.append(finding["title"])
+        return titles
 
     def _current_lead(self) -> Artifact | None:
         """The lead's approve/escalate decision on the engineer's latest work."""
@@ -731,6 +788,7 @@ class _Run:
     def _pr_body(
         self, task: TaskRecord, lead: Artifact, report: PreflightReport
     ) -> str:
+        titles = self._feedback_titles() if self._is_pr_round() else []
         return pr_body(
             task,
             self._issue(),
@@ -738,6 +796,7 @@ class _Run:
             self._checks().qa,
             report,
             self._source_issue(task),
+            feedback=(task.round, titles) if titles else None,
         )
 
     # -- human decisions -------------------------------------------------
@@ -755,7 +814,9 @@ class _Run:
             return True
         if choice not in ("approve", "answer") or escalation is None:
             return False
-        if escalation.body.get("stop") == "rounds":
+        if origin == "pr_open":
+            await self._resume_pr(choice, decision)
+        elif escalation.body.get("stop") == "rounds":
             self._set("max_rounds", str(self._budgets().max_rounds + 1))
             self._go(_S.TRIAGE, Role.HUMAN, "one more round granted")
         elif escalation.body.get("open_pr") and choice == "approve":
@@ -765,3 +826,57 @@ class _Run:
         else:
             self._go(_S.TRIAGE, Role.HUMAN, f"human {choice}")
         return True
+
+    async def _resume_pr(self, choice: str, decision: Artifact) -> None:
+        """A human answered an escalation raised while the PR was open."""
+        if choice == "approve":
+            self._go(_S.PR_OPEN, Role.HUMAN, "human approved: nothing to fix")
+            return
+        lead = self._latest(ArtifactKind.LEAD)
+        if lead is None or lead.body.get("human_decision") != decision.id:
+            note = str(decision.body.get("note", "")).strip()
+            finding = Finding(
+                id=f"h{decision.id}",
+                severity="major",
+                kind="bug",
+                title=note[:80] or "Human guidance",
+                detail=note or "Human guidance",
+            )
+            send_back = LeadDecision(
+                outcome="send_back",
+                category="",
+                findings_to_fix=(finding,),
+                follow_ups=(),
+                reason="human guidance on the open PR",
+                summary="",
+                comments=(),
+                question="",
+                options=(),
+            )
+            body = TypeAdapter(LeadDecision).dump_python(send_back, mode="json")
+            self.store.put_artifact(
+                self.task_id,
+                ArtifactKind.LEAD,
+                Role.HUMAN,
+                body | {"source": "human", "human_decision": decision.id},
+            )
+        if self.task().state is _S.AWAITING_HUMAN:
+            self._go(_S.PR_OPEN, Role.HUMAN, "human answered: back to work")
+        await self._start_answer_round()
+
+    def _answer_interrupted(self) -> bool:
+        """A human's send-back stored and the PR reopened, but the round not begun.
+
+        Any later PR or escalation artifact means that round already ran.
+        """
+        lead = self._latest(ArtifactKind.LEAD)
+        return (
+            lead is not None
+            and lead.body.get("source") == "human"
+            and lead.id > _id(self._latest(ArtifactKind.PR))
+            and lead.id > _id(self._latest(ArtifactKind.ESCALATION))
+        )
+
+    async def _start_answer_round(self) -> None:
+        self._go(_S.TRIAGE, Role.HUMAN, "human guidance on the PR")
+        await self._stop_rules()

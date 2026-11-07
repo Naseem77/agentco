@@ -5,7 +5,7 @@ from datetime import datetime
 from functools import wraps
 from typing import Literal
 
-from pydantic import BaseModel
+from pydantic import BaseModel, ConfigDict
 
 from agentco.github.errors import GitHubError
 
@@ -21,6 +21,31 @@ class PullRef(BaseModel):
 class GhUser:
     login: str
     is_bot: bool
+
+
+class GhReview(BaseModel):
+    model_config = ConfigDict(frozen=True)
+
+    id: int
+    pr_number: int
+    author: GhUser
+    association: str
+    state: str
+    body: str
+    submitted_at: datetime | None
+    url: str
+
+
+class GhCheckRun(BaseModel):
+    model_config = ConfigDict(frozen=True)
+
+    id: int
+    name: str
+    head_sha: str
+    status: str
+    conclusion: str | None
+    url: str
+    completed_at: datetime | None
 
 
 @dataclass(frozen=True)
@@ -177,4 +202,31 @@ def parse_review_comment(raw: dict) -> GhReviewComment:
         created_at=_dt(raw["created_at"]),
         updated_at=_dt(raw["updated_at"]),
         url=raw["html_url"],
+    )
+
+
+@_malformed("review")
+def parse_review(raw: dict, pr_number: int) -> GhReview:
+    return GhReview(
+        id=raw["id"],
+        pr_number=pr_number,
+        author=parse_user(raw.get("user")),
+        association=raw.get("author_association") or "NONE",
+        state=raw["state"],
+        body=raw.get("body") or "",
+        submitted_at=_opt_dt(raw.get("submitted_at")),
+        url=raw["html_url"],
+    )
+
+
+@_malformed("check run")
+def parse_check_run(raw: dict) -> GhCheckRun:
+    return GhCheckRun(
+        id=raw["id"],
+        name=raw["name"],
+        head_sha=raw["head_sha"],
+        status=raw["status"],
+        conclusion=raw.get("conclusion"),
+        url=raw["html_url"],
+        completed_at=_opt_dt(raw.get("completed_at")),
     )

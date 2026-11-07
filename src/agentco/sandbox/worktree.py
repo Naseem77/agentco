@@ -100,6 +100,21 @@ def _exclude_agentco_dir(repo_root: Path) -> None:
     exclude.write_text(f"{existing}{prefix}.agentco/\n")
 
 
+def _fetch_task_branch(repo_root: Path, branch: str) -> bool:
+    """Bring `origin/<branch>` local if the remote has it.
+
+    An unreachable remote raises instead of reading as "no such branch": starting
+    over from main would later overwrite the pushed work.
+    """
+    if "origin" not in _git(repo_root, "remote").split():
+        return False
+    ref = f"refs/heads/{branch}"
+    if not _git(repo_root, "ls-remote", "--heads", "origin", ref).strip():
+        return False
+    _git(repo_root, "fetch", "origin", f"+{ref}:refs/remotes/origin/{branch}")
+    return True
+
+
 def create_worktree(repo_root: Path, task_id: int, base_ref: str) -> Worktree:
     path = repo_root / ".agentco" / "worktrees" / str(task_id)
     branch = branch_name(task_id)
@@ -108,6 +123,7 @@ def create_worktree(repo_root: Path, task_id: int, base_ref: str) -> Worktree:
         return wt
     _exclude_agentco_dir(repo_root)
     path.parent.mkdir(parents=True, exist_ok=True)
+    _git(repo_root, "worktree", "prune")  # a deleted directory still holds the branch
     branch_exists = (
         _run(
             repo_root, "rev-parse", "--verify", "--quiet", f"refs/heads/{branch}"
@@ -116,6 +132,17 @@ def create_worktree(repo_root: Path, task_id: int, base_ref: str) -> Worktree:
     )
     if branch_exists:
         _git(repo_root, "worktree", "add", str(path), branch)
+    elif _fetch_task_branch(repo_root, branch):
+        _git(
+            repo_root,
+            "worktree",
+            "add",
+            "--no-track",
+            "-b",
+            branch,
+            str(path),
+            f"origin/{branch}",
+        )
     else:
         _git(
             repo_root,
@@ -366,19 +393,30 @@ def push_branch(wt: Worktree) -> None:
     """Publish the task branch, replacing what is there if a rebase rewrote it.
 
     Only agentco's own `agentco/task-<id>` branch may be forced; it is never main.
-    The lease names the remote tip seen just now, so a push from anyone else in
-    between is still refused.
+    The lease is the remote-tracking ref as last fetched (or pushed), so a commit
+    anyone else pushed since then, such as a reviewer's suggestion, is refused
+    instead of overwritten; the caller escalates the GitError.
     """
     if not _TASK_BRANCH.fullmatch(wt.branch):
         raise GitError(f"refusing to push {wt.branch!r}: not an agentco task branch")
     ref = f"refs/heads/{wt.branch}"
-    listing = _git(wt.path, "ls-remote", "--heads", "origin", ref).split()
-    lease = (
-        f"--force-with-lease={ref}:{listing[0]}"
-        if listing
-        else f"--force-with-lease={ref}:"
+    tracking = _run(
+        wt.path, "rev-parse", "--verify", "--quiet", f"refs/remotes/origin/{wt.branch}"
     )
-    _git(wt.path, "push", "-u", lease, "origin", f"{wt.branch}:{ref}")
+    if tracking.returncode == 0:
+        expected = tracking.stdout.decode().strip()
+    else:
+        # Never fetched: only the first push (nothing remote) can be proven safe.
+        listing = _git(wt.path, "ls-remote", "--heads", "origin", ref).split()
+        expected = listing[0] if listing else ""
+    _git(
+        wt.path,
+        "push",
+        "-u",
+        f"--force-with-lease={ref}:{expected}",
+        "origin",
+        f"{wt.branch}:{ref}",
+    )
 
 
 def remove_worktree(repo_root: Path, path: Path) -> None:

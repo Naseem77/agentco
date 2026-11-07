@@ -24,6 +24,7 @@ from agentco.github.client import GhCli, GitHub, GitHubWriter, validate_repo
 from agentco.github.errors import GitHubError
 from agentco.importer.locate import SymbolLocator
 from agentco.importer.run import ImportOptions, ImportReport, run_import
+from agentco.intake.run import IntakeReport, run_intake
 from agentco.llm.copilot import CopilotRuntime
 from agentco.llm.runtime import AgentRuntime
 from agentco.memory.backend import Fact, MemoryBackend, MemoryItem
@@ -507,6 +508,67 @@ def task_run(
 def _escalation_of(store: TaskStore, task_id: int) -> dict:
     escalation = store.latest_artifact(task_id, ArtifactKind.ESCALATION)
     return escalation.body if escalation else {}
+
+
+def _pr_findings(store: TaskStore, task_id: int) -> int:
+    lead = store.latest_artifact(task_id, ArtifactKind.LEAD)
+    if lead is None or lead.body.get("source") != "pr":
+        return 0
+    return len(lead.body.get("findings_to_fix", []))
+
+
+def _intake_lines(store: TaskStore, report: IntakeReport) -> list[str]:
+    lines = [f"#{n} merged" for n in report.merged]
+    lines += [f"#{n} closed" for n in report.closed]
+    stopped = {n for n, _ in report.escalated}
+    for n in report.reentered:
+        if n in stopped:
+            continue
+        k = _pr_findings(store, n)
+        lines.append(
+            f"#{n} back to triage (round {store.get(n).round}): {k} finding(s)"
+        )
+    lines += [f"#{n} needs a human: {category}" for n, category in report.escalated]
+    lines.append(f"{report.known} known, {len(report.deferred)} deferred")
+    lines += [f"error: {_one_line(e)}" for e in report.errors]
+    return lines
+
+
+@app.command()
+def intake(
+    repo: Annotated[str, typer.Option("--repo", help="GitHub repo as OWNER/NAME.")],
+    config: Path = ConfigOption,
+) -> None:
+    """Read feedback on open PRs and send real findings back to the team (re-runnable)."""
+    try:
+        validate_repo(repo)
+    except ValueError as e:
+        raise _fail(str(e)) from e
+    cfg = _load(config)
+    store = TaskStore(cfg.database_url)
+    store.create_all()
+
+    async def _run() -> IntakeReport:
+        runtime = make_runtime(cfg)
+        async with AsyncExitStack() as stack:
+            if isinstance(runtime, AbstractAsyncContextManager):
+                runtime = await stack.enter_async_context(runtime)
+            gate = MemoryGate(cfg.tenant, _build_backend(cfg))
+            return await run_intake(cfg, store, make_github(), runtime, gate, repo)
+
+    try:
+        with _falkordb_guard(cfg):
+            report = asyncio.run(_run())
+    except GitHubError as e:
+        raise _fail(str(e), 3) from e
+    except LLM_ERRORS as e:
+        raise _fail(f"LLM request failed: {_one_line(e)}") from e
+    for line in _intake_lines(store, report):
+        typer.echo(line)
+    if report.github_failed:
+        raise typer.Exit(3)
+    if report.errors:
+        raise typer.Exit(4)
 
 
 @app.command()

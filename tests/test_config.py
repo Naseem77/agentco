@@ -90,9 +90,28 @@ def test_loop_overrides(tmp_path):
     assert cfg.loop.max_changed_lines == 400
 
 
+def test_intake_defaults(tmp_path):
+    cfg = load_config(write(tmp_path, EXAMPLE))
+    assert cfg.intake.review_bots == ["copilot-pull-request-reviewer[bot]", "Copilot"]
+    assert cfg.intake.failing_conclusions == [
+        "failure",
+        "timed_out",
+        "action_required",
+        "startup_failure",
+    ]
+
+
+def test_intake_override(tmp_path):
+    raw = BASE | {"intake": {"review_bots": ["my-bot[bot]"]}}
+    cfg = load_config(write(tmp_path, yaml.safe_dump(raw)))
+    assert cfg.intake.review_bots == ["my-bot[bot]"]
+    assert cfg.intake.failing_conclusions[0] == "failure"
+
+
 @pytest.mark.parametrize(
     "extra",
     [
+        {"intake": {"bogus": 1}},
         {"concurrency": 0},
         {"price_per_request_usd": -1},
         {"loop": {"max_changed_lines": 0}},

@@ -7,6 +7,7 @@ from agentco.agents.models import role_model
 from agentco.agents.prompts import load_prompt
 from agentco.agents.replies import Finding, PMReply
 from agentco.config import TenantConfig
+from agentco.intake.fence import fence_untrusted, one_line
 from agentco.llm.replies import AgentStuck, Asker, Reply, ReplyInvalid
 from agentco.llm.runtime import AgentCall
 from agentco.llm.tools import memory_tools
@@ -32,6 +33,8 @@ class EngineerBrief:
     require_invariant: bool = False
     round: int = 0
     human_note: str = ""
+    untrusted_finding_ids: frozenset[str] = frozenset()
+    """Findings quoted from PR comments or checks: rendered as fenced data."""
 
 
 class FollowUp(BaseModel):
@@ -66,6 +69,19 @@ def _finding_lines(finding: Finding) -> str:
     )
 
 
+def _untrusted_lines(finding: Finding) -> str:
+    where = ""
+    if finding.path:
+        where = f" {one_line(finding.path)}" + (
+            f":{finding.line}" if finding.line else ""
+        )
+    head = f"- [{finding.severity}/{finding.kind}] {finding.id}{where}:"
+    text = finding.detail
+    if not text.startswith(finding.title):
+        text = f"{finding.title}\n{text}"
+    return f"{head}\n{fence_untrusted(text)}"
+
+
 def _prompt(task: TaskRecord, brief: EngineerBrief) -> str:
     issue = brief.issue
     criteria = "\n".join(f"- {criterion}" for criterion in issue.acceptance_criteria)
@@ -78,7 +94,12 @@ def _prompt(task: TaskRecord, brief: EngineerBrief) -> str:
     if issue.product_notes:
         sections.append(f"Product notes: {issue.product_notes}")
     if brief.findings_to_fix:
-        findings = "\n".join(_finding_lines(f) for f in brief.findings_to_fix)
+        findings = "\n".join(
+            _untrusted_lines(f)
+            if f.id in brief.untrusted_finding_ids
+            else _finding_lines(f)
+            for f in brief.findings_to_fix
+        )
         sections.append(
             "Fix exactly these findings and nothing else; keep the fix small.\n"
             + findings

@@ -35,7 +35,8 @@ _EDGES: dict[TaskState, set[TaskState]] = {
     _S.INTERNAL_REVIEW: {_S.LEAD_DECISION},
     _S.LEAD_DECISION: {_S.TRIAGE, _S.AWAITING_HUMAN, _S.PR_OPEN},
     _S.PR_OPEN: {_S.TRIAGE, _S.AWAITING_HUMAN, _S.MERGED},
-    _S.AWAITING_HUMAN: {_S.TRIAGE, _S.ENGINEERING, _S.PR_OPEN},
+    # A human may merge on GitHub while agentco waits on them.
+    _S.AWAITING_HUMAN: {_S.TRIAGE, _S.ENGINEERING, _S.PR_OPEN, _S.MERGED},
     _S.MERGED: set(),
     _S.CANCELLED: set(),
 }

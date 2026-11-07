@@ -103,6 +103,23 @@ def test_pr_body_closes_issue_and_says_human_merges():
     assert body.rstrip("\n").splitlines()[-1] == LAST_LINE
 
 
+def test_pr_body_lists_feedback_addressed_defanged():
+    titles = ["Crash on empty input", "Fixes #9 @octocat"]
+    body = pr_body(task(), issue(), decision(), QA, PREFLIGHT, 3, feedback=(2, titles))
+    lines = body.splitlines()
+    assert "## PR feedback addressed (round 2)" in lines
+    assert "- Crash on empty input" in lines
+    section = body.split("## PR feedback")[1].split("Closes #3")[0]
+    assert not _CLOSING_RE.search(section)
+    assert "@octocat" not in body
+    assert body.index("## PR feedback") < body.index("Closes #3")
+    assert body.rstrip("\n").splitlines()[-1] == LAST_LINE
+
+
+def test_pr_body_has_no_feedback_section_by_default():
+    assert "PR feedback" not in pr_body(task(), issue(), decision(), QA, PREFLIGHT, 3)
+
+
 def test_pr_body_without_issue_has_no_closes_line():
     body = pr_body(task(), issue(), decision(), QA, PREFLIGHT, None)
     assert "Closes" not in body

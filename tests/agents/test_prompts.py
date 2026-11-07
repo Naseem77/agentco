@@ -13,6 +13,7 @@ PROMPTS = [
     (Role.REVIEWER, "rules"),
     (Role.QA, None),
     (Role.LEAD, None),
+    (Role.LEAD, "pr"),
 ]
 
 

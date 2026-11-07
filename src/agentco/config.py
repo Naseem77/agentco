@@ -49,6 +49,21 @@ class LoopLimits(BaseModel):
     fast_lane_max_changed_lines: int = Field(60, gt=0)
 
 
+class IntakeConfig(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    review_bots: list[str] = [
+        "copilot-pull-request-reviewer[bot]",
+        "Copilot",
+    ]
+    failing_conclusions: list[str] = [
+        "failure",
+        "timed_out",
+        "action_required",
+        "startup_failure",
+    ]
+
+
 class TenantConfig(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
@@ -62,6 +77,7 @@ class TenantConfig(BaseModel):
     concurrency: int = Field(1, ge=1)
     thresholds: Thresholds = Thresholds()
     loop: LoopLimits = LoopLimits()
+    intake: IntakeConfig = IntakeConfig()
 
     @field_validator("tenant")
     @classmethod
