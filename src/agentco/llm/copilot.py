@@ -12,10 +12,28 @@ from agentco.llm.runtime import AgentCall, AgentResult, ToolSpec
 
 SAFE_SHELL_PREFIXES = ("git status", "git diff")
 
-_SHELL_METACHARS = (";", "&", "|", "`", "$(", "${", ">", "<", "\n", "\r")
+_SHELL_METACHARS = (";", "&", "|", "`", "$", ">", "<", "\n", "\r")
 # git flags that write outside the worktree or run external programs
 _UNSAFE_GIT_FLAGS = ("--output", "--no-index", "--ext-diff", "--textconv")
+_MIN_ABBREVIATION = 3
 _FALLBACK_PREMIUM_REQUESTS = 1.0
+
+
+def _word_prefix(command: str, prefix: str) -> bool:
+    prefix = prefix.rstrip()
+    return command == prefix or command.startswith(prefix + " ")
+
+
+def _unsafe_git_arg(arg: str) -> bool:
+    if arg.startswith("-O"):  # orderfile read
+        return True
+    if not arg.startswith("--"):
+        return False
+    flag = arg.split("=", 1)[0]
+    # git accepts unambiguous abbreviations of long flags
+    return len(flag) >= 2 + _MIN_ABBREVIATION and any(
+        denied.startswith(flag) for denied in _UNSAFE_GIT_FLAGS
+    )
 
 
 def _shell_allowed(call: AgentCall, command: str | None) -> tuple[bool, str]:
@@ -25,11 +43,11 @@ def _shell_allowed(call: AgentCall, command: str | None) -> tuple[bool, str]:
     command = command.strip()
     if command in call.commands:
         return True, "configured command"
-    if any(command.startswith(p) for p in call.command_prefixes):
+    if any(_word_prefix(command, p) for p in call.command_prefixes):
         return True, "configured command prefix"
     for prefix in SAFE_SHELL_PREFIXES:
-        if command == prefix or command.startswith(prefix + " "):
-            if any(flag in command for flag in _UNSAFE_GIT_FLAGS):
+        if _word_prefix(command, prefix):
+            if any(_unsafe_git_arg(arg) for arg in command.split()):
                 return denied
             return True, "read-only git command"
     return denied
@@ -66,10 +84,8 @@ def permission_allowed(
         resolved = _resolve_inside(call.workdir, path)
         if resolved is None:
             return False, f"{kind} outside the worktree: {path}"
-        if (
-            kind == "write"
-            and ".git" in resolved.relative_to(call.workdir.resolve()).parts
-        ):
+        parts = resolved.relative_to(call.workdir.resolve()).parts
+        if kind == "write" and any(part.casefold() == ".git" for part in parts):
             return False, f"write to .git is not allowed: {path}"
         return True, f"{kind} inside the worktree"
     return False, f"{kind} access is not allowed"
@@ -171,6 +187,8 @@ class CopilotRuntime:
                 stuck_reason = stuck_reason or "timeout"
                 with contextlib.suppress(Exception):
                     await session.abort()
+            except Exception as exc:  # noqa: BLE001 - cost must still be recorded
+                stuck_reason = stuck_reason or f"error: {type(exc).__name__}"
             finally:
                 unsubscribe()
                 await asyncio.gather(*aborts, return_exceptions=True)

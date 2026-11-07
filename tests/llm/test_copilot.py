@@ -8,7 +8,7 @@ from copilot.session_events import AssistantTurnStartData
 from pydantic import BaseModel
 
 from agentco.llm.copilot import SAFE_SHELL_PREFIXES, CopilotRuntime, permission_allowed
-from agentco.llm.runtime import AgentCall, ToolSpec
+from agentco.llm.runtime import AgentCall, AgentResult, ToolSpec
 from agentco.roles import Role
 
 
@@ -67,6 +67,15 @@ def test_safe_shell_prefixes():
         ("shell", {"command": "git diff --output=/tmp/x"}, False),
         ("shell", {"command": "git diff --no-index /etc/passwd x"}, False),
         ("shell", {"command": "git push"}, False),
+        ("shell", {"command": "uv run pytestx"}, False),
+        ("shell", {"command": "uv run pytest-evil"}, False),
+        ("shell", {"command": "uv run pytest $HOME"}, False),
+        ("shell", {"command": "git diff -O/etc/passwd"}, False),
+        ("shell", {"command": "git diff -O /etc/passwd"}, False),
+        ("shell", {"command": "git diff --ext-d"}, False),
+        ("shell", {"command": "git diff --text"}, False),
+        ("shell", {"command": "git diff --no-i x"}, False),
+        ("shell", {"command": "git diff --stat --name-only"}, True),
         ("write", {"path": "{wt}/src/a.py"}, True),
         ("write", {"path": "src/a.py"}, True),
         ("write", {"path": "{wt}/new_dir/b.py"}, True),
@@ -75,6 +84,11 @@ def test_safe_shell_prefixes():
         ("write", {"path": "/etc/passwd"}, False),
         ("write", {"path": "{wt}/.git/hooks/pre-commit"}, False),
         ("write", {"path": "{wt}/.git"}, False),
+        ("write", {"path": "{wt}/.GIT"}, False),
+        ("write", {"path": "{wt}/.Git/config"}, False),
+        ("write", {"path": ".GIT"}, False),
+        ("write", {"path": ".gIt/hooks/x"}, False),
+        ("write", {"path": "{wt}/.github/x.yml"}, True),
         ("write", {"path": None}, False),
         ("write", {"path": ""}, False),
         ("read", {"path": "{wt}/src/a.py"}, True),
@@ -285,17 +299,28 @@ async def test_client_is_lazy_and_shared(call):
 
 
 async def test_disconnect_when_send_raises(call):
-    client = FakeSdkClient()
+    client = FakeSdkClient(metrics_cost=3.0)
 
     async def boom(prompt, *, timeout):
         raise RuntimeError("cli died")
 
     client.session.send_and_wait = boom
     async with CopilotRuntime(client_factory=lambda: client) as rt:
-        with pytest.raises(RuntimeError) as exc:
-            await rt.run(call)
-    assert str(exc.value) == "cli died"
+        res = await rt.run(call)
+    assert res == AgentResult("", 3.0, True, "error: RuntimeError")
     assert client.session.disconnected is True
+
+
+async def test_send_failure_without_metrics_uses_fallback_cost(call):
+    client = FakeSdkClient(metrics_cost=None)
+
+    async def boom(prompt, *, timeout):
+        raise RuntimeError("cli died")
+
+    client.session.send_and_wait = boom
+    async with CopilotRuntime(client_factory=lambda: client) as rt:
+        res = await rt.run(call)
+    assert res == AgentResult("", 1.0, True, "error: RuntimeError")
 
 
 class Params(BaseModel):
