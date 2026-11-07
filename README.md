@@ -5,6 +5,7 @@ A software company made of AI agents: PM, triage, junior/senior engineers, archi
 - Design: [docs/superpowers/specs/2026-11-04-agent-company-design.md](docs/superpowers/specs/2026-11-04-agent-company-design.md)
 - Plan 1 (foundation): [docs/superpowers/plans/2026-11-04-agentco-plan-1-foundation.md](docs/superpowers/plans/2026-11-04-agentco-plan-1-foundation.md)
 - Plan 2 (importer): [docs/superpowers/plans/2026-11-04-agentco-plan-2-importer.md](docs/superpowers/plans/2026-11-04-agentco-plan-2-importer.md)
+- Plan 3 (task loop): [docs/superpowers/plans/2026-11-07-agentco-plan-3-task-loop.md](docs/superpowers/plans/2026-11-07-agentco-plan-3-task-loop.md)
 
 ## Quickstart
 
@@ -114,10 +115,55 @@ Exit codes: 1 bad arguments, config, a non-git `--repo-path` or an LLM error (e.
 `OPENAI_API_KEY` missing, rate limit, refusal), 2 FalkorDB unreachable or rejecting a
 query, 3 `gh` missing, not logged in, the repo not found, or `gh` returning unexpected JSON.
 
+## Run a task
+
+Prerequisites: `init` done, FalkorDB and `OPENAI_API_KEY` as above, the
+GitHub Copilot CLI signed in (the agents run through the Copilot SDK), `git` and `gh`. The
+target repo needs a `.agentco.yml` at its root that tells the team how to build and test it:
+
+```yaml
+build: make build
+test: make test
+e2e: null                       # or a command; the key is required
+lint: make lint
+sandbox: { devcontainer: .devcontainer }   # or { compose: docker-compose.yml, service: app }
+test_files: pytest {files}      # optional: run only the tests a change affects
+```
+
+```bash
+uv run agentco task new "Graph switch flickers" --body "Switching graphs flickers for a frame..."
+uv run agentco task run 1 --repo owner/name --repo-path .   # or --all
+uv run agentco inbox                                        # tasks waiting for you
+uv run agentco decide 1 approve                             # or: reject | answer --note "..."
+uv run agentco task run 1 --repo owner/name --repo-path .   # carries on from your decision
+```
+
+`task run` works on a branch in its own git worktree and prints the final state per task. It
+stops when the task needs you (`awaiting_human`), opens its pull request (`pr_open`) or is
+cancelled, and it resumes where it stopped when run again. `--all` runs every task that can
+make progress, `cfg.concurrency` at a time; `--host` runs the repo's build and test commands
+on this machine instead of in the sandbox.
+
+**A PR opens only after approval, and a human always merges.** The team lead's approval (or
+your `approve` on an escalated task) is the only way a branch is pushed and a PR opened, and
+nothing here ever merges one.
+
+`inbox` lists each waiting task with the category, the state it came from, why it stopped and
+the options. `decide <id> approve|reject|answer` answers it: `answer` needs `--note`,
+`reject` cancels the task at once, and `approve` or `answer` take effect on the next
+`task run`. `--add-budget USD` raises that task's spending limit, which is how a task that
+stopped on its budget continues. Every decision is also written to company memory as a human
+decision.
+
+Exit codes of `task run`: 1 bad arguments, config, checkout or repo contract, 2 FalkorDB
+unreachable, 3 `gh` unavailable or failing, 4 a step failed and the task stayed where it was
+(run it again to retry). `decide` uses 1 and 2.
+
 ## Tests
 
 ```bash
 uv run pytest -q                  # unit tests; no Docker or network needed
 uv run pytest -m integration      # needs FalkorDB on localhost:6379 and OPENAI_API_KEY
+AGENTCO_IT_COPILOT=1 uv run pytest tests/test_task_loop_integration.py -m integration  # real Copilot agents
 uv run ruff check src tests
 ```

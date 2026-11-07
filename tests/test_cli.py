@@ -1,5 +1,7 @@
+import asyncio
 import dataclasses
 import subprocess
+import sys
 from datetime import UTC, datetime
 from pathlib import Path
 
@@ -18,8 +20,18 @@ from typer.testing import CliRunner
 from agentco import cli
 from agentco.code.graph import InMemoryCodeGraph
 from agentco.github.client import FakeGitHub, GhCli, GitHubError
-from agentco.memory.backend import InMemoryBackend
+from agentco.llm.fake import FakeRuntime
+from agentco.memory.backend import InMemoryBackend, MemoryItem
+from agentco.memory.scopes import Scope
+from agentco.roles import Role
+from agentco.store.models import ArtifactKind
 from agentco.store.task_store import TaskStore
+from agentco.workflow.states import TaskState
+
+# The orchestrator rig lives next to its tests and imports its siblings by bare name.
+sys.path.insert(0, str(Path(__file__).parent / "workflow"))
+from orch_helpers import PM_JSON, SEED_FACT, STUCK, happy, triage_json
+from script_runner import FILES, RED_CMD, ScriptRunner
 
 runner = CliRunner()
 GITHUB_FIXTURES = Path(__file__).parent / "github" / "fixtures"
@@ -64,6 +76,24 @@ def _write_config(tmp_path):
     return path
 
 
+class _TaskRunSeams:
+    """What `task run` gets from the make_* seams; tests script it with `script()`."""
+
+    def __init__(self) -> None:
+        self.runtime = FakeRuntime({})
+        self.github = FakeGitHub([], [], [], {})
+        self.runner = ScriptRunner(codes={RED_CMD: 1})
+        self.runner_args: list[tuple] = []
+
+    def script(self, script, premium: float = 1.0) -> FakeRuntime:
+        self.runtime = FakeRuntime(script, premium_requests=premium)
+        return self.runtime
+
+    def command_runner(self, contract, root, host):
+        self.runner_args.append((contract, root, host))
+        return self.runner
+
+
 @pytest.fixture
 def env(tmp_path, monkeypatch):
     backend = InMemoryBackend()
@@ -73,12 +103,21 @@ def env(tmp_path, monkeypatch):
     monkeypatch.setattr(
         cli, "make_github", lambda: FakeGitHub.from_fixtures(GITHUB_FIXTURES)
     )
+    run_state = _TaskRunSeams()
+    monkeypatch.setattr(cli, "make_runtime", lambda cfg: run_state.runtime)
+    monkeypatch.setattr(
+        cli,
+        "make_command_runner",
+        lambda contract, root, host: run_state.command_runner(contract, root, host),
+    )
+    monkeypatch.setattr(cli, "make_github_writer", lambda: run_state.github)
     config = _write_config(tmp_path)
 
     def run(*args):
         return runner.invoke(cli.app, [*args, "--config", str(config)])
 
     run.backend = backend
+    run.seams = run_state
     run.code_graph = code_graph
     run.store = TaskStore(f"sqlite:///{tmp_path}/state.db")
     return run
@@ -958,3 +997,399 @@ def test_import_malformed_gh_json_exits_3_with_one_line(
 
 def cli_github(run):
     return GhCli(runner=run)
+
+
+CONTRACT = {
+    "build": "build",
+    "test": "pytest-all",
+    "e2e": None,
+    "lint": "lint",
+    "sandbox": {"devcontainer": ".devcontainer"},
+    "test_files": "pytest {files}",
+}
+
+
+@pytest.fixture
+def repo(env, make_repo):
+    """A contract repo whose area is already known to the `rnd` graph."""
+    asyncio.run(
+        env.backend.add(
+            "acme__rnd",
+            Scope.RND,
+            MemoryItem("calc", SEED_FACT, "test", datetime.now(UTC)),
+        )
+    )
+    return make_repo({**FILES, ".agentco.yml": yaml.safe_dump(CONTRACT)})
+
+
+def _run_task(env, repo, *args):
+    return env("task", "run", *args, "--repo", "acme/app", "--repo-path", str(repo))
+
+
+def _new_task(env, title="Make add commutative-safe") -> int:
+    return int(env("task", "new", title).stdout)
+
+
+def _over_budget(env):
+    """PM and triage cost more than the whole budget, so the task escalates."""
+    env.seams.script(
+        {Role.PM: [PM_JSON, PM_JSON], Role.TRIAGE: [triage_json(), triage_json()]},
+        premium=100,
+    )
+
+
+def _calls(env) -> list[Role]:
+    return [c.role for c in env.seams.runtime.calls]
+
+
+def _decisions(env, task_id):
+    return [a.body for a in env.store.artifacts(task_id, ArtifactKind.HUMAN_DECISION)]
+
+
+def test_task_new_body_is_stored_as_the_request(env):
+    task_id = _new_task(env, "Fix add")
+    assert env.store.latest_artifact(task_id, ArtifactKind.REQUEST).body == {
+        "body": "Fix add"
+    }
+    result = env("task", "new", "Fix mul", "--body", "mul drops the sign")
+    request = env.store.latest_artifact(int(result.stdout), ArtifactKind.REQUEST)
+    assert (request.role, request.body) == (Role.HUMAN, {"body": "mul drops the sign"})
+
+
+def test_task_run_happy_path_prints_pr_open(env, repo):
+    env.seams.script(happy())
+    task_id = _new_task(env)
+
+    result = _run_task(env, repo, str(task_id))
+
+    assert (result.exit_code, result.stdout) == (
+        0,
+        "task 1: pr_open https://github.com/acme/app/pull/1\n",
+    )
+    assert env.store.get(task_id).state is TaskState.PR_OPEN
+    assert [(c["repo"], c["base"]) for c in env.seams.github.created] == [
+        ("acme/app", "main")
+    ]
+    assert env.store.latest_artifact(task_id, ArtifactKind.TARGET).body == {
+        "repo": "acme/app",
+        "main": "main",
+    }
+    contract, root, host = env.seams.runner_args[0]
+    assert (contract.test, root, host) == ("pytest-all", repo.resolve(), False)
+
+
+def test_task_run_host_flag_reaches_the_command_runner(env, repo):
+    _over_budget(env)
+    task_id = _new_task(env)
+    _run_task(env, repo, str(task_id), "--host")
+    assert [host for _, _, host in env.seams.runner_args] == [True]
+
+
+def test_task_run_is_resumable_and_records_the_target_once(env, repo):
+    _over_budget(env)
+    task_id = _new_task(env)
+    first = _run_task(env, repo, str(task_id))
+    second = _run_task(env, repo, str(task_id))
+    assert (first.exit_code, first.stdout) == (0, "task 1: awaiting_human\n")
+    assert (second.exit_code, second.stdout) == (0, "task 1: awaiting_human\n")
+    assert _calls(env) == [Role.PM, Role.TRIAGE]
+    assert len(env.store.artifacts(task_id, ArtifactKind.TARGET)) == 1
+
+
+def test_task_run_step_failed_exit_4(env, repo):
+    env.seams.script({Role.PM: [STUCK]})
+    task_id = _new_task(env)
+
+    result = _run_task(env, repo, str(task_id))
+
+    assert result.exit_code == 4
+    assert result.stdout == "task 1: failed: pm: SECRET_REASON_XYZ\n"
+    assert env.store.get(task_id).state is TaskState.PM
+
+
+def test_task_run_github_unavailable_exit_3(env, repo, monkeypatch):
+    def missing():
+        raise GitHubError("gh not found")
+
+    monkeypatch.setattr(cli, "make_github_writer", missing)
+    task_id = _new_task(env)
+    result = _run_task(env, repo, str(task_id))
+    assert (result.exit_code, result.stdout) == (3, "gh not found\n")
+    assert env.store.get(task_id).state is TaskState.INTAKE
+
+
+def test_task_run_falkordb_down_exit_2(env, repo, monkeypatch):
+    def down(cfg):
+        raise redis.exceptions.ConnectionError("refused")
+
+    monkeypatch.setattr(cli, "make_backend", down)
+    task_id = _new_task(env)
+    result = _run_task(env, repo, str(task_id))
+    assert (result.exit_code, result.stdout) == (
+        2,
+        "cannot reach FalkorDB at localhost:6379\n",
+    )
+
+
+def test_task_run_falkordb_dying_mid_run_exit_2(env, repo, monkeypatch):
+    class Dying(InMemoryBackend):
+        async def search(self, graphs, query, limit):
+            raise redis.exceptions.ConnectionError("gone")
+
+    monkeypatch.setattr(cli, "make_backend", lambda cfg: Dying())
+    env.seams.script({Role.PM: [PM_JSON], Role.TRIAGE: [triage_json()]})
+    task_id = _new_task(env)
+    result = _run_task(env, repo, str(task_id))
+    assert (result.exit_code, result.stdout) == (
+        2,
+        "cannot reach FalkorDB at localhost:6379\n",
+    )
+
+
+class EnterExitRuntime(FakeRuntime):
+    def __init__(self, script):
+        super().__init__(script)
+        self.events = []
+
+    async def __aenter__(self):
+        self.events.append("start")
+        return self
+
+    async def __aexit__(self, *exc):
+        self.events.append("stop")
+
+
+def test_task_run_starts_and_stops_a_runtime_that_supports_it(env, repo):
+    runtime = EnterExitRuntime({Role.PM: [STUCK]})
+    env.seams.runtime = runtime
+    task_id = _new_task(env)
+    _run_task(env, repo, str(task_id))
+    assert runtime.events == ["start", "stop"]
+    assert [c.role for c in runtime.calls] == [Role.PM]
+
+
+def test_task_run_all_runs_only_tasks_that_can_progress(env, repo):
+    _over_budget(env)
+    first = _new_task(env, "First")
+    _run_task(env, repo, str(first))
+    second = _new_task(env, "Second")
+    cancelled = _new_task(env, "Cancelled")
+    env.store.transition(cancelled, TaskState.CANCELLED, Role.HUMAN, "x")
+
+    result = _run_task(env, repo, "--all")
+
+    assert (result.exit_code, result.stdout) == (0, "task 2: awaiting_human\n")
+    assert _calls(env) == [Role.PM, Role.TRIAGE, Role.PM, Role.TRIAGE]
+    assert env.store.get(first).state is TaskState.AWAITING_HUMAN
+    assert env.store.get(second).state is TaskState.AWAITING_HUMAN
+
+
+def test_task_run_all_runs_every_task_and_reports_each(env, repo):
+    _over_budget(env)
+    _new_task(env, "First")
+    _new_task(env, "Second")
+    result = _run_task(env, repo, "--all")
+    assert (result.exit_code, result.stdout) == (
+        0,
+        "task 1: awaiting_human\ntask 2: awaiting_human\n",
+    )
+
+
+def test_task_run_all_with_nothing_to_run(env, repo):
+    result = _run_task(env, repo, "--all")
+    assert (result.exit_code, result.stdout) == (0, "no tasks to run\n")
+
+
+def test_task_run_all_exits_4_when_any_task_fails_but_runs_the_rest(env, repo):
+    env.seams.script(
+        {Role.PM: [STUCK, PM_JSON], Role.TRIAGE: [triage_json()]}, premium=100
+    )
+    _new_task(env, "Broken")
+    _new_task(env, "Fine")
+    result = _run_task(env, repo, "--all")
+    assert result.exit_code == 4
+    assert result.stdout == (
+        "task 1: failed: pm: SECRET_REASON_XYZ\ntask 2: awaiting_human\n"
+    )
+
+
+def test_task_run_needs_exactly_one_of_id_or_all(env, repo):
+    task_id = _new_task(env)
+    for args in ([], [str(task_id), "--all"]):
+        result = _run_task(env, repo, *args)
+        assert (result.exit_code, result.stdout) == (
+            1,
+            "give exactly one of a task id or --all\n",
+        )
+
+
+def test_task_run_unknown_task_exit_1(env, repo):
+    result = _run_task(env, repo, "99")
+    assert (result.exit_code, result.stdout) == (1, "task 99 not found\n")
+
+
+def test_task_run_checkout_without_a_repo_contract_exit_1(env, make_repo):
+    bare = make_repo(FILES, name="nocontract")
+    task_id = _new_task(env)
+    result = _run_task(env, bare, str(task_id))
+    assert result.exit_code == 1
+    assert result.stdout == f"repo contract {bare.resolve()}/.agentco.yml not found\n"
+
+
+def test_task_run_bad_repo_name_exit_1(env, repo):
+    task_id = _new_task(env)
+    result = env(
+        "task", "run", str(task_id), "--repo", "nope", "--repo-path", str(repo)
+    )
+    assert (result.exit_code, result.stdout) == (
+        1,
+        "repo must look like owner/name, got 'nope'\n",
+    )
+
+
+def test_inbox_lists_escalations(env, repo):
+    _over_budget(env)
+    waiting = _new_task(env, "Fix add")
+    _run_task(env, repo, str(waiting))
+    _new_task(env, "Not escalated yet")
+
+    result = env("inbox")
+
+    assert result.exit_code == 0
+    assert result.stdout.splitlines() == [
+        "id\ttitle\tcategory\tfrom_state\treason\toptions\tcost",
+        "1\tFix add\tstuck\tengineering\tbudget\tadd budget; reject\t$8.00",
+    ]
+
+
+def test_inbox_when_empty(env):
+    result = env("inbox")
+    assert (result.exit_code, result.stdout) == (0, "nothing is waiting for a human\n")
+
+
+def test_decide_requires_awaiting_human(env):
+    task_id = _new_task(env)
+    result = env("decide", str(task_id), "approve")
+    assert (result.exit_code, result.stdout) == (
+        1,
+        "task 1 is intake, not awaiting_human\n",
+    )
+    assert _decisions(env, task_id) == []
+    assert env.backend._graphs == {}
+
+
+def test_decide_unknown_task_exit_1(env):
+    result = env("decide", "99", "approve")
+    assert (result.exit_code, result.stdout) == (1, "task 99 not found\n")
+
+
+def test_decide_answer_requires_note(env):
+    task_id = _new_task(env)
+    for args in (["answer"], ["answer", "--note", "  "]):
+        result = env("decide", str(task_id), *args)
+        assert (result.exit_code, result.stdout) == (
+            1,
+            "answer needs --note with your answer\n",
+        )
+
+
+def test_decide_rejects_a_bad_budget(env, repo):
+    _over_budget(env)
+    task_id = _new_task(env)
+    _run_task(env, repo, str(task_id))
+    result = env("decide", str(task_id), "approve", "--add-budget", "0")
+    assert (result.exit_code, result.stdout) == (
+        1,
+        "--add-budget must be a positive amount, got 0.0\n",
+    )
+    assert _decisions(env, task_id) == []
+
+
+def test_decide_writes_company_memory_as_human(env, repo):
+    _over_budget(env)
+    task_id = _new_task(env, "Fix add")
+    _run_task(env, repo, str(task_id))
+
+    result = env("decide", str(task_id), "answer", "--note", "ship it small")
+
+    assert result.exit_code == 0
+    assert result.stdout == "task 1: answer recorded; run `agentco task run 1`\n"
+    assert _decisions(env, task_id) == [{"decision": "answer", "note": "ship it small"}]
+    [item] = env.backend.items("acme__company")
+    assert item.name == "human-decision:1:1"
+    assert item.body == (
+        "Human decision (answer) on task 1 'Fix add': the team escalated from "
+        "engineering (stuck) because: budget. Note: ship it small"
+    )
+    assert env.store.get(task_id).state is TaskState.AWAITING_HUMAN
+
+
+def test_decide_with_falkordb_down_changes_nothing(env, repo, monkeypatch):
+    _over_budget(env)
+    task_id = _new_task(env)
+    _run_task(env, repo, str(task_id))
+
+    def down(cfg):
+        raise redis.exceptions.ConnectionError("refused")
+
+    monkeypatch.setattr(cli, "make_backend", down)
+    result = env("decide", str(task_id), "reject")
+
+    assert (result.exit_code, result.stdout) == (
+        2,
+        "cannot reach FalkorDB at localhost:6379\n",
+    )
+    assert _decisions(env, task_id) == []
+    assert env.store.get(task_id).state is TaskState.AWAITING_HUMAN
+
+
+def test_decide_reject_cancels(env, repo):
+    _over_budget(env)
+    task_id = _new_task(env)
+    _run_task(env, repo, str(task_id))
+
+    result = env("decide", str(task_id), "reject", "--note", "not now")
+
+    assert (result.exit_code, result.stdout) == (0, "task 1: cancelled\n")
+    assert env.store.get(task_id).state is TaskState.CANCELLED
+    assert _decisions(env, task_id) == [{"decision": "reject", "note": "not now"}]
+    assert env.store.get_meta("task:1:extra_budget") is None
+    again = _run_task(env, repo, str(task_id))
+    assert (again.exit_code, again.stdout) == (0, "task 1: cancelled\n")
+    assert env.seams.github.created == []
+
+
+def test_decide_add_budget_then_run_resumes(env, repo):
+    script = happy()
+    script[Role.PM] = [PM_JSON]
+    script[Role.TRIAGE] = [triage_json()]
+    env.seams.script(script, premium=100)
+    task_id = _new_task(env)
+    assert _run_task(env, repo, str(task_id)).stdout == "task 1: awaiting_human\n"
+
+    result = env("decide", str(task_id), "approve", "--add-budget", "100")
+
+    assert result.exit_code == 0
+    assert env.store.get_meta("task:1:extra_budget") == "100.0"
+    assert env.store.get(task_id).state is TaskState.AWAITING_HUMAN
+    resumed = _run_task(env, repo, "--all")
+    assert (resumed.exit_code, resumed.stdout) == (
+        0,
+        "task 1: pr_open https://github.com/acme/app/pull/1\n",
+    )
+    assert len(env.seams.github.created) == 1
+    assert _calls(env).count(Role.PM) == 1
+
+
+def test_decide_add_budget_accumulates(env, repo):
+    _over_budget(env)
+    task_id = _new_task(env)
+    _run_task(env, repo, str(task_id))
+    env("decide", str(task_id), "approve", "--add-budget", "1.5")
+    env("decide", str(task_id), "approve", "--add-budget", "2")
+    assert env.store.get_meta("task:1:extra_budget") == "3.5"
+    assert [d["decision"] for d in _decisions(env, task_id)] == ["approve", "approve"]
+    assert [i.name for i in env.backend.items("acme__company")] == [
+        "human-decision:1:1",
+        "human-decision:1:2",
+    ]
