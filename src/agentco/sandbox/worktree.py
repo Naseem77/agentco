@@ -5,10 +5,9 @@ All functions are synchronous and shell out to git; async callers wrap them in
 no prompts, and a fixed agentco identity.
 """
 
-import io
 import os
+import shutil
 import subprocess
-import tarfile
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -44,14 +43,21 @@ def branch_name(task_id: int) -> str:
     return f"agentco/task-{task_id}"
 
 
-def _run(cwd: Path, *args: str) -> subprocess.CompletedProcess[bytes]:
-    env = {**os.environ, "GIT_TERMINAL_PROMPT": "0"}
+_INHERITED_GIT_ENV = ("GIT_DIR", "GIT_WORK_TREE", "GIT_INDEX_FILE")
+
+
+def _run(
+    cwd: Path, *args: str, input: bytes | None = None
+) -> subprocess.CompletedProcess[bytes]:
+    env = {k: v for k, v in os.environ.items() if k not in _INHERITED_GIT_ENV}
+    env["GIT_TERMINAL_PROMPT"] = "0"
     try:
         return subprocess.run(
             [*_GIT, *args],
             cwd=cwd,
             env=env,
-            stdin=subprocess.DEVNULL,
+            input=input,
+            stdin=None if input is not None else subprocess.DEVNULL,
             capture_output=True,
             check=False,
         )
@@ -129,17 +135,27 @@ def commit_all(wt: Worktree, message: str) -> str | None:
     return _git(wt.path, "rev-parse", "HEAD").strip()
 
 
+_DIFF = (
+    "-c",
+    "core.quotePath=false",
+    "diff",
+    "--no-ext-diff",
+    "--no-textconv",
+    "--no-color",
+)
+
+
 def diff(wt: Worktree, against: str) -> str:
-    return _git(wt.path, "diff", f"{against}...HEAD")
+    return _git(wt.path, *_DIFF, f"{against}...HEAD")
 
 
 def changed_files(wt: Worktree, against: str) -> list[str]:
-    out = _git(wt.path, "diff", "--no-renames", "--name-only", f"{against}...HEAD")
+    out = _git(wt.path, *_DIFF, "--no-renames", "--name-only", f"{against}...HEAD")
     return out.splitlines()
 
 
 def changed_lines(wt: Worktree, against: str) -> int:
-    out = _git(wt.path, "diff", "--no-renames", "--numstat", f"{against}...HEAD")
+    out = _git(wt.path, *_DIFF, "--no-renames", "--numstat", f"{against}...HEAD")
     total = 0
     for line in out.splitlines():
         added, deleted, _ = line.split("\t", 2)
@@ -159,24 +175,107 @@ def rebase_onto(wt: Worktree, base_ref: str) -> bool:
     return False
 
 
+def _tree_entries(wt: Worktree) -> list[tuple[str, str, str]]:
+    out = _git(wt.path, "ls-tree", "-r", "-z", "--full-tree", "HEAD")
+    entries = []
+    for record in out.split("\0"):
+        if not record:
+            continue
+        meta, path = record.split("\t", 1)
+        mode, _kind, sha = meta.split()
+        entries.append((mode, sha, path))
+    return entries
+
+
+def _read_blobs(wt: Worktree, shas: list[str]) -> dict[str, bytes]:
+    if not shas:
+        return {}
+    proc = _run(
+        wt.path, "cat-file", "--batch", input="".join(f"{s}\n" for s in shas).encode()
+    )
+    if proc.returncode != 0:
+        raise _fail(("cat-file", "--batch"), proc)
+    data, pos, blobs = proc.stdout, 0, {}
+    for sha in shas:
+        end = data.index(b"\n", pos)
+        size = int(data[pos:end].split()[2])
+        blobs[sha] = data[end + 1 : end + 1 + size]
+        pos = end + 1 + size + 1
+    return blobs
+
+
+def _safe_rel(path: str) -> Path:
+    parts = path.split("/")
+    if any(p in ("", ".", "..") or p.lower() == ".git" for p in parts):
+        raise GitError(f"refusing unsafe path in snapshot: {path!r}")
+    return Path(*parts)
+
+
+def _materialize(wt: Worktree, dest: Path) -> None:
+    """Copy HEAD's committed blobs into dest, with no attribute processing.
+
+    Not `git archive`/`checkout-index`: those honour .gitattributes
+    (`export-subst` would expand the engineer's commit message into files).
+    Symlinks are recreated as symlinks, after all regular files, and a symlink
+    that is absolute or resolves outside dest raises GitError.
+    """
+    entries = _tree_entries(wt)
+    blobs = _read_blobs(wt, [sha for mode, sha, _ in entries if mode[0] in "01"])
+    links: list[tuple[Path, str]] = []
+    for mode, sha, path in entries:
+        target = dest / _safe_rel(path)
+        if mode == "160000":  # submodule: archive-like empty directory
+            target.mkdir(parents=True, exist_ok=True)
+        elif mode == "120000":
+            links.append((target, blobs[sha].decode(errors="surrogateescape")))
+        else:
+            target.parent.mkdir(parents=True, exist_ok=True)
+            target.write_bytes(blobs[sha])
+            target.chmod(0o755 if mode == "100755" else 0o644)
+    root = dest.resolve()
+    for link, link_target in links:
+        if os.path.isabs(link_target):
+            raise GitError(f"snapshot symlink {link.relative_to(dest)} is absolute")
+        link.parent.mkdir(parents=True, exist_ok=True)
+        os.symlink(link_target, link)
+    for link, _ in links:  # after all links exist, so chains are resolved physically
+        if not Path(os.path.realpath(link)).is_relative_to(root):
+            raise GitError(f"snapshot symlink {link.relative_to(dest)} escapes dest")
+
+
 def make_snapshot(wt: Worktree, dest: Path) -> Path:
     """Export HEAD into a fresh single-commit repo (D4: QA never sees history).
 
     The repo contract's `build` must work from a fresh checkout, because the
-    snapshot has no installed dependencies.
+    snapshot has no installed dependencies. Any failure raises GitError and
+    leaves dest as it was found (absent, or empty), so a retry works.
     """
-    if dest.exists() and any(dest.iterdir()):
+    existed = dest.exists()
+    if existed and any(dest.iterdir()):
         raise GitError(f"snapshot destination {dest} is not empty")
-    archive = _run(wt.path, "archive", "--format=tar", "HEAD")
-    if archive.returncode != 0:
-        raise _fail(("archive", "HEAD"), archive)
-    dest.mkdir(parents=True, exist_ok=True)
-    with tarfile.open(fileobj=io.BytesIO(archive.stdout)) as tar:
-        tar.extractall(dest, filter="data")
-    _git(dest, "init", "-b", "main")
-    _git(dest, "add", "-A")
-    _git(dest, "commit", "--allow-empty", "-m", SNAPSHOT_MESSAGE)
+    try:
+        dest.mkdir(parents=True, exist_ok=True)
+        _materialize(wt, dest)
+        _git(dest, "init", "-b", "main")
+        _git(dest, "add", "-A")
+        _git(dest, "commit", "--allow-empty", "-m", SNAPSHOT_MESSAGE)
+    except (GitError, OSError, ValueError) as e:
+        _clean(dest, keep_dir=existed)
+        if isinstance(e, GitError):
+            raise
+        raise GitError(f"snapshot of {wt.path} failed: {e}") from e
     return dest
+
+
+def _clean(dest: Path, keep_dir: bool) -> None:
+    if not keep_dir:
+        shutil.rmtree(dest, ignore_errors=True)
+        return
+    for child in dest.iterdir():
+        if child.is_dir() and not child.is_symlink():
+            shutil.rmtree(child, ignore_errors=True)
+        else:
+            child.unlink(missing_ok=True)
 
 
 def push_branch(wt: Worktree) -> None:

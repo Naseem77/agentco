@@ -229,6 +229,102 @@ def test_snapshot_refuses_non_empty_dest(make_repo, tmp_path):
         make_snapshot(wt, dest)
 
 
+def commit_in_worktree(wt, files: dict[str, str], message: str) -> None:
+    for rel, text in files.items():
+        (wt.path / rel).write_text(text)
+    commit_all(wt, message)
+
+
+def test_snapshot_ignores_export_subst_and_export_ignore(make_repo, tmp_path):
+    root = make_repo({"a.py": "x=1  $Format:%B$\n", "keep.txt": "keep\n"})
+    wt = create_worktree(root, 1, "main")
+    commit_in_worktree(
+        wt,
+        {".gitattributes": "a.py export-subst\nkeep.txt export-ignore\n"},
+        "fix: SECRET-REASONING-NOTE",
+    )
+    snap = make_snapshot(wt, tmp_path / "snap")
+    assert (snap / "a.py").read_text() == "x=1  $Format:%B$\n"
+    assert (snap / "keep.txt").read_text() == "keep\n"
+    assert (snap / ".gitattributes").exists()
+
+
+def test_snapshot_preserves_modes_and_internal_symlinks(make_repo, tmp_path):
+    root = make_repo({"run.sh": "#!/bin/sh\n", "d/b.py": "y = 1\n"})
+    (root / "run.sh").chmod(0o755)
+    (root / "link.py").symlink_to("d/b.py")
+    git(root, "add", "-A")
+    git(root, "commit", "-m", "modes")
+    wt = create_worktree(root, 1, "main")
+    snap = make_snapshot(wt, tmp_path / "snap")
+    assert (snap / "run.sh").stat().st_mode & 0o111 != 0
+    assert (snap / "d/b.py").stat().st_mode & 0o111 == 0
+    assert (snap / "link.py").is_symlink()
+    assert (snap / "link.py").readlink() == Path("d/b.py")
+    assert git(snap, "status", "--porcelain") == ""
+
+
+@pytest.mark.parametrize("target", ["/etc/hostname", "../outside.txt"])
+def test_snapshot_rejects_escaping_symlink_and_cleans_dest(make_repo, tmp_path, target):
+    root = make_repo({"a.py": "x = 1\n"})
+    (root / "link").symlink_to(target)
+    git(root, "add", "-A")
+    git(root, "commit", "-m", "link")
+    wt = create_worktree(root, 1, "main")
+    dest = tmp_path / "snap"
+    with pytest.raises(GitError):
+        make_snapshot(wt, dest)
+    assert not dest.exists()
+    (root / "link").unlink()
+    git(root, "add", "-A")
+    git(root, "commit", "-m", "drop link")
+    wt2 = create_worktree(root, 2, "main")
+    assert make_snapshot(wt2, dest) == dest
+
+
+def test_snapshot_rejects_symlink_chain_escaping_via_dot(make_repo, tmp_path):
+    root = make_repo({"a.py": "x = 1\n"})
+    (root / "y").symlink_to(".")
+    (root / "z").symlink_to("y/..")
+    git(root, "add", "-A")
+    git(root, "commit", "-m", "chain")
+    wt = create_worktree(root, 1, "main")
+    dest = tmp_path / "snap"
+    with pytest.raises(GitError):
+        make_snapshot(wt, dest)
+    assert not dest.exists()
+
+
+def test_snapshot_failure_keeps_preexisting_empty_dest_empty(make_repo, tmp_path):
+    root = make_repo({"a.py": "x = 1\n"})
+    (root / "link").symlink_to("/etc/hostname")
+    git(root, "add", "-A")
+    git(root, "commit", "-m", "link")
+    wt = create_worktree(root, 1, "main")
+    dest = tmp_path / "snap"
+    dest.mkdir()
+    with pytest.raises(GitError):
+        make_snapshot(wt, dest)
+    assert list(dest.iterdir()) == []
+
+
+def test_changed_files_not_quoted_for_non_ascii_names(make_repo):
+    root = make_repo({"a.py": "x = 1\n"})
+    wt = create_worktree(root, 1, "main")
+    commit_in_worktree(wt, {"é2.py": "y = 1\n"}, "feat: unicode")
+    assert changed_files(wt, "main") == ["é2.py"]
+
+
+def test_git_calls_ignore_inherited_git_dir(make_repo, monkeypatch, tmp_path):
+    root = make_repo({"a.py": "x = 1\n"})
+    other = make_repo({"b.py": "y = 1\n"}, name="other")
+    monkeypatch.setenv("GIT_DIR", str(other / ".git"))
+    monkeypatch.setenv("GIT_WORK_TREE", str(other))
+    wt = create_worktree(root, 1, "main")
+    commit_in_worktree(wt, {"c.py": "z = 1\n"}, "feat: c")
+    assert changed_files(wt, "main") == ["c.py"]
+
+
 def test_push_branch_reaches_bare_origin(make_repo, tmp_path):
     root = make_repo({"a.py": "x = 1\n"})
     wt = create_worktree(root, 5, "main")

@@ -19,6 +19,7 @@ from agentco.repo_contract import RepoContract, RepoContractError
 
 TIMEOUT_EXIT = 124
 NOT_FOUND_EXIT = 127
+KILL_GRACE_S = 2.0
 OUTPUT_LINES = 200
 DEFAULT_PREPARE_TIMEOUT_S = 900
 
@@ -69,8 +70,15 @@ def _exec(argv: list[str], cwd: Path, timeout_s: float) -> tuple[int, str]:
             os.killpg(proc.pid, signal.SIGKILL)
         except ProcessLookupError:
             pass
-        out, _ = proc.communicate()  # includes output captured before the timeout
         code = TIMEOUT_EXIT
+        try:
+            out, _ = proc.communicate(timeout=KILL_GRACE_S)
+        except subprocess.TimeoutExpired as e:
+            # A descendant in another session still holds the pipe: give up on it.
+            out = e.output or b""
+            if proc.stdout is not None:
+                proc.stdout.close()
+            proc.wait()
     return code, out.decode(errors="replace")
 
 

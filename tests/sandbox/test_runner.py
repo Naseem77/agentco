@@ -45,6 +45,15 @@ def test_host_runner_timeout_kills_grandchildren_holding_the_pipe(tmp_path):
     assert r.duration_s < 4
 
 
+def test_host_runner_timeout_is_bounded_when_a_descendant_escapes_the_session(tmp_path):
+    escaper = "import os,time; os.setsid(); time.sleep(8)"
+    command = f"echo started; python3 -c '{escaper}' & sleep 30"
+    r = HostRunner().run(command, tmp_path, 0.5)
+    assert (r.exit_code, r.timed_out) == (124, True)
+    assert r.output.strip() == "started"
+    assert r.duration_s < 5
+
+
 def test_host_runner_keeps_last_200_lines(tmp_path):
     r = HostRunner().run("seq 1 500", tmp_path, timeout_s=10)
     lines = r.output.splitlines()
