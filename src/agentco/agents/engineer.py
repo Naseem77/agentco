@@ -1,0 +1,160 @@
+import asyncio
+from dataclasses import dataclass
+
+from pydantic import BaseModel, Field
+
+from agentco.agents.models import role_model
+from agentco.agents.prompts import load_prompt
+from agentco.agents.replies import Finding, PMReply
+from agentco.config import TenantConfig
+from agentco.llm.replies import AgentStuck, Asker, Reply, ReplyInvalid
+from agentco.llm.runtime import AgentCall
+from agentco.llm.tools import memory_tools
+from agentco.memory.gate import MemoryGate
+from agentco.repo_contract import RepoContract
+from agentco.roles import Role
+from agentco.sandbox.worktree import (
+    Worktree,
+    changed_files,
+    commit_all,
+    head_sha,
+    reset_worktree,
+)
+from agentco.store.models import ArtifactKind, TaskRecord
+from agentco.store.task_store import TaskStore
+
+
+@dataclass(frozen=True)
+class EngineerBrief:
+    issue: PMReply
+    findings_to_fix: tuple[Finding, ...] = ()
+    preflight_failures: tuple[str, ...] = ()
+    require_invariant: bool = False
+    round: int = 0
+    human_note: str = ""
+
+
+class FollowUp(BaseModel):
+    title: str
+    why: str
+
+
+class EngineerReply(Reply):
+    summary: str
+    files_touched: list[str]
+    tests_added: list[str]
+    no_test_reason: str = ""
+    invariant: str = ""
+    new_dependencies: list[str] = Field(default_factory=list)
+    follow_ups: list[FollowUp] = Field(default_factory=list)
+
+
+class EngineerFailed(RuntimeError):
+    def __init__(self, reason: str, stuck: bool = False) -> None:
+        super().__init__(reason)
+        self.reason = reason
+        self.stuck = stuck
+
+
+def _finding_lines(finding: Finding) -> str:
+    where = ""
+    if finding.path:
+        where = f" {finding.path}" + (f":{finding.line}" if finding.line else "")
+    return (
+        f"- [{finding.severity}/{finding.kind}] {finding.id}{where}: "
+        f"{finding.title}\n  {finding.detail}"
+    )
+
+
+def _prompt(task: TaskRecord, brief: EngineerBrief) -> str:
+    issue = brief.issue
+    criteria = "\n".join(f"- {criterion}" for criterion in issue.acceptance_criteria)
+    sections = [
+        f"Task {task.id}: {task.title}",
+        f"Summary: {issue.summary}",
+        f"Why: {issue.why}",
+        f"Acceptance criteria:\n{criteria}",
+    ]
+    if issue.product_notes:
+        sections.append(f"Product notes: {issue.product_notes}")
+    if brief.findings_to_fix:
+        findings = "\n".join(_finding_lines(f) for f in brief.findings_to_fix)
+        sections.append(
+            "Fix exactly these findings and nothing else; keep the fix small.\n"
+            + findings
+        )
+    if brief.preflight_failures:
+        failures = "\n".join(f"- {failure}" for failure in brief.preflight_failures)
+        sections.append(f"Pre-flight failures to make pass:\n{failures}")
+    if brief.require_invariant:
+        sections.append(
+            "State in `invariant` the one rule that makes this class of bug "
+            "impossible, and apply it everywhere in the code you touch."
+        )
+    if brief.human_note:
+        sections.append(f"Note from the human: {brief.human_note}")
+    return "\n\n".join(sections)
+
+
+def _commands(contract: RepoContract) -> tuple[str, ...]:
+    commands = (contract.build, contract.test, contract.lint, contract.e2e)
+    return tuple(command for command in commands if command)
+
+
+async def _invariant_only_retry(
+    wt: Worktree, brief: EngineerBrief, reply: EngineerReply
+) -> bool:
+    # An earlier round already committed the fix; only the invariant was missing.
+    if not (brief.require_invariant and reply.invariant.strip()):
+        return False
+    return bool(await asyncio.to_thread(changed_files, wt, wt.base))
+
+
+async def run_engineer(
+    asker: Asker,
+    cfg: TenantConfig,
+    gate: MemoryGate,
+    store: TaskStore,
+    task: TaskRecord,
+    role: Role,
+    wt: Worktree,
+    contract: RepoContract,
+    brief: EngineerBrief,
+) -> EngineerReply:
+    prefixes = (contract.test_files.split("{files}")[0],) if contract.test_files else ()
+    call = AgentCall(
+        role=role,
+        model=role_model(cfg, role).model,
+        system=load_prompt(role),
+        prompt=_prompt(task, brief),
+        workdir=wt.path,
+        edits=True,
+        commands=_commands(contract),
+        command_prefixes=prefixes,
+        tools=memory_tools(gate.for_role(role)),
+        max_turns=cfg.loop.agent_max_turns,
+        timeout_s=cfg.loop.agent_timeout_s,
+    )
+    head = await asyncio.to_thread(head_sha, wt)
+    try:
+        reply = await asker.ask(call, EngineerReply)
+    except Exception as exc:
+        await asyncio.to_thread(reset_worktree, wt.path, head)
+        if isinstance(exc, AgentStuck):
+            raise EngineerFailed(exc.reason, stuck=True) from exc
+        if isinstance(exc, ReplyInvalid):
+            raise EngineerFailed(str(exc)) from exc
+        raise
+    sha = await asyncio.to_thread(
+        commit_all, wt, f"agentco: task {task.id} round {brief.round}"
+    )
+    if sha is None and not await _invariant_only_retry(wt, brief, reply):
+        raise EngineerFailed("engineer made no changes")
+    if brief.require_invariant and not reply.invariant.strip():
+        raise EngineerFailed("no invariant stated")
+    for follow_up in reply.follow_ups:
+        store.create_task(
+            task.tenant, follow_up.title, "followup", source_ref=f"task:{task.id}"
+        )
+    store.put_artifact(task.id, ArtifactKind.ENGINEER, role, reply.model_dump())
+    return reply

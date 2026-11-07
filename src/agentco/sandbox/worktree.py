@@ -137,6 +137,16 @@ def commit_all(wt: Worktree, message: str) -> str | None:
     return _git(wt.path, "rev-parse", "HEAD").strip()
 
 
+def head_sha(wt: Worktree) -> str:
+    return _git(wt.path, "rev-parse", "HEAD").strip()
+
+
+def reset_worktree(path: Path, ref: str) -> None:
+    """Discard all uncommitted work and return to `ref` (ignored files are kept)."""
+    _git(path, "reset", "--hard", ref)
+    _git(path, "clean", "-fd")
+
+
 _DIFF = (
     "-c",
     "core.quotePath=false",
@@ -148,7 +158,7 @@ _DIFF = (
 
 
 def diff(wt: Worktree, against: str) -> str:
-    return _git(wt.path, *_DIFF, f"{against}...HEAD")
+    return _git(wt.path, *_DIFF, "--no-renames", f"{against}...HEAD")
 
 
 def changed_files(wt: Worktree, against: str) -> list[str]:
