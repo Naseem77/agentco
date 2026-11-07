@@ -5,9 +5,16 @@ from datetime import datetime
 from functools import wraps
 from typing import Literal
 
+from pydantic import BaseModel
+
 from agentco.github.errors import GitHubError
 
 _CLOSING_RE = re.compile(r"(?i)\b(?:close[sd]?|fix(?:e[sd])?|resolve[sd]?)\s+#(\d+)")
+
+
+class PullRef(BaseModel):
+    number: int
+    url: str
 
 
 @dataclass(frozen=True)
