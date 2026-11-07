@@ -36,4 +36,5 @@ def test_back_to_first_floor_edges_are_allowed():
     assert BACK_TO_FIRST_FLOOR == {
         (TaskState.LEAD_DECISION, TaskState.TRIAGE),
         (TaskState.PR_OPEN, TaskState.TRIAGE),
+        (TaskState.PREFLIGHT, TaskState.TRIAGE),
     }

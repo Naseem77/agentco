@@ -1,4 +1,6 @@
+import json
 import math
+from collections.abc import Collection
 from pathlib import Path
 
 from sqlalchemy import create_engine, select, update
@@ -7,6 +9,9 @@ from sqlalchemy.orm import Session, sessionmaker
 
 from agentco.roles import Role
 from agentco.store.models import (
+    Artifact,
+    ArtifactKind,
+    ArtifactRow,
     AuditEntry,
     AuditRow,
     Base,
@@ -39,6 +44,18 @@ def _record(row: TaskRow) -> TaskRecord:
     )
 
 
+def _artifact(row: ArtifactRow) -> Artifact:
+    return Artifact(
+        id=row.id,
+        task_id=row.task_id,
+        round=row.round,
+        kind=ArtifactKind(row.kind),
+        role=Role(row.role),
+        body=json.loads(row.body),
+        created_at=row.created_at,
+    )
+
+
 class TaskStore:
     def __init__(self, url: str) -> None:
         db = make_url(url)
@@ -55,6 +72,8 @@ class TaskStore:
         self._sessions = sessionmaker(self._engine, expire_on_commit=False)
 
     def create_all(self) -> None:
+        """Create missing tables. There is no migration tool yet, so a database
+        created before a table existed only gains that table, not new columns."""
         Base.metadata.create_all(self._engine)
 
     def _task(self, session: Session, task_id: int) -> TaskRow:
@@ -148,6 +167,58 @@ class TaskStore:
             session.flush()
             session.expire_all()
             return _record(self._task(session, task_id))
+
+    def list_tasks(
+        self, tenant: str, states: Collection[TaskState] | None = None
+    ) -> list[TaskRecord]:
+        stmt = select(TaskRow).where(TaskRow.tenant == tenant).order_by(TaskRow.id)
+        if states is not None:
+            stmt = stmt.where(TaskRow.state.in_([s.value for s in states]))
+        with self._sessions() as session:
+            return [_record(r) for r in session.scalars(stmt)]
+
+    def put_artifact(
+        self, task_id: int, kind: ArtifactKind, role: Role, body: dict
+    ) -> Artifact:
+        with self._sessions.begin() as session:
+            task = self._task(session, task_id)
+            row = ArtifactRow(
+                task_id=task_id,
+                round=task.round,
+                kind=kind.value,
+                role=role.value,
+                body=json.dumps(body, sort_keys=True),
+            )
+            session.add(row)
+            self._audit(session, task_id, role, "artifact", {"kind": kind.value})
+            session.flush()
+            return _artifact(row)
+
+    def artifacts(
+        self,
+        task_id: int,
+        kind: ArtifactKind | None = None,
+        round: int | None = None,
+    ) -> list[Artifact]:
+        stmt = select(ArtifactRow).where(ArtifactRow.task_id == task_id)
+        if kind is not None:
+            stmt = stmt.where(ArtifactRow.kind == kind.value)
+        if round is not None:
+            stmt = stmt.where(ArtifactRow.round == round)
+        with self._sessions() as session:
+            return [
+                _artifact(r) for r in session.scalars(stmt.order_by(ArtifactRow.id))
+            ]
+
+    def latest_artifact(self, task_id: int, kind: ArtifactKind) -> Artifact | None:
+        with self._sessions() as session:
+            row = session.scalars(
+                select(ArtifactRow)
+                .where(ArtifactRow.task_id == task_id, ArtifactRow.kind == kind.value)
+                .order_by(ArtifactRow.id.desc())
+                .limit(1)
+            ).first()
+            return _artifact(row) if row else None
 
     def assign(self, task_id: int, role: Role) -> TaskRecord:
         with self._sessions.begin() as session:

@@ -29,6 +29,26 @@ class Budgets(BaseModel):
     max_rounds: int = Field(3, gt=0)
 
 
+class Thresholds(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    known_min_facts: int = Field(1, ge=1)
+    lead_min_confidence: float = Field(0.7, ge=0, le=1)
+
+
+class LoopLimits(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    max_changed_lines: int = Field(400, gt=0)
+    fix_max_changed_lines: int = Field(150, gt=0)
+    preflight_attempts: int = Field(2, gt=0)
+    command_timeout_s: float = Field(900, gt=0, allow_inf_nan=False)
+    agent_max_turns: int = Field(40, gt=0)
+    agent_timeout_s: float = Field(1200, gt=0, allow_inf_nan=False)
+    fast_lane: bool = True
+    fast_lane_max_changed_lines: int = Field(60, gt=0)
+
+
 class TenantConfig(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
@@ -38,6 +58,10 @@ class TenantConfig(BaseModel):
     database_url: str = "sqlite:///.agentco/state.db"
     roles: dict[Role, RoleModel]
     budgets: Budgets = Budgets()
+    price_per_request_usd: float = Field(0.04, ge=0, allow_inf_nan=False)
+    concurrency: int = Field(1, ge=1)
+    thresholds: Thresholds = Thresholds()
+    loop: LoopLimits = LoopLimits()
 
     @field_validator("tenant")
     @classmethod

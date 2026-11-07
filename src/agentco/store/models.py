@@ -1,7 +1,17 @@
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
+from enum import StrEnum
 
-from sqlalchemy import JSON, DateTime, Float, ForeignKey, Integer, String, TypeDecorator
+from sqlalchemy import (
+    JSON,
+    DateTime,
+    Float,
+    ForeignKey,
+    Integer,
+    String,
+    Text,
+    TypeDecorator,
+)
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
 
 from agentco.roles import Role
@@ -29,6 +39,21 @@ class UTCDateTime(TypeDecorator):
 
 class Base(DeclarativeBase):
     pass
+
+
+class ArtifactKind(StrEnum):
+    REQUEST = "request"
+    TARGET = "target"
+    ISSUE = "issue"
+    TRIAGE = "triage"
+    ENGINEER = "engineer"
+    PREFLIGHT = "preflight"
+    REVIEW = "review"
+    QA = "qa"
+    LEAD = "lead"
+    ESCALATION = "escalation"
+    HUMAN_DECISION = "human_decision"
+    PR = "pr"
 
 
 class TaskRow(Base):
@@ -61,6 +86,18 @@ class AuditRow(Base):
     cost_usd: Mapped[float] = mapped_column(Float, default=0.0)
 
 
+class ArtifactRow(Base):
+    __tablename__ = "artifacts"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    task_id: Mapped[int] = mapped_column(ForeignKey("tasks.id"), index=True)
+    round: Mapped[int] = mapped_column(Integer)
+    kind: Mapped[str] = mapped_column(String)
+    role: Mapped[str] = mapped_column(String)
+    body: Mapped[str] = mapped_column(Text)  # JSON text
+    created_at: Mapped[datetime] = mapped_column(UTCDateTime, default=utcnow)
+
+
 class MetaRow(Base):
     __tablename__ = "meta"
 
@@ -90,3 +127,14 @@ class AuditEntry:
     action: str
     detail: dict = field(default_factory=dict)
     cost_usd: float = 0.0
+
+
+@dataclass(frozen=True)
+class Artifact:
+    id: int
+    task_id: int
+    round: int
+    kind: ArtifactKind
+    role: Role
+    body: dict
+    created_at: datetime

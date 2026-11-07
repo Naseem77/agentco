@@ -25,11 +25,14 @@ class Sandbox(BaseModel):
 
     devcontainer: str | None = None
     compose: str | None = None
+    service: str | None = None  # compose service to run commands in
 
     @model_validator(mode="after")
     def _exactly_one(self) -> "Sandbox":
         if (self.devcontainer is None) == (self.compose is None):
             raise ValueError("sandbox must set exactly one of devcontainer or compose")
+        if self.service is not None and self.compose is None:
+            raise ValueError("sandbox service is only valid with compose")
         return self
 
 
@@ -41,12 +44,20 @@ class RepoContract(BaseModel):
     e2e: str | None  # key required; null means the repo has no e2e tests
     lint: str
     sandbox: Sandbox
+    test_files: str | None = None  # command template; must contain {files}
 
     @field_validator("build", "test", "e2e", "lint")
     @classmethod
     def _non_empty(cls, v: str | None) -> str | None:
         if v is not None and not v.strip():
             raise ValueError("command must be a non-empty string")
+        return v
+
+    @field_validator("test_files")
+    @classmethod
+    def _has_files_placeholder(cls, v: str | None) -> str | None:
+        if v is not None and "{files}" not in v:
+            raise ValueError("test_files must contain the {files} placeholder")
         return v
 
 

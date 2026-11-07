@@ -48,6 +48,34 @@ def test_compose_sandbox(tmp_path):
     assert load_repo_contract(tmp_path).sandbox.compose == "docker-compose.yml"
 
 
+def test_test_files_defaults_to_none_and_accepts_placeholder(tmp_path):
+    write_contract(tmp_path)
+    assert load_repo_contract(tmp_path).test_files is None
+    write_contract(tmp_path, test_files="uv run pytest {files}")
+    assert load_repo_contract(tmp_path).test_files == "uv run pytest {files}"
+
+
+def test_test_files_needs_placeholder(tmp_path):
+    write_contract(tmp_path, test_files="uv run pytest")
+    errors = contract_errors(tmp_path)
+    assert errors == [
+        (
+            ("test_files",),
+            "Value error, test_files must contain the {files} placeholder",
+        )
+    ]
+
+
+def test_sandbox_service_only_with_compose(tmp_path):
+    write_contract(tmp_path, sandbox={"compose": "c.yml", "service": "app"})
+    sandbox = load_repo_contract(tmp_path).sandbox
+    assert (sandbox.compose, sandbox.service) == ("c.yml", "app")
+    write_contract(tmp_path, sandbox={"compose": "c.yml"})
+    assert load_repo_contract(tmp_path).sandbox.service is None
+    write_contract(tmp_path, sandbox={"devcontainer": ".d", "service": "app"})
+    assert [loc for loc, _ in contract_errors(tmp_path)] == [("sandbox",)]
+
+
 def test_missing_file(tmp_path):
     with pytest.raises(RepoContractMissing):
         load_repo_contract(tmp_path)

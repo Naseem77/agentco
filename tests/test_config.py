@@ -1,6 +1,7 @@
 from pathlib import Path
 
 import pytest
+import yaml
 
 from agentco.config import ConfigError, family_warnings, load_config
 from agentco.roles import Role
@@ -50,6 +51,63 @@ def test_loads_example_config(tmp_path):
     assert cfg.falkordb_host == "localhost" and cfg.falkordb_port == 6379
     assert cfg.database_url == f"sqlite:///{tmp_path.resolve()}/.agentco/state.db"
     assert family_warnings(cfg) == []
+
+
+BASE = yaml.safe_load(EXAMPLE)
+
+
+def test_loop_defaults(tmp_path):
+    cfg = load_config(write(tmp_path, EXAMPLE))
+    assert (cfg.price_per_request_usd, cfg.concurrency) == (0.04, 1)
+    assert cfg.thresholds.known_min_facts == 1
+    assert cfg.thresholds.lead_min_confidence == 0.7
+    assert cfg.loop.model_dump() == {
+        "max_changed_lines": 400,
+        "fix_max_changed_lines": 150,
+        "preflight_attempts": 2,
+        "command_timeout_s": 900,
+        "agent_max_turns": 40,
+        "agent_timeout_s": 1200,
+        "fast_lane": True,
+        "fast_lane_max_changed_lines": 60,
+    }
+
+
+def test_loop_overrides(tmp_path):
+    raw = BASE | {
+        "price_per_request_usd": 0,
+        "concurrency": 3,
+        "thresholds": {"known_min_facts": 2, "lead_min_confidence": 1},
+        "loop": {"fast_lane": False, "preflight_attempts": 5},
+    }
+    cfg = load_config(write(tmp_path, yaml.safe_dump(raw)))
+    assert (cfg.price_per_request_usd, cfg.concurrency) == (0, 3)
+    assert (cfg.thresholds.known_min_facts, cfg.thresholds.lead_min_confidence) == (
+        2,
+        1,
+    )
+    assert (cfg.loop.fast_lane, cfg.loop.preflight_attempts) == (False, 5)
+    assert cfg.loop.max_changed_lines == 400
+
+
+@pytest.mark.parametrize(
+    "extra",
+    [
+        {"concurrency": 0},
+        {"price_per_request_usd": -1},
+        {"loop": {"max_changed_lines": 0}},
+        {"loop": {"command_timeout_s": 0}},
+        {"loop": {"fast_lane_max_changed_lines": -1}},
+        {"loop": {"bogus": 1}},
+        {"thresholds": {"known_min_facts": 0}},
+        {"thresholds": {"lead_min_confidence": 1.1}},
+        {"thresholds": {"lead_min_confidence": -0.1}},
+        {"thresholds": {"bogus": 1}},
+    ],
+)
+def test_loop_invalid(tmp_path, extra):
+    with pytest.raises(ConfigError):
+        load_config(write(tmp_path, yaml.safe_dump(BASE | extra)))
 
 
 def test_budgets_default_when_omitted(tmp_path):

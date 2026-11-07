@@ -31,7 +31,7 @@ _EDGES: dict[TaskState, set[TaskState]] = {
     _S.TRIAGE: {_S.ENGINEERING, _S.ARCHITECT, _S.AWAITING_HUMAN},
     _S.ARCHITECT: {_S.AWAITING_HUMAN},
     _S.ENGINEERING: {_S.PREFLIGHT, _S.AWAITING_HUMAN},
-    _S.PREFLIGHT: {_S.ENGINEERING, _S.INTERNAL_REVIEW},
+    _S.PREFLIGHT: {_S.ENGINEERING, _S.INTERNAL_REVIEW, _S.TRIAGE},
     _S.INTERNAL_REVIEW: {_S.LEAD_DECISION},
     _S.LEAD_DECISION: {_S.TRIAGE, _S.AWAITING_HUMAN, _S.PR_OPEN},
     _S.PR_OPEN: {_S.TRIAGE, _S.AWAITING_HUMAN, _S.MERGED},
@@ -49,5 +49,5 @@ ALLOWED_TRANSITIONS: Mapping[TaskState, frozenset[TaskState]] = MappingProxyType
 
 # Sending work back to the first floor starts a new round.
 BACK_TO_FIRST_FLOOR: frozenset[tuple[TaskState, TaskState]] = frozenset(
-    {(_S.LEAD_DECISION, _S.TRIAGE), (_S.PR_OPEN, _S.TRIAGE)}
+    {(_S.LEAD_DECISION, _S.TRIAGE), (_S.PR_OPEN, _S.TRIAGE), (_S.PREFLIGHT, _S.TRIAGE)}
 )
