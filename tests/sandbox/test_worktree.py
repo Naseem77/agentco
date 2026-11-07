@@ -107,6 +107,17 @@ def test_refresh_main_unknown_branch_raises(make_repo):
         refresh_main(root, "nope")
 
 
+def test_diff_shows_rename_as_delete_and_add(make_repo):
+    root = make_repo({"a.py": "x = 1\ny = 2\nz = 3\n"})
+    wt = create_worktree(root, 1, "main")
+    git(wt.path, "mv", "a.py", "b.py")
+    commit_all(wt, "move")
+    text = diff(wt, "main")
+    assert "rename from" not in text
+    assert "diff --git a/a.py b/a.py\ndeleted file mode" in text
+    assert "diff --git a/b.py b/b.py\nnew file mode" in text
+
+
 def test_commit_diff_and_lines(make_repo):
     root = make_repo({"a.py": "x = 1\ny = 2\n"})
     wt = create_worktree(root, 1, "main")

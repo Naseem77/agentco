@@ -158,7 +158,7 @@ _DIFF = (
 
 
 def diff(wt: Worktree, against: str) -> str:
-    return _git(wt.path, *_DIFF, f"{against}...HEAD")
+    return _git(wt.path, *_DIFF, "--no-renames", f"{against}...HEAD")
 
 
 def changed_files(wt: Worktree, against: str) -> list[str]:

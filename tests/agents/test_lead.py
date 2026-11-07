@@ -12,6 +12,7 @@ from agentco.agents.lead import (
     LeadReply,
     critical_hits,
     decide,
+    diff_paths,
     new_hits,
     run_lead,
 )
@@ -20,7 +21,7 @@ from agentco.agents.qa import QAFailure, QAReply
 from agentco.agents.replies import Finding, PMReply
 from agentco.agents.review import ReviewReply
 from agentco.llm.fake import FakeRuntime
-from agentco.llm.replies import Asker
+from agentco.llm.replies import Asker, ReplyInvalid
 from agentco.memory.backend import InMemoryBackend, MemoryItem
 from agentco.memory.gate import MemoryGate
 from agentco.memory.scopes import Scope, graph_name
@@ -526,3 +527,104 @@ def test_lead_prompt_names_findings_by_id():
 
     assert "`finding_id`" in prompt
     assert "its `id`" in prompt
+
+
+RENAME_INTO_AUTH = (
+    "diff --git a/src/old.py b/src/auth/x.py\nsimilarity index 100%\n"
+    "rename from src/old.py\nrename to src/auth/x.py\n"
+)
+RENAME_OUT_OF_AUTH = (
+    "diff --git a/src/auth/x.py b/src/util.py\nsimilarity index 90%\n"
+    "rename from src/auth/x.py\nrename to src/util.py\n"
+    "--- a/src/auth/x.py\n+++ b/src/util.py\n@@ -1 +1 @@\n-a\n+b\n"
+)
+RENAME_INTO_WORKFLOW = (
+    "diff --git a/ci.yml b/.github/workflows/ci.yml\nsimilarity index 100%\n"
+    "rename from ci.yml\nrename to .github/workflows/ci.yml\n"
+)
+
+
+def test_diff_paths_collects_old_and_new_sides_of_a_rename():
+    assert diff_paths(RENAME_INTO_AUTH) == ["src/auth/x.py", "src/old.py"]
+    assert diff_paths(RENAME_OUT_OF_AUTH) == ["src/auth/x.py", "src/util.py"]
+
+
+def test_diff_paths_handles_plain_add_and_delete():
+    text = (
+        "diff --git a/new.py b/new.py\nnew file mode 100644\n"
+        "--- /dev/null\n+++ b/new.py\n@@ -0,0 +1 @@\n+x\n"
+        "diff --git a/gone.py b/gone.py\ndeleted file mode 100644\n"
+        "--- a/gone.py\n+++ /dev/null\n@@ -1 +0,0 @@\n-x\n"
+    )
+    assert diff_paths(text) == ["gone.py", "new.py"]
+
+
+@pytest.mark.parametrize(
+    ("diff_text", "hit"),
+    [
+        (RENAME_INTO_AUTH, "security: src/auth/x.py"),
+        (RENAME_OUT_OF_AUTH, "security: src/auth/x.py"),
+        (RENAME_INTO_WORKFLOW, "infra: .github/workflows/ci.yml"),
+    ],
+)
+async def test_renames_are_critical_even_when_engineer_hides_them(
+    store, loop_cfg, diff_text, hit
+):
+    env = Env(store, loop_cfg, [lead_json()], await gate_with("src arithmetic"))
+
+    d = await env.run(fast_lane=True, diff_text=diff_text)
+
+    assert (d.outcome, d.category) == ("escalate", "critical")
+    assert hit in d.reason
+    assert len(env.runtime.calls) == 1
+
+
+async def test_lead_failure_with_critical_hits_escalates(store, loop_cfg):
+    env = Env(store, loop_cfg, ["not json"] * 3, await gate_with("src arithmetic"))
+
+    d = await env.run(diff_text=RENAME_INTO_AUTH)
+
+    assert (d.outcome, d.category, d.reason) == (
+        "escalate",
+        "critical",
+        "lead unavailable",
+    )
+    [artifact] = store.artifacts(env.task.id, ArtifactKind.LEAD)
+    assert artifact.body["reason"] == "lead unavailable"
+
+
+async def test_lead_failure_with_new_hits_escalates(store, loop_cfg):
+    env = Env(store, loop_cfg, ["not json"] * 3, await gate_with("src/calc.py x"))
+    engineer = ENGINEER.model_copy(update={"new_dependencies": ["left-pad"]})
+
+    d = await env.run(engineer=engineer)
+
+    assert (d.outcome, d.category, d.reason) == (
+        "escalate",
+        "new",
+        "lead unavailable",
+    )
+
+
+async def test_lead_failure_without_hits_still_raises(store, loop_cfg):
+    env = Env(store, loop_cfg, ["not json"] * 3, await gate_with("src/calc.py x"))
+
+    with pytest.raises(ReplyInvalid):
+        await env.run()
+
+
+def test_qa_failed_without_details_gets_a_synthetic_finding():
+    qa = QA_FAIL.model_copy(update={"failures": []})
+
+    d = decide(L(), REVIEW(), qa, (), [], [], 0.7)
+
+    assert d.outcome == "send_back"
+    assert d.findings_to_fix == (
+        Finding(
+            id="qa-1",
+            severity="major",
+            kind="bug",
+            title="QA failed without details",
+            detail="QA reported a failure but listed no failing cases.",
+        ),
+    )

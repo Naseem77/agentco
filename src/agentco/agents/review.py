@@ -19,7 +19,7 @@ class ReviewReply(Reply):
     summary: str
 
 
-def _finding_line(finding: Finding) -> str:
+def finding_line(finding: Finding) -> str:
     where = ""
     if finding.path:
         where = f" {finding.path}" + (f":{finding.line}" if finding.line else "")
@@ -34,7 +34,7 @@ def review_input(
 ) -> str:
     sections = [issue_text(issue)]
     if findings_addressed:
-        lines = "\n".join(_finding_line(f) for f in findings_addressed)
+        lines = "\n".join(finding_line(f) for f in findings_addressed)
         sections.append(
             "The diff below is a fix for these earlier findings. Review it as new "
             f"code: confirm they are fixed and look for bugs the fix adds.\n{lines}"

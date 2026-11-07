@@ -1,7 +1,7 @@
 """Team lead: classifies findings, then code applies the decision order (spec §6)."""
 
 import re
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, replace
 from typing import Literal
 
 from pydantic import BaseModel, Field
@@ -12,9 +12,9 @@ from agentco.agents.models import role_model
 from agentco.agents.prompts import load_prompt
 from agentco.agents.qa import QAReply
 from agentco.agents.replies import Finding, PMReply, issue_text
-from agentco.agents.review import ReviewReply, _finding_line
+from agentco.agents.review import ReviewReply, finding_line
 from agentco.config import TenantConfig
-from agentco.llm.replies import Asker, Reply
+from agentco.llm.replies import AgentStuck, Asker, Reply, ReplyInvalid
 from agentco.llm.runtime import AgentCall
 from agentco.llm.tools import memory_tools
 from agentco.memory.gate import MemoryGate
@@ -33,7 +33,18 @@ CRITICAL_PATTERNS: dict[str, tuple[str, ...]] = {
 }
 FAST_LANE_SUMMARY = "fast lane: rule-based approval"
 
-_DIFF_PATH = re.compile(r"^diff --git a/(.+) b/\1$", re.MULTILINE)
+_DIFF_HEADER = re.compile(r"^diff --git a/(.+?) b/(.+)$", re.MULTILINE)
+_DIFF_FILE_LINE = re.compile(
+    r"^(?:rename (?:from|to) (.+)|(?:\+\+\+ b|--- a)/(.+?)\t?)$", re.MULTILINE
+)
+
+
+def diff_paths(diff_text: str) -> list[str]:
+    """Every old and new path a diff touches, renames included."""
+    paths = {p for header in _DIFF_HEADER.findall(diff_text) for p in header}
+    for groups in _DIFF_FILE_LINE.findall(diff_text):
+        paths.update(p for p in groups if p)
+    return sorted(paths)
 
 
 def critical_hits(paths: list[str], qa: QAReply | None) -> list[str]:
@@ -90,6 +101,16 @@ class LeadDecision:
 
 
 def _qa_findings(qa: QAReply) -> list[Finding]:
+    if not qa.failures:
+        return [
+            Finding(
+                id="qa-1",
+                severity="major",
+                kind="bug",
+                title="QA failed without details",
+                detail="QA reported a failure but listed no failing cases.",
+            )
+        ]
     return [
         Finding(
             id=f"qa-{number}",
@@ -222,7 +243,7 @@ def _review_section(review: ReviewReply | None) -> str:
     lines = [f"Blind review: {review.summary}"]
     if review.findings:
         lines.append("Findings (classify each by its id):")
-        lines.extend(_finding_line(finding) for finding in review.findings)
+        lines.extend(finding_line(finding) for finding in review.findings)
     return "\n".join(lines)
 
 
@@ -320,7 +341,7 @@ async def run_lead(
     changed_lines: int,
     fast_lane: bool,
 ) -> LeadDecision:
-    paths = sorted({*_DIFF_PATH.findall(diff_text), *engineer.files_touched})
+    paths = sorted({*diff_paths(diff_text), *engineer.files_touched})
     critical = critical_hits(paths, checks.qa)
     new = await new_hits(gate, paths, engineer.new_dependencies)
 
@@ -355,7 +376,12 @@ async def run_lead(
             max_turns=cfg.loop.agent_max_turns,
             timeout_s=cfg.loop.agent_timeout_s,
         )
-        reply = await asker.ask(call, LeadReply)
+        try:
+            reply = await asker.ask(call, LeadReply)
+        except (ReplyInvalid, AgentStuck):
+            if not (critical or new):
+                raise
+            reply = None
         decision = decide(
             reply,
             checks.review,
@@ -365,6 +391,8 @@ async def run_lead(
             new,
             cfg.thresholds.lead_min_confidence,
         )
+        if reply is None:
+            decision = replace(decision, reason="lead unavailable")
         _file_follow_ups(store, task, decision.follow_ups)
 
     body = asdict(decision)
