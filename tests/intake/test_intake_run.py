@@ -4,7 +4,7 @@ from datetime import UTC, datetime, timedelta
 import pytest
 
 import agentco.intake.run as run_module
-from agentco.github.client import FakeGitHub
+from agentco.github.client import FakeGitHub, _validate_ref
 from agentco.github.errors import GitHubError
 from agentco.github.models import GhCheckRun, GhPull, GhReviewComment, GhUser
 from agentco.intake.run import IntakeReport, run_intake
@@ -328,15 +328,29 @@ async def test_one_bad_pull_ref_does_not_abort_the_run(store, loop_cfg):
     class Picky(FakeGitHub):
         def get_pull(self, repo, number):
             if number == 7:
-                raise ValueError("invalid pull request reference '7'")
+                _validate_ref("not a sha")
             return super().get_pull(repo, number)
 
     gh = Picky([], [pull_of(7), pull_of(9)], list(env.gh._comments), {})
     rep = await env.run(gh=gh)
-    assert rep.errors == [f"#{env.tid} PR #7: invalid pull request reference '7'"]
+    assert rep.errors == [
+        f"#{env.tid} PR #7: commit ref must be a plain sha, got 'not a sha'"
+    ]
     assert not rep.github_failed
     assert rep.reentered == [good]
     assert store.get_meta(f"intake:acme:{REPO}:cursor") is None
+
+
+async def test_a_programming_error_is_not_swallowed_as_a_pull_error(store, loop_cfg):
+    env = Env(store, loop_cfg)
+
+    class Broken(FakeGitHub):
+        def get_pull(self, repo, number):
+            raise ValueError("a bug, not a bad ref")
+
+    gh = Broken([], [pull_of(7)], [], {})
+    with pytest.raises(ValueError, match="^a bug, not a bad ref$"):
+        await env.run(gh=gh)
 
 
 async def test_agent_failure_is_reported_and_retried(store, loop_cfg):
@@ -579,6 +593,33 @@ async def test_edge_case_creates_followup_once(store, loop_cfg):
     assert [f["id"] for f in lead["follow_ups"]] == ["c2"]
 
 
+async def test_followup_is_created_once_when_the_marker_write_crashes(
+    store, loop_cfg, monkeypatch
+):
+    reply = lead_json(("c1", "real_bug"), ("c2", "edge_case"))
+    env = with_lead(store, loop_cfg, reply, reply)
+    env.gh.add_comment(C(1, "alice", "MEMBER", "crash on empty list"))
+    env.gh.add_comment(C(2, "alice", "MEMBER", "also check None", path="b.py"))
+    real = store.set_meta
+    crashed = []
+
+    def flaky(key, value):
+        if ":followup:" in key and not crashed:
+            crashed.append(key)
+            raise RuntimeError("simulated crash")
+        real(key, value)
+
+    monkeypatch.setattr(store, "set_meta", flaky)
+    with pytest.raises(RuntimeError, match="simulated crash"):
+        await env.run()
+    rep = await env.run()
+    assert rep.ok
+    children = [t for t in store.list_tasks("acme") if t.parent_id == env.tid]
+    assert [(t.title, t.source) for t in children] == [("also check None", "followup")]
+    marker = f"intake:acme:review:{env.kinds(ArtifactKind.PR_REVIEW)[0].id}:followup:c2"
+    assert store.get_meta(marker) == str(children[0].id)
+
+
 async def test_tradeoff_is_a_human_decision_and_stays_unapproved(store, loop_cfg):
     env = with_lead(
         store, loop_cfg, lead_json(("c1", "tradeoff"), question="Keep the cache?")
@@ -606,6 +647,36 @@ async def test_carried_tradeoff_comes_back_after_the_real_bug(store, loop_cfg):
     rep = await env.run(now=T2)
     assert rep.escalated == [(env.tid, "tradeoff")]
     assert env.kinds(ArtifactKind.PR_REVIEW)[-1].body["consumed"] == ["c2"]
+
+
+@pytest.mark.parametrize(
+    "extra", [{"conflicts": ["a vs b"]}, {"new_pattern": "use asyncio"}]
+)
+async def test_approved_escalation_over_only_tradeoffs_is_not_asked_again(
+    store, loop_cfg, extra
+):
+    env = with_lead(
+        store,
+        loop_cfg,
+        lead_json(("c1", "tradeoff"), ("c2", "tradeoff"), question="Which?", **extra),
+        lead_json(("c1", "tradeoff"), ("c2", "tradeoff"), question="Again?", **extra),
+    )
+    env.gh.add_comment(C(1, "alice", "MEMBER", "cache it"))
+    env.gh.add_comment(C(2, "bob", "MEMBER", "do not cache it", path="b.py"))
+    rep = await env.run()
+    assert rep.escalated == [(env.tid, "new")]
+    review = env.kinds(ArtifactKind.PR_REVIEW)[-1].body
+    assert review["consumed"] == ["c1", "c2"] and review["decision"]["carried"] == []
+    store.put_artifact(
+        env.tid, ArtifactKind.HUMAN_DECISION, Role.HUMAN, {"decision": "approve"}
+    )
+    store.transition(env.tid, S.PR_OPEN, Role.HUMAN, "human approved: nothing to fix")
+    rep = await env.run(now=T2)
+    assert rep.ok and rep.escalated == [] and rep.reentered == []
+    assert len(env.lead_calls()) == 1
+    assert len(env.kinds(ArtifactKind.ESCALATION)) == 1
+    assert len(env.kinds(ArtifactKind.PR_REVIEW)) == 1
+    assert env.task().state is S.PR_OPEN
 
 
 async def test_human_merge_while_awaiting_is_found_by_intake(store, loop_cfg):

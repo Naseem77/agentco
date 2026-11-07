@@ -1561,7 +1561,7 @@ def test_intake_twice_is_idempotent(env, monkeypatch):
 def test_intake_rejects_a_bad_repo_exit_1(env):
     result = env("intake", "--repo", "not a repo")
     assert result.exit_code == 1
-    assert "repo" in result.stdout
+    assert result.stdout == "repo must look like owner/name, got 'not a repo'\n"
 
 
 def test_intake_github_failure_exit_3(env, monkeypatch):

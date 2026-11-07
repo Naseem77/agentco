@@ -16,7 +16,7 @@ from agentco.agents.lead import LeadDecision
 from agentco.agents.replies import Finding
 from agentco.config import TenantConfig
 from agentco.github.client import GitHub
-from agentco.github.errors import GitHubError
+from agentco.github.errors import GitHubError, InvalidRef
 from agentco.github.models import GhPull, GhReviewComment
 from agentco.intake.classify import PRRoundDecision, classify_round
 from agentco.intake.findings import (
@@ -330,7 +330,18 @@ class _Intake:
         for raw in decision["follow_ups"]:
             marker = f"intake:{task.tenant}:review:{review.id}:followup:{raw['id']}"
             if self.store.get_meta(marker) is None:
-                created = self.store.create_task(
+                # A crash between create and marker must not create the task twice.
+                existing = next(
+                    (
+                        t
+                        for t in self.store.list_tasks(task.tenant)
+                        if t.parent_id == task.id
+                        and t.source == "followup"
+                        and t.title == raw["title"]
+                    ),
+                    None,
+                )
+                created = existing or self.store.create_task(
                     task.tenant,
                     raw["title"],
                     "followup",
@@ -436,7 +447,7 @@ async def run_intake(
             report.errors.append(
                 f"#{tp.task.id} changed concurrently, retried next run"
             )
-        except ValueError as exc:
+        except InvalidRef as exc:
             report.errors.append(f"#{tp.task.id} PR #{tp.number}: {exc}")
     if report.ok:
         store.set_meta(key, now.isoformat())

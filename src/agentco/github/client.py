@@ -7,7 +7,7 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import Protocol
 
-from agentco.github.errors import GitHubError
+from agentco.github.errors import GitHubError, InvalidRef
 from agentco.github.models import (
     GhCheckRun,
     GhIssue,
@@ -120,7 +120,7 @@ def _flatten_key(output: str, key: str) -> list[dict]:
 
 def _validate_ref(ref: str) -> str:
     if not _REF_RE.match(ref) or ref in (".", ".."):
-        raise ValueError(f"commit ref must be a plain sha, got {ref!r}")
+        raise InvalidRef(f"commit ref must be a plain sha, got {ref!r}")
     return ref
 
 

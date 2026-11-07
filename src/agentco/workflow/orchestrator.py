@@ -203,6 +203,9 @@ class _Run:
                 if not await self._resume(task):
                     return task
                 continue
+            if task.state is _S.PR_OPEN and self._answer_interrupted():
+                await self._start_answer_round()
+                continue
             handler = handlers.get(task.state)
             if task.state in _DONE or handler is None:
                 return task
@@ -409,9 +412,12 @@ class _Run:
     def _brief(self, task: TaskRecord) -> EngineerBrief:
         """Built from lead, QA/review (via the lead), pre-flight and human input only."""
         findings: list[Finding] = []
+        untrusted: frozenset[str] = frozenset()
         lead = self._latest(ArtifactKind.LEAD)
         if lead and lead.body.get("outcome") == "send_back":
             findings = list(_lead_from(lead.body).findings_to_fix)
+            if lead.body.get("source") == "pr":
+                untrusted = frozenset(f.id for f in findings)
         human_note = ""
         human = self._human_input()
         if human:
@@ -442,6 +448,7 @@ class _Run:
             require_invariant=bool(triage and triage.body.get("require_invariant")),
             round=task.round,
             human_note=human_note,
+            untrusted_finding_ids=untrusted,
         )
 
     async def _engineering(self, task: TaskRecord) -> None:
@@ -855,5 +862,21 @@ class _Run:
             )
         if self.task().state is _S.AWAITING_HUMAN:
             self._go(_S.PR_OPEN, Role.HUMAN, "human answered: back to work")
+        await self._start_answer_round()
+
+    def _answer_interrupted(self) -> bool:
+        """A human's send-back stored and the PR reopened, but the round not begun.
+
+        Any later PR or escalation artifact means that round already ran.
+        """
+        lead = self._latest(ArtifactKind.LEAD)
+        return (
+            lead is not None
+            and lead.body.get("source") == "human"
+            and lead.id > _id(self._latest(ArtifactKind.PR))
+            and lead.id > _id(self._latest(ArtifactKind.ESCALATION))
+        )
+
+    async def _start_answer_round(self) -> None:
         self._go(_S.TRIAGE, Role.HUMAN, "human guidance on the PR")
         await self._stop_rules()

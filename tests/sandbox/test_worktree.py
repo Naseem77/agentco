@@ -401,6 +401,39 @@ def test_push_branch_replaces_a_remote_branch_without_a_tracking_ref(
     assert _remote_sha(root, tmp_path, "agentco/task-5") == head_sha(wt)
 
 
+def test_push_branch_refuses_to_overwrite_a_commit_pushed_after_our_last_fetch(
+    make_repo, tmp_path
+):
+    root = make_repo({"a.py": "x = 1\n"})
+    wt = create_worktree(root, 5, "main")
+    (wt.path / "b.py").write_text("y = 1\n")
+    commit_all(wt, "task")
+    push_branch(wt)
+    reviewer = tmp_path / "reviewer"
+    git(tmp_path, "clone", str(tmp_path / "repo.git"), str(reviewer))
+    git(reviewer, "checkout", "agentco/task-5")
+    (reviewer / "c.py").write_text("z = 1\n")
+    git(reviewer, "add", "-A")
+    git(
+        reviewer,
+        "-c",
+        "user.name=r",
+        "-c",
+        "user.email=r@example.com",
+        "commit",
+        "-m",
+        "suggestion",
+    )
+    git(reviewer, "push", "origin", "agentco/task-5")
+    theirs = git(reviewer, "rev-parse", "HEAD").strip()
+    git(wt.path, "commit", "--amend", "-m", "reworded", "--allow-empty")
+
+    with pytest.raises(GitError):
+        push_branch(wt)
+
+    assert _remote_sha(root, tmp_path, "agentco/task-5") == theirs
+
+
 def test_push_branch_never_forces_a_branch_that_is_not_a_task_branch(
     make_repo, tmp_path
 ):
