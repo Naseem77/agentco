@@ -274,3 +274,104 @@ def test_command_full_or_no_template_runs_whole_suite():
 )
 def test_is_test_path(path, ok):
     assert is_test_path(path) is ok
+
+
+SUB_FILES = {
+    **FILES,
+    "src/calc.py": FILES["src/calc.py"] + "\ndef sub(a, b):\n    return a - b\n",
+    "tests/test_sub.py": "from src.calc import sub\n\ndef test_sub():\n    assert sub(3, 1) == 2\n",
+}
+
+
+async def test_deleted_last_function_is_full(make_repo):
+    root = make_repo(SUB_FILES)
+    wt = create_worktree(root, 1, "main")
+    edit(wt.path / "src/calc.py", "\ndef sub(a, b):\n    return a - b\n", "")
+    commit_all(wt, "x")
+    got = await affected_tests("acme/app", wt, "main")
+    assert (got.paths, got.full) == ((), True)
+
+
+async def test_deleted_function_between_others_is_full(make_repo):
+    root = make_repo(SUB_FILES)
+    wt = create_worktree(root, 1, "main")
+    edit(wt.path / "src/calc.py", "def mul(a, b):\n    return a * b\n\n", "")
+    commit_all(wt, "x")
+    got = await affected_tests("acme/app", wt, "main")
+    assert (got.paths, got.full) == ((), True)
+
+
+async def test_renamed_function_reached_by_another_test_is_full(make_repo):
+    files = {
+        **FILES,
+        "tests/test_other.py": "from src.calc import multiply\n\ndef test_other():\n    assert multiply(1, 1) == 1\n",
+    }
+    root = make_repo(files)
+    wt = create_worktree(root, 1, "main")
+    edit(wt.path / "src/calc.py", "def mul(", "def multiply(")
+    commit_all(wt, "x")
+    got = await affected_tests("acme/app", wt, "main")
+    assert (got.paths, got.full) == ((), True)
+
+
+async def test_removed_test_function_is_not_a_removal(make_repo):
+    files = {
+        **FILES,
+        "tests/test_mul.py": FILES["tests/test_mul.py"]
+        + "\ndef test_mul_again():\n    assert mul(1, 1) == 1\n",
+    }
+    root = make_repo(files)
+    wt = create_worktree(root, 1, "main")
+    edit(
+        wt.path / "tests/test_mul.py",
+        "\ndef test_mul_again():\n    assert mul(1, 1) == 1\n",
+        "",
+    )
+    commit_all(wt, "x")
+    got = await affected_tests("acme/app", wt, "main")
+    assert (got.paths, got.full) == (("tests/test_mul.py",), False)
+
+
+async def test_module_level_change_in_test_file_is_full(make_repo):
+    files = {
+        **FILES,
+        "tests/test_add.py": "LIMIT = 1\n\ndef test_add():\n    assert LIMIT == 1\n",
+        "tests/test_mul.py": "from tests.test_add import LIMIT\n\ndef test_mul():\n    assert LIMIT == 1\n",
+    }
+    root = make_repo(files)
+    wt = create_worktree(root, 1, "main")
+    edit(wt.path / "tests/test_add.py", "LIMIT = 1\n", "LIMIT = 2\n")
+    commit_all(wt, "x")
+    got = await affected_tests("acme/app", wt, "main")
+    assert (got.paths, got.full) == ((), True)
+
+
+async def test_index_failure_falls_back_to_full(make_repo, monkeypatch):
+    async def boom(*args, **kwargs):
+        raise RuntimeError("unreadable")
+
+    monkeypatch.setattr("agentco.sandbox.affected.index_repo", boom)
+    root = make_repo(FILES)
+    wt = create_worktree(root, 1, "main")
+    edit(wt.path / "src/calc.py", "return a * b", "return b * a")
+    commit_all(wt, "x")
+    got = await affected_tests("acme/app", wt, "main")
+    assert got == AffectedTests(
+        paths=(),
+        full=True,
+        reason="code graph unavailable: RuntimeError: unreadable",
+    )
+
+
+def test_command_keeps_other_braces_in_template():
+    got = AffectedTests(paths=("tests/a.py",), full=False, reason="r")
+    assert test_command(contract("awk '{print}' {files} {x}"), got) == (
+        "awk '{print}' tests/a.py {x}"
+    )
+
+
+def test_command_root_level_dash_path_is_not_an_option():
+    got = AffectedTests(paths=("-x_test.py", "tests/b.py"), full=False, reason="r")
+    assert test_command(contract("pytest {files}"), got) == (
+        "pytest ./-x_test.py tests/b.py"
+    )

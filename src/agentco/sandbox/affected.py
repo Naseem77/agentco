@@ -15,10 +15,10 @@ from posixpath import basename
 
 from agentco.code.graph import InMemoryCodeGraph, code_graph_for
 from agentco.code.indexer import index_repo
-from agentco.code.parse import Symbol
+from agentco.code.parse import Symbol, parse_source
 from agentco.repo_contract import RepoContract
 from agentco.roles import Role
-from agentco.sandbox.worktree import _DIFF, Worktree, _git, changed_files
+from agentco.sandbox.worktree import _DIFF, Worktree, _git, _run, changed_files
 
 _TEST_DIRS = frozenset({"tests", "test", "__tests__"})
 _TEST_NAME = re.compile(
@@ -100,6 +100,23 @@ def _inside_functions(spans: list[tuple[int, int]], hunk: tuple[int, int]) -> bo
     return any(start <= hunk[0] and hunk[1] <= end for start, end in spans)
 
 
+def _removed_symbols(
+    wt: Worktree, merge_base: str, path: str, head: list[Symbol]
+) -> list[str]:
+    """Base-side symbols of `path` that no longer exist in HEAD (deleted or renamed)."""
+    proc = _run(wt.path, "show", f"{merge_base}:{path}")
+    if proc.returncode != 0:
+        return []  # added in this branch: nothing was removed
+    structure = parse_source(path, proc.stdout)
+    if structure is None:
+        return []
+    kept = {s.qualname for s in head}
+    gone = [s for s in structure.symbols if s.qualname not in kept]
+    if is_test_path(path):  # dropping a test needs no rerun; dropping a helper does
+        gone = [s for s in gone if not s.name.lower().startswith("test")]
+    return [s.qualname for s in gone]
+
+
 def _overlaps(symbol: Symbol, hunk: tuple[int, int]) -> bool:
     return symbol.start_line <= hunk[1] and hunk[0] <= symbol.end_line
 
@@ -117,10 +134,16 @@ async def affected_tests(
         return _full(f"no changes against {base}")
     ranges = await asyncio.to_thread(changed_line_ranges, wt, base)
 
-    code = code_graph_for(_OVERLAY_TENANT, Role.LIBRARIAN, InMemoryCodeGraph())
-    await index_repo(repo, wt.path, code)
-    symbols = await code.all_symbols(repo)
-    edges = await code.call_edges(repo)
+    try:
+        merge_base = (
+            await asyncio.to_thread(_git, wt.path, "merge-base", base, "HEAD")
+        ).strip()
+        code = code_graph_for(_OVERLAY_TENANT, Role.LIBRARIAN, InMemoryCodeGraph())
+        await index_repo(repo, wt.path, code)
+        symbols = await code.all_symbols(repo)
+        edges = await code.call_edges(repo)
+    except Exception as e:  # noqa: BLE001 - any failure must degrade to the full suite
+        return _full(f"code graph unavailable: {type(e).__name__}: {e}")
 
     name_count: dict[str, int] = defaultdict(int)
     for syms in symbols.values():
@@ -142,10 +165,15 @@ async def affected_tests(
             return _full(f"{path} changed without a line range")
         file_ranges = ranges.get(path, [])
         spans = _function_spans(symbols.get(path, []))
-        if not is_test_path(path):
-            for hunk in file_ranges:
-                if not _inside_functions(spans, hunk):
-                    return _full(f"{path}:{hunk[0]} changes code outside any function")
+        for hunk in file_ranges:
+            if not _inside_functions(spans, hunk):
+                return _full(f"{path}:{hunk[0]} changes code outside any function")
+        if (wt.path / path).is_file():
+            removed = await asyncio.to_thread(
+                _removed_symbols, wt, merge_base, path, symbols.get(path, [])
+            )
+            if removed:
+                return _full(f"{path} removes or renames {removed[0]}")
         for symbol in symbols.get(path, []):
             if symbol.kind != "Function" or not any(
                 _overlaps(symbol, h) for h in file_ranges
@@ -180,8 +208,10 @@ async def affected_tests(
 def test_command(contract: RepoContract, affected: AffectedTests) -> str:
     if affected.full or contract.test_files is None:
         return contract.test
-    files = " ".join(shlex.quote(p) for p in affected.paths)
-    return contract.test_files.format(files=files)
+    # a leading "-" would read as an option
+    paths = (f"./{p}" if p.startswith("-") else p for p in affected.paths)
+    files = " ".join(shlex.quote(p) for p in paths)
+    return contract.test_files.replace("{files}", files)
 
 
 test_command.__test__ = False  # type: ignore[attr-defined]  # not a pytest test when imported
