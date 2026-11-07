@@ -7,6 +7,7 @@ name = "agentco"
 version = "0.1.0"
 source = { editable = "." }
 dependencies = [
+    { name = "github-copilot-sdk" },
     { name = "graphiti-core", extra = ["falkordb"] },
     { name = "httpx" },
     { name = "pydantic" },
@@ -28,6 +29,7 @@ dev = [
 
 [package.metadata]
 requires-dist = [
+    { name = "github-copilot-sdk", specifier = ">=1.0.29" },
     { name = "graphiti-core", extras = ["falkordb"], specifier = ">=0.30,<0.31" },
     { name = "httpx", specifier = ">=0.27" },
     { name = "pydantic", specifier = ">=2" },
@@ -256,6 +258,19 @@ dependencies = [
 sdist = { url = "https://files.pythonhosted.org/packages/82/e5/18675f4538d33fdaf18279d89cdc663c02ac3987ef200dbc30b825308ae6/falkordb-1.8.1.tar.gz", hash = "sha256:2ab3fd5e3880a3a2708efbcc536a9175f24a59bff328758a3819dca8994526be", size = 134804, upload-time = "2026-10-25T07:36:42.92Z" }
 wheels = [
     { url = "https://files.pythonhosted.org/packages/9d/f1/306e8e8e9901553cb924162ada7dbf1740ebdc221c575fc8c1856f1d277e/falkordb-1.8.1-py3-none-any.whl", hash = "sha256:ad9116f073de822bd1dd98f0dea41eadf93b75ef5f412e34abb60548211c30af", size = 40598, upload-time = "2026-10-25T07:36:42.005Z" },
+]
+
+[[package]]
+name = "github-copilot-sdk"
+version = "1.0.29"
+source = { registry = "https://pypi.org/simple" }
+dependencies = [
+    { name = "httpx" },
+    { name = "pydantic" },
+    { name = "python-dateutil" },
+]
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/a4/f7/bf23175a479735546e81add65aecd4b6bcb5f2831fe550f78579fe7a5806/github_copilot_sdk-1.0.29-py3-none-any.whl", hash = "sha256:8b67b71c4feb2e7d95ea119ee0cfd96e096f6a24ebd32f743e8abe8637321700", size = 1007957, upload-time = "2026-11-06T20:46:49.821Z" },
 ]
 
 [[package]]
