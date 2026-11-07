@@ -18,6 +18,7 @@ from agentco.workflow.states import TaskState
 
 MAX_BODY = 2000
 _TITLE_MAX = 80
+_TITLE_FALLBACK = "PR feedback"
 _CODE_FENCE_RE = re.compile(r"```.*?```", re.DOTALL)
 _URL_RE = re.compile(r"https?://\S+")
 _DIGITS_RE = re.compile(r"\d+")
@@ -35,6 +36,13 @@ def normalize_text(body: str) -> str:
         # Fence-, URL- or digit-only: the text that was stripped is all there is.
         normalized = _SPACE_RE.sub(" ", body).strip()
     return normalized
+
+
+def clean_title(body: str) -> str:
+    """One plain line of untrusted PR text: no code fences or backticks, capped."""
+    text = re.sub(r"```.*?(?:```|\Z)", " ", body, flags=re.DOTALL).replace("`", "")
+    line = next((ln for ln in text.splitlines() if ln.strip()), "")
+    return _SPACE_RE.sub(" ", line).strip()[:_TITLE_MAX] or _TITLE_FALLBACK
 
 
 def fingerprint(path: str | None, body: str) -> str:
@@ -70,14 +78,13 @@ class PRFinding(BaseModel):
 
     def as_finding(self) -> Finding:
         major = self.source == "check" or self.review_state == "CHANGES_REQUESTED"
-        first_line = next(iter(self.body.strip().splitlines()), "")
         return Finding(
             id=self.id,
             severity="major" if major else "minor",
             kind="bug",
             path=self.path or "",
             line=self.line,
-            title=first_line[:_TITLE_MAX],
+            title=clean_title(self.body),
             detail=self.body,
         )
 
@@ -107,7 +114,7 @@ def tracked_pulls(store: TaskStore, tenant: str, repo: str) -> list[TrackedPull]
 
 def counts(f: PRFinding, team_bots: Collection[str]) -> bool:
     """Only team humans and allow-listed review bots can raise a finding."""
-    if f.author in team_bots:
+    if f.author in team_bots and f.is_bot:
         return True
     return f.association in TEAM_ASSOCIATIONS and not f.is_bot
 
@@ -143,8 +150,12 @@ def collect_findings(
     head_sha: str,
     *,
     store: TaskStore,
+    with_checks: bool = True,
 ) -> list[PRFinding]:
-    """New findings on one PR. Markers are set by the caller once they are stored."""
+    """New findings on one PR. Markers are set by the caller once they are stored.
+
+    Checks are only the current head's: with `with_checks` off (a round is rewriting the
+    branch) none are read, and a run of any other commit is dropped."""
     found = [
         _comment_finding(c) for c in comments_by_pr.get(tp.number, []) if c.body.strip()
     ]
@@ -172,9 +183,10 @@ def collect_findings(
             )
         )
     found = [f for f in found if counts(f, cfg.review_bots)]
-    for check in gh.check_runs(repo, head_sha):
+    for check in gh.check_runs(repo, head_sha) if with_checks else ():
         if (
-            check.status != "completed"
+            check.head_sha != head_sha
+            or check.status != "completed"
             or check.conclusion not in cfg.failing_conclusions
         ):
             continue

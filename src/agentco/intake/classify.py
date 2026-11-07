@@ -59,10 +59,14 @@ class PRRoundDecision:
     options: tuple[str, ...]
     carried: tuple[str, ...] = ()
     """Ids of findings NOT handled this round: tradeoffs that were not put to a human
-    because a real bug, a conflict or a new pattern took the round, and pending findings
+    because a real bug, a conflict or a new pattern took the round, real bugs (and failing
+    checks) that a conflict or new pattern escalation pushed aside, and pending findings
     beyond MAX_PROMPT_FINDINGS. They are in no `classifications` entry, so the consumer
     must store them in no PR_REVIEW artifact and set no marker for them. They then come
     back as pending findings next round, once the task is back in PR_OPEN."""
+    carried_bugs: tuple[str, ...] = ()
+    """The real bugs among `carried`. Once a human has answered the escalation that carried
+    them they are fixed without asking the lead (and so without a second conflict)."""
 
 
 def prior_categories(store: TaskStore, task_id: int) -> dict[str, str]:
@@ -79,7 +83,20 @@ def prior_categories(store: TaskStore, task_id: int) -> dict[str, str]:
     return seen
 
 
-def preclassify(findings: list[PRFinding], prior: dict[str, str]) -> Preclassified:
+def settled_bugs(store: TaskStore, task_id: int) -> set[str]:
+    """Real bugs carried past an escalation that a human has since answered."""
+    answered = [a.id for a in store.artifacts(task_id, ArtifactKind.HUMAN_DECISION)]
+    settled: set[str] = set()
+    for review in store.artifacts(task_id, ArtifactKind.PR_REVIEW):
+        carried = review.body.get("decision", {}).get("carried_bugs", [])
+        if carried and any(i > review.id for i in answered):
+            settled.update(carried)
+    return settled
+
+
+def preclassify(
+    findings: list[PRFinding], prior: dict[str, str], settled: set[str] = frozenset()
+) -> Preclassified:
     decided: list[Classified] = []
     known: list[str] = []
     pending: list[PRFinding] = []
@@ -91,6 +108,14 @@ def preclassify(findings: list[PRFinding], prior: dict[str, str]) -> Preclassifi
         if f.source == "check":
             decided.append(
                 Classified(finding_id=f.id, category="real_bug", note="CI check failed")
+            )
+        elif f.id in settled:
+            decided.append(
+                Classified(
+                    finding_id=f.id,
+                    category="real_bug",
+                    note="a real bug held back by an escalation a human has answered",
+                )
             )
         elif before == "real_bug":
             decided.append(
@@ -139,8 +164,17 @@ def decide_pr_round(
         escalating
         or any(categories.get(f.id, "real_bug") == "real_bug" for f in all_open)
     )
+    # A real bug is never consumed by a conflict or new-pattern escalation: it is fixed once
+    # the human has answered, not silently dropped with the round.
+    carried_bug_ids = tuple(
+        f.id
+        for f in all_open
+        if escalating and categories.get(f.id, "real_bug") == "real_bug"
+    )
     carried_ids = tuple(
-        f.id for f in all_open if deferred and categories.get(f.id) == "tradeoff"
+        f.id
+        for f in all_open
+        if f.id in carried_bug_ids or (deferred and categories.get(f.id) == "tradeoff")
     )
     open_findings = [f for f in all_open if f.id not in carried_ids]
     # A pending finding the lead did not classify counts as a real bug.
@@ -182,6 +216,7 @@ def decide_pr_round(
             question=question,
             options=options,
             carried=carried_ids,
+            carried_bugs=carried_bug_ids,
         )
 
     # Checked before "nothing open": a conflict among carried tradeoffs still needs a human.
@@ -194,11 +229,17 @@ def decide_pr_round(
             reason = "reviewers conflict: " + "; ".join(reply.conflicts)
         else:
             reason = f"feedback asks for something new: {reply.new_pattern}"
+        question = reply.question or reason
+        if carried_bug_ids:
+            titles = "; ".join(
+                f.as_finding().title for f in all_open if f.id in carried_bug_ids
+            )
+            question += f"\n\nThese real bugs are fixed once you decide: {titles}"
         return outcome(
             "escalate",
             "new",
             reason,
-            question=reply.question or reason,
+            question=question,
             options=tuple(reply.options),
         )
 
@@ -280,7 +321,9 @@ async def classify_round(
     task: TaskRecord,
     findings: list[PRFinding],
 ) -> PRRoundDecision:
-    pre = preclassify(findings, prior_categories(store, task.id))
+    pre = preclassify(
+        findings, prior_categories(store, task.id), settled_bugs(store, task.id)
+    )
     reply: PRLeadReply | None = None
     overflow = pre.pending[MAX_PROMPT_FINDINGS:]
     if overflow:

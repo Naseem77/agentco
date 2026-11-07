@@ -8,7 +8,7 @@ has been applied. Intake never comments on, approves or merges a PR.
 
 import asyncio
 from dataclasses import dataclass, field
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 
 from pydantic import TypeAdapter
 
@@ -38,6 +38,9 @@ from agentco.workflow.stop_rules import StopDecision, apply_stop_rules
 _S = TaskState
 _ROUND_OPTIONS = ("answer: one more round", "reject")
 _BUDGET_OPTIONS = ("add budget", "reject")
+CURSOR_OVERLAP = timedelta(
+    minutes=5
+)  # our clock vs GitHub's; markers dedupe the re-read
 _DECISION = TypeAdapter(PRRoundDecision)
 _LEAD = TypeAdapter(LeadDecision)
 
@@ -230,7 +233,7 @@ class _Intake:
         if review is not None:
             await self._apply(task, review)
             task = self.store.get(task.id)
-        pending = self._pending(task.id)
+        pending = self._pending(task.id, pull.head_sha)
         if not pending:
             return
         if task.state is not _S.PR_OPEN:
@@ -262,6 +265,7 @@ class _Intake:
             self.cfg.intake,
             pull.head_sha,
             store=self.store,
+            with_checks=task.state is _S.PR_OPEN,
         )
         stored = {
             f["id"]: artifact.id
@@ -289,7 +293,8 @@ class _Intake:
             return None
         return review
 
-    def _pending(self, task_id: int) -> list[PRFinding]:
+    def _pending(self, task_id: int, head_sha: str) -> list[PRFinding]:
+        """Unconsumed findings; a check of a commit that is no longer the head is stale."""
         consumed = {
             i
             for review in self.store.artifacts(task_id, ArtifactKind.PR_REVIEW)
@@ -299,7 +304,10 @@ class _Intake:
         for artifact in self.store.artifacts(task_id, ArtifactKind.PR_FEEDBACK):
             for raw in artifact.body["findings"]:
                 finding = PRFinding.model_validate(raw)
-                if finding.id not in consumed:
+                stale = finding.source == "check" and (
+                    artifact.body.get("head_sha") != head_sha
+                )
+                if finding.id not in consumed and not stale:
                     pending.setdefault(finding.id, finding)
         return list(pending.values())
 
@@ -423,7 +431,8 @@ async def run_intake(
     if not tracked:
         store.set_meta(key, now.isoformat())
         return report
-    since = _read_cursor(store, key) or min(tp.opened_at for tp in tracked)
+    cursor = _read_cursor(store, key)
+    since = cursor - CURSOR_OVERLAP if cursor else min(tp.opened_at for tp in tracked)
     intake = _Intake(cfg, store, gh, runtime, gate, repo, report, since)
     try:
         comments = await asyncio.to_thread(gh.review_comments, repo, since)
