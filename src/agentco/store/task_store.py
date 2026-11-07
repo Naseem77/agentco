@@ -1,10 +1,12 @@
 import json
 import math
 from collections.abc import Collection
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
-from sqlalchemy import create_engine, select, update
+from sqlalchemy import create_engine, delete, select, update
 from sqlalchemy.engine import make_url
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session, sessionmaker
 
 from agentco.roles import Role
@@ -15,6 +17,7 @@ from agentco.store.models import (
     AuditEntry,
     AuditRow,
     Base,
+    LeaseRow,
     MetaRow,
     TaskRecord,
     TaskRow,
@@ -317,3 +320,31 @@ class TaskStore:
     def set_meta(self, key: str, value: str) -> None:
         with self._sessions.begin() as session:
             session.merge(MetaRow(key=key, value=value))
+
+    def try_lease(
+        self, key: str, owner: str, ttl_s: float, now: datetime | None = None
+    ) -> bool:
+        """Take the lease `key` unless someone else holds an unexpired one."""
+        now = now or datetime.now(UTC)
+        try:
+            with self._sessions.begin() as session:
+                session.execute(
+                    delete(LeaseRow).where(
+                        LeaseRow.key == key,
+                        (LeaseRow.expires_at <= now) | (LeaseRow.owner == owner),
+                    )
+                )
+                session.add(
+                    LeaseRow(
+                        key=key, owner=owner, expires_at=now + timedelta(seconds=ttl_s)
+                    )
+                )
+            return True
+        except IntegrityError:
+            return False
+
+    def release_lease(self, key: str, owner: str) -> None:
+        with self._sessions.begin() as session:
+            session.execute(
+                delete(LeaseRow).where(LeaseRow.key == key, LeaseRow.owner == owner)
+            )

@@ -1585,6 +1585,18 @@ def test_intake_rejects_a_bad_repo_exit_1(env):
     assert result.stdout == "repo must look like owner/name, got 'not a repo'\n"
 
 
+def test_intake_busy_exit_0(env, monkeypatch):
+    gh = _intake_gh(env, monkeypatch)
+    _pr_task(env, gh)
+    assert env.store.try_lease("intake:acme:acme/app", "other", 60)
+
+    result = _intake(env)
+
+    assert result.exit_code == 0, result.stdout
+    assert result.stdout == "another intake for acme/app is running; skipped\n"
+    assert gh.calls == []
+
+
 def test_intake_github_failure_exit_3(env, monkeypatch):
     gh = _intake_gh(env, monkeypatch, fail_reads=True)
     task_id = _pr_task(env, gh)

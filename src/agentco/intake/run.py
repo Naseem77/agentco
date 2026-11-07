@@ -7,8 +7,11 @@ has been applied. Intake never comments on, approves or merges a PR.
 """
 
 import asyncio
+import os
+import socket
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
+from uuid import uuid4
 
 from pydantic import TypeAdapter
 
@@ -41,6 +44,7 @@ _BUDGET_OPTIONS = ("add budget", "reject")
 CURSOR_OVERLAP = timedelta(
     minutes=5
 )  # our clock vs GitHub's; markers dedupe the re-read
+INTAKE_LEASE_TTL_S = 3600
 _DECISION = TypeAdapter(PRRoundDecision)
 _LEAD = TypeAdapter(LeadDecision)
 
@@ -59,6 +63,7 @@ class IntakeReport:
     touched: list[int] = field(default_factory=list)
     errors: list[str] = field(default_factory=list)
     github_failed: bool = False
+    busy: bool = False
 
     @property
     def ok(self) -> bool:
@@ -423,6 +428,26 @@ async def run_intake(
     repo: str,
     *,
     now: datetime | None = None,
+) -> IntakeReport:
+    """One intake per repo at a time, across processes: a busy lease skips the run."""
+    lease = f"intake:{cfg.tenant}:{repo}"
+    owner = f"{socket.gethostname()}:{os.getpid()}:{uuid4().hex[:8]}"
+    if not store.try_lease(lease, owner, INTAKE_LEASE_TTL_S):
+        return IntakeReport(repo, busy=True)
+    try:
+        return await _run_intake(cfg, store, gh, runtime, gate, repo, now)
+    finally:
+        store.release_lease(lease, owner)
+
+
+async def _run_intake(
+    cfg: TenantConfig,
+    store: TaskStore,
+    gh: GitHub,
+    runtime: AgentRuntime,
+    gate: MemoryGate,
+    repo: str,
+    now: datetime | None,
 ) -> IntakeReport:
     now = now or datetime.now(UTC)
     report = IntakeReport(repo)

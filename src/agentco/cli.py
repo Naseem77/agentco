@@ -658,6 +658,9 @@ def intake(
         raise _fail(str(e), 3) from e
     except LLM_ERRORS as e:
         raise _fail(f"LLM request failed: {_one_line(e)}") from e
+    if report.busy:
+        typer.echo(f"another intake for {repo} is running; skipped")
+        return
     for line in _intake_lines(store, report):
         typer.echo(line)
     _echo_warnings(learned)

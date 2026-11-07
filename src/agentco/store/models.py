@@ -107,6 +107,14 @@ class MetaRow(Base):
     value: Mapped[str] = mapped_column(String)
 
 
+class LeaseRow(Base):
+    __tablename__ = "leases"
+
+    key: Mapped[str] = mapped_column(String, primary_key=True)
+    owner: Mapped[str] = mapped_column(String)
+    expires_at: Mapped[datetime] = mapped_column(UTCDateTime)
+
+
 @dataclass
 class TaskRecord:
     id: int
