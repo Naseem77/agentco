@@ -107,7 +107,7 @@ async def test_isolation_no_engineer_text_reaches_review_or_qa(
             1 if call.role is Role.QA else 0
         )
     review_call = next(c for c in runtime.calls if c.role is Role.REVIEWER)
-    assert review_call.workdir is None
+    assert review_call.workdir == wt.path and review_call.edits is False
     assert "-x = 1\n+x = 2\n" in review_call.prompt
     assert git(wt.path, "log", "-1", "--format=%s").strip() == (
         f"agentco: fix {SENTINEL}"
@@ -137,7 +137,7 @@ async def test_isolation_fast_lane_reviewer_also_blind(make_repo, store, loop_cf
 
     [call] = runtime.calls
     assert SENTINEL not in call.system + call.prompt
-    assert call.workdir is None
+    assert call.workdir == wt.path and call.edits is False
 
 
 async def test_run_checks_returns_both_results():

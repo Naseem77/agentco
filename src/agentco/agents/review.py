@@ -61,6 +61,8 @@ async def run_review(
         model=role_model(cfg, Role.REVIEWER).model,
         system=load_prompt(Role.REVIEWER, "light" if fast_lane else None),
         prompt=review_input(issue, diff_text, findings_addressed),
+        workdir=wt.path,  # read-only: no edits, no commands beyond read-only git
+        edits=False,
         tools=memory_tools(gate.for_role(Role.REVIEWER)),
         max_turns=cfg.loop.agent_max_turns,
         timeout_s=cfg.loop.agent_timeout_s,

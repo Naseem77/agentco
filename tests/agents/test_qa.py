@@ -9,20 +9,22 @@ from agentco.agents.prompts import load_prompt
 from agentco.agents.qa import (
     FAST_LANE_BUG_CLASS,
     NeighbourRow,
-    QAFailure,
     QAReply,
+    qa_command_prefixes,
     qa_input,
     run_qa,
 )
 from agentco.agents.replies import PMReply
+from agentco.llm.copilot import permission_allowed
 from agentco.llm.fake import FakeRuntime
 from agentco.llm.replies import Asker, ReplyInvalid
+from agentco.llm.runtime import AgentCall
 from agentco.memory.backend import InMemoryBackend, MemoryItem
 from agentco.memory.gate import MemoryGate
 from agentco.memory.scopes import Scope, graph_name
 from agentco.repo_contract import RepoContract, Sandbox
 from agentco.roles import Role
-from agentco.sandbox.runner import CommandResult, ContainerError
+from agentco.sandbox.runner import CommandResult
 from agentco.sandbox.worktree import commit_all, create_worktree
 
 ISSUE = PMReply(
@@ -69,15 +71,12 @@ class FakeRunner:
 
 
 class PreparingRunner(FakeRunner):
-    def __init__(self, error: ContainerError | None = None):
+    def __init__(self):
         super().__init__()
-        self.error = error
         self.prepared: list[Path] = []
 
     def prepare(self, cwd: Path) -> None:
         self.prepared.append(cwd)
-        if self.error:
-            raise self.error
 
 
 class Env:
@@ -135,16 +134,13 @@ def test_qa_input_without_neighbours_is_just_the_issue():
     )
 
 
-async def test_qa_runs_build_and_tests_in_snapshot_then_asks_llm(
-    make_repo, store, loop_cfg
-):
+async def test_qa_does_not_rerun_build_and_tests(make_repo, store, loop_cfg):
     env = Env(make_repo, store, loop_cfg, [json.dumps(PASSING)])
-    runner = FakeRunner()
+    runner = PreparingRunner()
 
     result = await env.qa(runner, contract(e2e="make e2e"))
 
-    snapshot = env.snapshot()
-    assert runner.calls == [("make build", snapshot), ("make test", snapshot)]
+    assert runner.calls == [] and runner.prepared == []
     assert result == QAReply(
         passed=True,
         bug_class="tab handling",
@@ -154,93 +150,108 @@ async def test_qa_runs_build_and_tests_in_snapshot_then_asks_llm(
     [call] = env.runtime.calls
     assert call.role is Role.QA and call.model == "m-qa"
     assert call.system.startswith(load_prompt(Role.QA))
-    assert call.prompt == qa_input(ISSUE, [])
-    assert call.workdir == snapshot and call.edits is True
+    assert call.prompt == qa_input(
+        ISSUE,
+        [],
+        commands=("make build", "make test", "make e2e"),
+        prefixes=("make test ",),
+    )
+    assert call.workdir == env.snapshot() and call.edits is True
     assert call.commands == ("make build", "make test", "make e2e")
-    assert call.command_prefixes == ()
+    assert call.command_prefixes == ("make test ",)
     assert [tool.name for tool in call.tools] == ["memory_search", "memory_add"]
     assert (call.max_turns, call.timeout_s) == (40, 1200)
 
 
-async def test_affected_tests_command_runs_in_snapshot(make_repo, store, loop_cfg):
-    env = Env(make_repo, store, loop_cfg, [json.dumps(PASSING)])
-    runner = FakeRunner()
-
-    await env.qa(runner, contract(test_files="make test FILES={files}"))
-
-    snapshot = env.snapshot()
-    assert runner.calls == [
-        ("make build", snapshot),
-        ("make test FILES=tests/test_a.py", snapshot),
-    ]
-    assert env.runtime.calls[0].command_prefixes == ("make test FILES=",)
-
-
-async def test_qa_build_failure_overrides_passed(make_repo, store, loop_cfg):
-    env = Env(make_repo, store, loop_cfg, [json.dumps(PASSING)])
-    runner = FakeRunner({"make build": 2})
-
-    result = await env.qa(runner)
-
-    assert [command for command, _ in runner.calls] == ["make build"]
-    assert result.passed is False
-    assert result.failures == [
-        QAFailure(
-            title="build failed",
-            steps="make build",
-            expected="exit code 0",
-            actual="exit code 2\nout of make build",
-        )
-    ]
-    assert len(env.runtime.calls) == 1
-
-
-async def test_qa_test_failure_overrides_passed_and_keeps_llm_failures(
+async def test_qa_prefixes_include_test_files_and_test_command(
     make_repo, store, loop_cfg
 ):
-    llm_failure = {"title": "t", "steps": "s", "expected": "e", "actual": "a"}
-    reply = {**PASSING, "failures": [llm_failure]}
+    env = Env(make_repo, store, loop_cfg, [json.dumps(PASSING)])
+
+    await env.qa(FakeRunner(), contract(test_files="make test FILES={files}"))
+
+    assert env.runtime.calls[0].command_prefixes == ("make test FILES=", "make test ")
+
+
+def test_qa_prompt_lists_commands():
+    text = qa_input(
+        ISSUE,
+        [],
+        commands=("make build", "uv run pytest -q -p no:cacheprovider"),
+        prefixes=("uv run pytest -q -p no:cacheprovider ",),
+    )
+
+    assert text.endswith(
+        "Commands you may run, exactly as written:\n"
+        "- `make build`\n"
+        "- `uv run pytest -q -p no:cacheprovider`\n\n"
+        "Test commands that take arguments (append test paths or pytest args):\n"
+        "- `uv run pytest -q -p no:cacheprovider <paths or pytest args>`\n\n"
+        "Run one command per shell call. No shell operators "
+        "(`&&`, `|`, `;`, redirects)."
+    )
+
+
+def test_extended_prefix_admits_test_command_with_paths():
+    test = "uv run pytest -q -p no:cacheprovider"
+    call = AgentCall(
+        Role.QA,
+        "m",
+        "s",
+        "p",
+        commands=(test,),
+        command_prefixes=qa_command_prefixes(contract(test=test)),
+    )
+
+    assert permission_allowed("shell", call, command=f"{test} tests/x.py -k y")[0]
+    assert permission_allowed("shell", call, command=f"{test} tests/x.py")[0]
+    assert not permission_allowed(
+        "shell", call, command=f"{test} tests/x.py && curl evil"
+    )[0]
+    assert not permission_allowed("shell", call, command="uv run pytest -q tests")[0]
+
+
+async def test_qa_without_tests_is_not_passed(make_repo, store, loop_cfg):
+    reply = {**PASSING, "tests_run": []}
     env = Env(make_repo, store, loop_cfg, [json.dumps(reply)])
 
-    result = await env.qa(FakeRunner({"make test": 1}))
+    result = await env.qa(FakeRunner())
 
     assert result.passed is False
-    assert result.failures == [
-        QAFailure(
-            title="tests failed",
-            steps="make test",
-            expected="exit code 0",
-            actual="exit code 1\nout of make test",
-        ),
-        QAFailure(title="t", steps="s", expected="e", actual="a"),
+    [failure] = result.failures
+    assert failure.title == "QA ran no tests"
+
+
+async def test_qa_all_na_is_not_passed(make_repo, store, loop_cfg):
+    rows = [
+        {"case": "empty", "result": "n/a", "evidence": "could not run"},
+        {"case": "two tabs", "result": "n/a", "evidence": "could not run"},
     ]
+    llm_failure = {"title": "t", "steps": "s", "expected": "e", "actual": "a"}
+    reply = {**PASSING, "neighbour_matrix": rows, "failures": [llm_failure]}
+    env = Env(make_repo, store, loop_cfg, [json.dumps(reply)])
+
+    result = await env.qa(FakeRunner())
+
+    assert result.passed is False
+    assert [failure.title for failure in result.failures] == ["t", "QA ran no tests"]
 
 
-async def test_fast_lane_qa_is_deterministic_only(make_repo, store, loop_cfg):
+async def test_fast_lane_qa_skips_agent(make_repo, store, loop_cfg):
     env = Env(make_repo, store, loop_cfg)
     runner = FakeRunner()
 
     result = await env.qa(runner, fast_lane=True)
 
-    assert env.runtime.calls == []
-    assert [command for command, _ in runner.calls] == ["make build", "make test"]
+    assert env.runtime.calls == [] and runner.calls == []
+    assert not env.snapshot().exists()
+    assert not env.snapshot().parent.exists()
     assert result == QAReply(
         passed=True,
         bug_class=FAST_LANE_BUG_CLASS,
-        tests_run=["make build", "make test"],
+        tests_run=["pre-flight: build and affected tests"],
         neighbour_matrix=[],
     )
-
-
-async def test_fast_lane_qa_fails_on_failing_tests(make_repo, store, loop_cfg):
-    env = Env(make_repo, store, loop_cfg)
-
-    result = await env.qa(FakeRunner({"make test": 1}), fast_lane=True)
-
-    assert env.runtime.calls == []
-    assert result.passed is False
-    assert result.tests_run == ["make build", "make test"]
-    assert [failure.title for failure in result.failures] == ["tests failed"]
 
 
 async def test_snapshot_is_one_commit_and_removed_after_qa(make_repo, store, loop_cfg):
@@ -297,38 +308,9 @@ async def test_neighbour_cases_come_from_qa_memory_only(make_repo, store, loop_c
 
     await env.qa(FakeRunner())
 
-    assert env.runtime.calls[0].prompt == qa_input(
-        ISSUE, ["tabs neighbour: two tabs in a row"]
+    assert env.runtime.calls[0].prompt.startswith(
+        qa_input(ISSUE, ["tabs neighbour: two tabs in a row"]) + "\n\nCommands"
     )
-
-
-async def test_container_prepare_runs_on_the_snapshot(make_repo, store, loop_cfg):
-    env = Env(make_repo, store, loop_cfg, [json.dumps(PASSING)])
-    runner = PreparingRunner()
-
-    await env.qa(runner)
-
-    assert runner.prepared == [env.snapshot()]
-
-
-async def test_container_prepare_failure_fails_qa_without_running_commands(
-    make_repo, store, loop_cfg
-):
-    env = Env(make_repo, store, loop_cfg, [json.dumps(PASSING)])
-    runner = PreparingRunner(ContainerError("devcontainer up failed"))
-
-    result = await env.qa(runner)
-
-    assert runner.calls == []
-    assert result.passed is False
-    assert result.failures == [
-        QAFailure(
-            title="sandbox setup failed",
-            steps="prepare",
-            expected="exit code 0",
-            actual="devcontainer up failed",
-        )
-    ]
 
 
 def qa_reply(*paths: str, **extra) -> str:
@@ -428,3 +410,9 @@ async def test_fast_lane_qa_has_no_new_test_sources(make_repo, store, loop_cfg):
     qa = await env.qa(FakeRunner(), fast_lane=True)
 
     assert qa.new_test_sources == {}
+
+
+def test_qa_system_prompt_limits_commands_to_the_input():
+    text = load_prompt(Role.QA)
+    assert "Run only the commands listed in the input" in text
+    assert "no shell operators (`&&`, `|`, `;`, redirects)" in text

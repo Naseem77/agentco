@@ -38,6 +38,14 @@ All roles are required, unknown keys are rejected, and reviewer/qa/lead must use
 different model than senior/junior. See the
 [design spec §10](docs/superpowers/specs/2026-11-04-agent-company-design.md) for every option.
 
+Graphiti's OpenAI models are set with `memory_models` (defaults shown; `small_model` is
+also the reranker). `AGENTCO_GRAPHITI_MODEL` and `AGENTCO_GRAPHITI_SMALL_MODEL` override
+`model` and `small_model` when set.
+
+```yaml
+memory_models: { model: gpt-5.5, small_model: gpt-4.1-mini, embedder: text-embedding-3-small }
+```
+
 ```bash
 uv run agentco init                                   # one-time
 uv run agentco memory search --as qa "neighbours"

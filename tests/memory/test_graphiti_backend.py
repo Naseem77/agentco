@@ -3,9 +3,12 @@ from datetime import UTC, datetime
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock
 
+from graphiti_core.cross_encoder import OpenAIRerankerClient
+from graphiti_core.embedder import OpenAIEmbedder
+from graphiti_core.llm_client import OpenAIClient
 from graphiti_core.nodes import EpisodeType
 
-from agentco.config import TenantConfig
+from agentco.config import MemoryModels, TenantConfig
 from agentco.memory import graphiti_backend
 from agentco.memory.backend import MemoryItem
 from agentco.memory.entities import ENTITY_TYPES
@@ -136,15 +139,96 @@ async def test_search_does_not_share_config_between_calls():
     assert limits == [3, 7]
 
 
-def test_build_graphiti_backend_uses_cfg_host_and_port(monkeypatch):
+def stub_graphiti(monkeypatch) -> tuple[MagicMock, MagicMock]:
     # The real FalkorDriver connects in its constructor, so stub both classes.
     driver_cls, graphiti_cls = MagicMock(), MagicMock()
     monkeypatch.setattr(graphiti_backend, "FalkorDriver", driver_cls)
     monkeypatch.setattr(graphiti_backend, "Graphiti", graphiti_cls)
+    monkeypatch.setenv("OPENAI_API_KEY", "sk-test")  # OpenAI clients need a key
+    monkeypatch.delenv("AGENTCO_GRAPHITI_MODEL", raising=False)
+    monkeypatch.delenv("AGENTCO_GRAPHITI_SMALL_MODEL", raising=False)
+    return driver_cls, graphiti_cls
+
+
+def test_build_graphiti_backend_uses_cfg_host_and_port(monkeypatch):
+    driver_cls, graphiti_cls = stub_graphiti(monkeypatch)
     cfg = TenantConfig(
         tenant="acme", falkordb_host="db.example", falkordb_port=6400, roles={}
     )
     backend = build_graphiti_backend(cfg)
     driver_cls.assert_called_once_with(host="db.example", port=6400)
-    graphiti_cls.assert_called_once_with(graph_driver=driver_cls.return_value)
+    graphiti_cls.assert_called_once()
+    assert graphiti_cls.call_args.kwargs["graph_driver"] is driver_cls.return_value
     assert backend._graphiti is graphiti_cls.return_value
+
+
+def graphiti_models(graphiti_cls: MagicMock) -> dict[str, str]:
+    kwargs = graphiti_cls.call_args.kwargs
+    llm, embedder, reranker = (
+        kwargs["llm_client"],
+        kwargs["embedder"],
+        kwargs["cross_encoder"],
+    )
+    assert isinstance(llm, OpenAIClient)
+    assert isinstance(embedder, OpenAIEmbedder)
+    assert isinstance(reranker, OpenAIRerankerClient)
+    return {
+        "model": llm.config.model,
+        "small_model": llm.config.small_model,
+        "embedder": embedder.config.embedding_model,
+        "reranker": reranker.config.model,
+    }
+
+
+def test_build_graphiti_backend_uses_configured_models(monkeypatch):
+    _, graphiti_cls = stub_graphiti(monkeypatch)
+
+    build_graphiti_backend(TenantConfig(tenant="acme", roles={}))
+
+    assert graphiti_models(graphiti_cls) == {
+        "model": "gpt-5.5",
+        "small_model": "gpt-4.1-mini",
+        "embedder": "text-embedding-3-small",
+        "reranker": "gpt-4.1-mini",
+    }
+    assert "nano" not in str(graphiti_models(graphiti_cls))
+
+    cfg = TenantConfig(
+        tenant="acme",
+        roles={},
+        memory_models=MemoryModels(
+            model="big", small_model="small", embedder="embed-x"
+        ),
+    )
+    build_graphiti_backend(cfg)
+
+    assert graphiti_models(graphiti_cls) == {
+        "model": "big",
+        "small_model": "small",
+        "embedder": "embed-x",
+        "reranker": "small",
+    }
+
+
+def test_graphiti_model_env_overrides_win(monkeypatch):
+    _, graphiti_cls = stub_graphiti(monkeypatch)
+    monkeypatch.setenv("AGENTCO_GRAPHITI_MODEL", "env-big")
+    monkeypatch.setenv("AGENTCO_GRAPHITI_SMALL_MODEL", "env-small")
+
+    build_graphiti_backend(TenantConfig(tenant="acme", roles={}))
+
+    assert graphiti_models(graphiti_cls) == {
+        "model": "env-big",
+        "small_model": "env-small",
+        "embedder": "text-embedding-3-small",
+        "reranker": "env-small",
+    }
+
+
+def test_empty_graphiti_model_env_is_ignored(monkeypatch):
+    _, graphiti_cls = stub_graphiti(monkeypatch)
+    monkeypatch.setenv("AGENTCO_GRAPHITI_MODEL", "")
+
+    build_graphiti_backend(TenantConfig(tenant="acme", roles={}))
+
+    assert graphiti_models(graphiti_cls)["model"] == "gpt-5.5"

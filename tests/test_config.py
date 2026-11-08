@@ -322,3 +322,22 @@ def test_pool_defaults_and_disable(tmp_path):
     assert (cfg.pool.size, cfg.pool.setup_timeout_s) == (2, 1800)
     raw = BASE | {"pool": {"size": 0}}
     assert load_config(write(tmp_path, yaml.safe_dump(raw))).pool.size == 0
+
+
+def test_memory_models_default(tmp_path):
+    cfg = load_config(write(tmp_path, EXAMPLE))
+    models = cfg.memory_models
+    assert (models.model, models.small_model, models.embedder) == (
+        "gpt-5.5",
+        "gpt-4.1-mini",
+        "text-embedding-3-small",
+    )
+    raw = BASE | {"memory_models": {"small_model": "gpt-5-mini"}}
+    overridden = load_config(write(tmp_path, yaml.safe_dump(raw))).memory_models
+    assert (overridden.model, overridden.small_model) == ("gpt-5.5", "gpt-5-mini")
+
+
+def test_memory_models_reject_unknown_key(tmp_path):
+    raw = BASE | {"memory_models": {"nano": "gpt-4.1-nano"}}
+    with pytest.raises(ConfigError):
+        load_config(write(tmp_path, yaml.safe_dump(raw)))
