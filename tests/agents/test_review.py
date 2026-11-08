@@ -2,9 +2,12 @@ import inspect
 import json
 import subprocess
 
+import pytest
+
 from agentco.agents.prompts import load_prompt
 from agentco.agents.replies import Finding, PMReply
 from agentco.agents.review import ReviewReply, review_input, run_review
+from agentco.llm.copilot import permission_allowed
 from agentco.llm.fake import FakeRuntime
 from agentco.llm.replies import Asker
 from agentco.memory.backend import InMemoryBackend
@@ -109,7 +112,7 @@ async def test_review_sees_base_diff_with_memory_search_only(
         ISSUE, git(env.wt.path, "diff", "main...HEAD"), []
     )
     assert "-x = 1\n+x = 2\n" in call.prompt
-    assert call.workdir is None and call.edits is False
+    assert call.workdir == env.wt.path and call.edits is False
     assert call.commands == () and call.command_prefixes == ()
     assert [tool.name for tool in call.tools] == ["memory_search"]
     assert (call.max_turns, call.timeout_s) == (40, 1200)
@@ -139,4 +142,30 @@ async def test_fast_lane_uses_light_prompt(make_repo, store, loop_cfg):
 
     [call] = env.runtime.calls
     assert call.system.startswith(load_prompt(Role.REVIEWER, "light"))
-    assert call.workdir is None and call.edits is False
+    assert call.workdir == env.wt.path and call.edits is False
+
+
+@pytest.mark.parametrize("fast_lane", [False, True])
+async def test_review_call_is_read_only_with_worktree(
+    make_repo, store, loop_cfg, fast_lane
+):
+    env = Env(make_repo, store, loop_cfg, [REPLY])
+    env.commit("x = 2\n")
+
+    await env.review(fast_lane=fast_lane)
+
+    [call] = env.runtime.calls
+    assert call.workdir == env.wt.path
+    assert call.edits is False
+    assert call.commands == () and call.command_prefixes == ()
+    assert permission_allowed("read", call, path="a.py")[0] is True
+    assert permission_allowed("write", call, path="a.py")[0] is False
+
+
+@pytest.mark.parametrize("variant", [None, "light"])
+def test_reviewer_prompts_say_verify_in_the_code(variant):
+    text = load_prompt(Role.REVIEWER, variant)
+    assert (
+        "You can read any file in the repository to confirm a finding before you "
+        "report it; report only findings you verified in the code."
+    ) in text

@@ -981,6 +981,8 @@ class _Run:
             base = await self._refresh_base()
             wt = Worktree(wt.path, wt.branch, base)
             await self._sync_branch(wt, base)
+            # an unchanged tree and base reuse the round's passing checks: only
+            # the full suite (unless the round already ran it) and e2e run again
             report, _ = await self._run_preflight(
                 wt, base, fix_since=None, final=True, lead_comments=[]
             )
