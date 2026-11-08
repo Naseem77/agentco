@@ -1,5 +1,7 @@
 import asyncio
+import os
 import threading
+import time
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -36,6 +38,7 @@ from agentco.workflow.preflight import (
     Preflight,
     PreflightReport,
     RestoreError,
+    red_copy_path,
 )
 
 RULES_OK = '{"violations": []}'
@@ -116,7 +119,8 @@ async def test_all_checks_run_and_failures_collected(make_repo, store):
     ]
     assert rep.ok is False and rep.conflict is False
     assert [c.name for c in rep.failures()] == ["lint", "tests", "red"]
-    assert runner.calls == [LINT, BUILD, TESTS_CMD, RED_CMD]
+    # the red check builds its own copy of the commit
+    assert sorted(runner.calls) == sorted([LINT, BUILD, BUILD, TESTS_CMD, RED_CMD])
     lint = rep.checks[3]
     assert lint.detail == "\n".join(f"line {i}" for i in range(40, 100))
 
@@ -216,7 +220,8 @@ async def start_blocked_red(make_repo, store, runner):
     task = asyncio.create_task(go(make_preflight(runner, store), wt))
     while not runner.entered.is_set():
         await asyncio.sleep(0.01)
-    assert (wt.path / "src/calc.py").read_text() == ORIGINAL
+    assert (wt.path / "src/calc.py").read_text() == FIXED  # reverted in a copy
+    assert (red_copy_path(wt) / "src/calc.py").read_text() == ORIGINAL
     return wt, task
 
 
@@ -231,6 +236,7 @@ async def test_cancel_during_red_restores_the_fix(make_repo, store):
     assert (wt.path / "src/calc.py").read_text() == FIXED
     assert git(wt.path, "status", "--porcelain") == ""
     assert git(wt.path, "rev-parse", "HEAD") == head
+    assert not any(red_copy_path(wt).iterdir())
 
 
 async def test_second_cancel_cannot_interrupt_the_restore(
@@ -451,7 +457,8 @@ async def test_final_runs_full_suite_and_e2e(make_repo, store):
     runner = ScriptRunner(codes={RED_CMD: 1})
     rep = await go(make_preflight(runner, store, e2e=E2E), wt, final=True)
     assert rep.ok
-    assert runner.calls == [LINT, BUILD, FULL, RED_CMD, E2E]
+    assert sorted(runner.calls) == sorted([LINT, BUILD, BUILD, FULL, RED_CMD, E2E])
+    assert runner.calls[-1] == E2E
     assert names(rep)[-2:] == [("red", True), ("e2e", True)]
 
 
@@ -459,7 +466,7 @@ async def test_non_final_skips_e2e_and_full_suite(make_repo, store):
     _, wt = fixed_worktree(make_repo)
     runner = ScriptRunner(codes={RED_CMD: 1})
     await go(make_preflight(runner, store, e2e=E2E), wt)
-    assert runner.calls == [LINT, BUILD, TESTS_CMD, RED_CMD]
+    assert sorted(runner.calls) == sorted([LINT, BUILD, BUILD, TESTS_CMD, RED_CMD])
 
 
 async def test_final_without_e2e_configured_skips_it(make_repo, store):
@@ -483,7 +490,7 @@ async def test_no_new_test_fails_without_reason(make_repo, store):
     rep = await go(make_preflight(runner, store), wt)
     red = {c.name: c for c in rep.checks}["red"]
     assert (red.ok, red.detail) == (False, "no new test")
-    assert runner.calls == [LINT, BUILD, "pytest tests/test_add.py"]
+    assert sorted(runner.calls) == sorted([LINT, BUILD, "pytest tests/test_add.py"])
 
 
 async def test_no_test_reason_passes_red(make_repo, store):
@@ -505,7 +512,8 @@ async def test_test_only_change_has_no_fix_to_revert(make_repo, store):
     rep = await go(make_preflight(runner, store), wt)
     red = {c.name: c for c in rep.checks}["red"]
     assert (red.ok, red.detail) == (True, "test-only change: no fix to revert")
-    assert runner.calls == [LINT, BUILD, RED_CMD]  # the tests check ran them once
+    # the tests check ran them once
+    assert sorted(runner.calls) == sorted([LINT, BUILD, RED_CMD])
 
 
 TEST_ONLY = "test-only change: regression tests for a merged fix"
@@ -600,7 +608,7 @@ async def test_prepare_runs_once_per_worktree(make_repo, store):
     rig = make_preflight(runner, store)
     await go(rig, wt)
     await go(rig, wt)
-    assert runner.prepared == [wt.path]
+    assert runner.prepared == [wt.path, red_copy_path(wt)]
 
 
 async def test_prepare_failure_is_a_clear_preflight_failure(make_repo, store):
@@ -619,7 +627,7 @@ async def test_prepare_failure_is_a_clear_preflight_failure(make_repo, store):
     assert runner.calls == []
     runner.prepare_error = None  # a failed prepare is retried next round
     rep = await go(rig, wt)
-    assert runner.prepared == [wt.path] and runner.calls != []
+    assert runner.prepared == [wt.path, red_copy_path(wt)] and runner.calls != []
 
 
 async def test_runner_without_prepare_is_fine(make_repo, store):
@@ -725,7 +733,7 @@ async def test_cache_hit_skips_runner(make_repo, store):
     first = await go(rig, wt)
     second = await go(rig, wt)
     assert first.ok and second == first
-    assert sorted(runner.calls) == sorted([LINT, BUILD, TESTS_CMD, RED_CMD])
+    assert sorted(runner.calls) == sorted([LINT, BUILD, BUILD, TESTS_CMD, RED_CMD])
     assert len(rig.runtime.calls) == 1  # the rules check was cached too
 
 
@@ -739,8 +747,8 @@ async def test_cache_misses_after_new_commit(make_repo, store):
     (wt.path / "src/calc.py").write_text(FIXED + "# tweak\n")
     commit_all(wt, "tweak")
     await go(rig, wt)
-    assert len(runner.calls) == 2 * first == 8  # every command ran again
-    for command in (LINT, BUILD, RED_CMD):
+    assert len(runner.calls) == 2 * first == 10  # every command ran again
+    for command in (LINT, RED_CMD):
         assert runner.calls.count(command) == 2, command
     assert len(rig.runtime.calls) == 2
 
@@ -755,8 +763,9 @@ async def test_cache_misses_after_base_change(make_repo, store):
     git(root, "commit", "--allow-empty", "-m", "base moved, same content")
     await go(rig, wt)
     assert git(wt.path, "rev-parse", "HEAD^{tree}") == tree  # only the base moved
-    for command in (LINT, BUILD, TESTS_CMD, RED_CMD):
+    for command in (LINT, TESTS_CMD, RED_CMD):
         assert runner.calls.count(command) == 2, command
+    assert runner.calls.count(BUILD) == 4  # the worktree and the red copy
     assert len(rig.runtime.calls) == 2
 
 
@@ -768,7 +777,8 @@ async def test_failed_result_not_cached(make_repo, store):
     rep = await go(rig, wt)
     assert [c.name for c in rep.failures()] == ["lint"]
     assert runner.calls.count(LINT) == 2
-    assert runner.calls.count(BUILD) == 1 and runner.calls.count(TESTS_CMD) == 1
+    assert runner.calls.count(BUILD) == 2  # once in the worktree, once in the copy
+    assert runner.calls.count(TESTS_CMD) == 1 and runner.calls.count(RED_CMD) == 1
 
 
 async def test_rules_pass_covers_a_smaller_rule_set(make_repo, store):
@@ -797,3 +807,169 @@ async def test_red_cache_depends_on_the_no_test_reason(make_repo, store):
     first = await red_of(rig, wt, no_test_reason="docs only")
     second = await red_of(rig, wt)
     assert (first.ok, second.ok) == (True, False)
+
+
+class Timed(ScriptRunner):
+    """Sleeps in the slow commands and records when each one ran, and where."""
+
+    def __init__(self, slow: set[str], **kw):
+        super().__init__(**kw)
+        self.slow = slow
+        self.spans: list[tuple[str, Path, float, float]] = []
+
+    def run(self, command, cwd, timeout_s):
+        start = time.monotonic()
+        if command in self.slow:
+            time.sleep(0.3)
+        result = super().run(command, cwd, timeout_s)
+        self.spans.append((command, cwd, start, time.monotonic()))
+        return result
+
+    def span(self, command: str, cwd: Path) -> tuple[float, float]:
+        [found] = [(s, e) for c, p, s, e in self.spans if c == command and p == cwd]
+        return found
+
+
+def overlap(*spans: tuple[float, float]) -> bool:
+    return max(s for s, _ in spans) < min(e for _, e in spans)
+
+
+async def test_checks_run_concurrently(make_repo, store):
+    _, wt = fixed_worktree(make_repo)
+    runner = Timed({LINT, BUILD, TESTS_CMD, RED_CMD}, codes={RED_CMD: 1})
+    rig = make_preflight(runner, store, replies=[RULES_OK])
+    await add_rule(rig)
+    rules: list[tuple[float, float]] = []
+    ask = rig.runtime.run
+
+    async def slow_rules(call):
+        start = time.monotonic()
+        await asyncio.sleep(0.3)
+        try:
+            return await ask(call)
+        finally:
+            rules.append((start, time.monotonic()))
+
+    rig.runtime.run = slow_rules
+    rep = await go(rig, wt)
+    assert rep.ok
+    lint, build = runner.span(LINT, wt.path), runner.span(BUILD, wt.path)
+    assert overlap(rules[0], lint, build)
+    first = (rules[0], lint, build)
+    assert max(e for _, e in first) - min(s for s, _ in first) < 0.6
+    tests = runner.span(TESTS_CMD, wt.path)
+    copy = red_copy_path(wt)
+    red = (runner.span(BUILD, copy)[0], runner.span(RED_CMD, copy)[1])
+    assert overlap(tests, red)  # the red check works in its copy meanwhile
+    assert tests[0] >= build[1]  # tests wait for a passing build
+
+
+async def test_build_failure_skips_tests_and_red(make_repo, store):
+    _, wt = fixed_worktree(make_repo)
+    runner = ScriptRunner(codes={BUILD: 1, LINT: 1})
+    rep = await go(make_preflight(runner, store), wt)
+    assert names(rep) == [
+        ("rebase", True),
+        ("size", True),
+        ("rules", True),
+        ("lint", False),
+        ("build", False),
+    ]
+    assert sorted(runner.calls) == sorted([LINT, BUILD])
+
+
+def tree_bytes(path: Path) -> dict[str, bytes]:
+    return {
+        str(p.relative_to(path)): p.read_bytes()
+        for p in sorted(path.rglob("*"))
+        if p.is_file() and ".git" not in p.relative_to(path).parts
+    }
+
+
+@pytest.mark.parametrize("crash", [False, True])
+async def test_red_runs_in_copy_and_worktree_untouched(make_repo, store, crash):
+    root, wt = fixed_worktree(make_repo)
+    before = tree_bytes(wt.path)
+    seen: dict[str, object] = {}
+
+    class Spy(ScriptRunner):
+        def run(self, command, cwd, timeout_s):
+            if command == RED_CMD:
+                seen["cwd"] = cwd
+                seen["worktree"] = (wt.path / "src/calc.py").read_text()
+                seen["copy"] = (cwd / "src/calc.py").read_text()
+                seen["new test"] = (cwd / "tests/test_new.py").is_file()
+            return super().run(command, cwd, timeout_s)
+
+    runner = Spy(codes={RED_CMD: 1}, raise_on=RED_CMD if crash else None)
+    if crash:
+        with pytest.raises(RuntimeError, match="runner crashed"):
+            await go(make_preflight(runner, store), wt)
+    else:
+        rep = await go(make_preflight(runner, store), wt)
+        assert rep.ok
+    copy = seen["cwd"]
+    assert isinstance(copy, Path)
+    assert copy.is_relative_to(root / ".agentco" / "red")
+    assert not copy.is_relative_to(wt.path)
+    assert (seen["worktree"], seen["copy"], seen["new test"]) == (
+        FIXED,
+        ORIGINAL,
+        True,
+    )
+    assert tree_bytes(wt.path) == before
+    assert git(wt.path, "status", "--porcelain", "--untracked-files=all") == ""
+    assert not copy.exists() or not any(copy.iterdir())
+    # the copy was built (it has no dependencies of its own) before the revert
+    assert runner.calls.count(BUILD) == 2
+
+
+async def test_red_copy_build_failure_is_not_a_red_proof(make_repo, store):
+    _, wt = fixed_worktree(make_repo)
+
+    class CopyBuildFails(ScriptRunner):
+        def run(self, command, cwd, timeout_s):
+            if command == BUILD and cwd != wt.path:
+                return CommandResult(command, 1, "no deps", 0.0, False)
+            return super().run(command, cwd, timeout_s)
+
+    runner = CopyBuildFails(codes={RED_CMD: 1})
+    rep = await go(make_preflight(runner, store), wt)
+    red = {c.name: c for c in rep.checks}["red"]
+    assert not red.ok
+    assert red.detail.splitlines()[0] == (
+        "could not build a copy to run the new tests without the fix (exit 1)"
+    )
+    assert RED_CMD not in runner.calls
+
+
+async def test_red_copy_is_prepared_like_the_worktree(make_repo, store):
+    root, wt = fixed_worktree(make_repo)
+    runner = ScriptRunner(codes={RED_CMD: 1})
+    await go(make_preflight(runner, store), wt)
+    assert runner.prepared == [wt.path, root / ".agentco" / "red" / wt.path.name]
+    assert red_copy_path(wt) == root / ".agentco" / "red" / wt.path.name
+
+
+async def test_red_copy_reverts_deleted_and_executable_sources(make_repo, store):
+    root = make_repo({**FILES, "src/run.sh": "#!/bin/sh\necho hi\n"})
+    git(root, "update-index", "--chmod=+x", "src/run.sh")
+    git(root, "commit", "-m", "exec")
+    wt = create_worktree(root, 1, "main")
+    add_test(wt)
+    fix(wt)
+    (wt.path / "src/run.sh").unlink()
+    commit_all(wt, "fix")
+    seen: dict[str, object] = {}
+
+    class Spy(ScriptRunner):
+        def run(self, command, cwd, timeout_s):
+            if command == RED_CMD:
+                script = cwd / "src/run.sh"
+                seen["script"] = script.read_text() if script.exists() else None
+                seen["exec"] = script.exists() and os.access(script, os.X_OK)
+            return super().run(command, cwd, timeout_s)
+
+    await go(make_preflight(Spy(codes={RED_CMD: 1}), store), wt)
+    assert seen == {"script": "#!/bin/sh\necho hi\n", "exec": True}
+    assert not (wt.path / "src/run.sh").exists()

@@ -1,13 +1,16 @@
 """Pre-flight gate: the cheap, mechanical checks a task passes before review.
 
-Rebase and size fail fast. Every later check runs and every failure is reported,
-so the engineer fixes everything in one round. The `red` check proves the new
-tests fail without the fix, by reverting the source files on a committed clean
-tree and always restoring the worktree afterwards. A check that passed on the
-same tree against the same base commit is not run again.
+Rebase and size fail fast. Then the rules, lint and build checks run at the
+same time, and every failure is reported, so the engineer fixes everything in
+one round. Once the build passes, the tests and the `red` check run at the same
+time. The `red` check proves the new tests fail without the fix: it reverts the
+source files in a throwaway copy of the commit, never in the worktree. A check
+that passed on the same tree against the same base commit is not run again.
 """
 
 import asyncio
+import os
+import posixpath
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -39,18 +42,24 @@ from agentco.sandbox.runner import (
     ContainerError,
 )
 from agentco.sandbox.worktree import (
+    GitError,
     Worktree,
+    _clean,
     _git,
+    _make_parent,
     _run,
+    _safe_rel,
     changed_files,
     changed_lines,
     diff,
+    make_snapshot,
     rebase_onto,
 )
 
 DETAIL_LINES = 60
 NO_TESTS_EXIT = 5  # pytest: no tests collected
 RULE_SEP = "\0"
+RED_COPIES = "red"  # next to the worktrees: .agentco/red/<worktree name>
 
 
 @dataclass(frozen=True)
@@ -124,18 +133,70 @@ async def _restore_shielded(wt: Worktree) -> None:
         raise asyncio.CancelledError
 
 
-def _revert_source(wt: Worktree, base: str, sources: list[str]) -> None:
-    """Put every changed non-test file back to its state on base."""
-    existing = [
-        p
-        for p in sources
-        if _run(wt.path, "cat-file", "-e", f"{base}:{p}").returncode == 0
-    ]
-    if existing:
-        _git(wt.path, "checkout", base, "--", *(f":(literal){p}" for p in existing))
-    for p in sources:
-        if p not in existing:
-            (wt.path / p).unlink(missing_ok=True)
+async def _all[T](*steps: Awaitable[T]) -> list[T]:
+    """Run steps concurrently; the first error is raised only once all have ended,
+    so no command is still running in the worktree when it is restored."""
+    results = await asyncio.gather(*steps, return_exceptions=True)
+    for result in results:
+        if isinstance(result, BaseException):
+            raise result
+    return results  # type: ignore[return-value]
+
+
+def red_copy_path(wt: Worktree) -> Path:
+    return wt.path.parents[1] / RED_COPIES / wt.path.name
+
+
+def _clear(copy: Path) -> None:
+    # the directory itself stays: a dev container may have it bind-mounted
+    if copy.is_dir():
+        _clean(copy, keep_dir=True)
+
+
+def _fresh_copy(wt: Worktree, copy: Path) -> None:
+    _clear(copy)  # left over from a crash
+    make_snapshot(wt, copy)
+
+
+def _base_entries(wt: Worktree, base: str) -> dict[str, tuple[str, str]]:
+    out = _git(wt.path, "ls-tree", "-r", "-z", "--full-tree", base)
+    entries: dict[str, tuple[str, str]] = {}
+    for record in out.split("\0"):
+        if record:
+            meta, path = record.split("\t", 1)
+            mode, _kind, sha = meta.split()
+            entries[path] = (mode, sha)
+    return entries
+
+
+def _revert_source(wt: Worktree, copy: Path, base: str, sources: list[str]) -> None:
+    """In the copy, put every changed non-test file back to its state on base.
+
+    Base is read from the worktree's repository (the copy has no history);
+    nothing is written to the worktree.
+    """
+    on_base = _base_entries(wt, base)
+    root = copy.resolve()
+    for path in sources:
+        target = copy / _safe_rel(path)
+        _make_parent(root, target)
+        if target.is_symlink() or target.is_file():
+            target.unlink()
+        mode, sha = on_base.get(path, ("", ""))
+        if mode not in ("100644", "100755", "120000"):
+            continue  # added by the fix (or a submodule): absent without it
+        blob = _run(wt.path, "cat-file", "blob", sha)
+        if blob.returncode != 0:
+            raise GitError(f"cannot read {path!r} on {base}")
+        if mode == "120000":
+            link = blob.stdout.decode(errors="surrogateescape")
+            resolved = posixpath.normpath(posixpath.join(posixpath.dirname(path), link))
+            if posixpath.isabs(link) or resolved.split("/")[0] == "..":
+                raise GitError(f"symlink {path!r} on {base} escapes the copy")
+            os.symlink(link, target)
+        else:
+            target.write_bytes(blob.stdout)
+            target.chmod(0o755 if mode == "100755" else 0o644)
 
 
 @dataclass
@@ -169,16 +230,16 @@ class Preflight:
         self, name: str, command: str, wt: Worktree, stamp: tuple[str, str]
     ) -> CheckResult:
         async def check() -> CheckResult:
-            result = await self._exec(command, wt)
+            result = await self._exec(command, wt.path)
             if result.exit_code == 0:
                 return CheckResult(name, True, "")
             return CheckResult(name, False, self._failure_detail(result))
 
         return await self._cached(name, command, stamp, check)
 
-    async def _exec(self, command: str, wt: Worktree) -> CommandResult:
+    async def _exec(self, command: str, cwd: Path) -> CommandResult:
         return await asyncio.to_thread(
-            self.runner.run, command, wt.path, self.limits.command_timeout_s
+            self.runner.run, command, cwd, self.limits.command_timeout_s
         )
 
     def _failure_detail(self, result: CommandResult) -> str:
@@ -209,7 +270,7 @@ class Preflight:
             _git, wt.path, "status", "--porcelain", "--untracked-files=all"
         )
         if status.strip():
-            # the red check's restore would destroy uncommitted work
+            # the restore after the commands would destroy uncommitted work
             checks.append(
                 CheckResult(
                     "clean", False, "uncommitted changes in the worktree: commit first"
@@ -268,42 +329,61 @@ class Preflight:
             return _report(checks)
         checks.append(CheckResult("size", True, f"{lines} changed lines {scope}"))
 
-        checks.append(await self._rules(wt, base, stamp, lead_comments))
+        async def lint_and_build() -> list[CheckResult]:
+            prepared: list[CheckResult] = []
+            if not await self._prepare(wt, prepared):
+                return prepared
+            return await _all(
+                self._command("lint", self.contract.lint, wt, stamp),
+                self._command("build", self.contract.build, wt, stamp),
+            )
 
-        if not await self._prepare(wt, checks):
+        rules, commands = await _all(
+            self._rules(wt, base, stamp, lead_comments), lint_and_build()
+        )
+        checks.extend([rules, *commands])  # type: ignore[list-item, misc]
+        build = checks[-1]  # or the failed prepare
+        if build.name == "prepare":
             return _report(checks)
 
-        checks.append(await self._command("lint", self.contract.lint, wt, stamp))
-        checks.append(await self._command("build", self.contract.build, wt, stamp))
-        if final:
-            command = self.contract.test
-        else:
-            affected = await affected_tests(self.repo, wt, base)
-            command = test_command(self.contract, affected)
-        checks.append(await self._command("tests", command, wt, stamp))
-        checks.append(
-            await self._cached(
-                "red",
-                RULE_SEP.join(("red", str(test_only), no_test_reason)),
-                stamp,
-                lambda: self._red(wt, base, no_test_reason, test_only),
+        if build.ok:  # nothing to test without a build
+            if final:
+                command = self.contract.test
+            else:
+                affected = await affected_tests(self.repo, wt, base)
+                command = test_command(self.contract, affected)
+            checks.extend(
+                await _all(
+                    self._command("tests", command, wt, stamp),
+                    self._cached(
+                        "red",
+                        RULE_SEP.join(("red", str(test_only), no_test_reason)),
+                        stamp,
+                        lambda: self._red(wt, base, no_test_reason, test_only),
+                    ),
+                )
             )
-        )
         if final and self.contract.e2e:
             checks.append(await self._command("e2e", self.contract.e2e, wt, stamp))
         return _report(checks)
 
     async def _prepare(self, wt: Worktree, checks: list[CheckResult]) -> bool:
-        prepare = getattr(self.runner, "prepare", None)
-        if prepare is None or wt.path in self._prepared:
-            return True
-        try:
-            await asyncio.to_thread(prepare, wt.path)
-        except ContainerError as e:
-            checks.append(CheckResult("prepare", False, str(e)))
+        error = await self._prepare_path(wt.path)
+        if error is not None:
+            checks.append(CheckResult("prepare", False, error))
             return False
-        self._prepared.add(wt.path)
         return True
+
+    async def _prepare_path(self, path: Path) -> str | None:
+        prepare = getattr(self.runner, "prepare", None)
+        if prepare is None or path in self._prepared:
+            return None
+        try:
+            await asyncio.to_thread(prepare, path)
+        except ContainerError as e:
+            return str(e)
+        self._prepared.add(path)
+        return None
 
     async def _rules(
         self,
@@ -374,12 +454,13 @@ class Preflight:
         command = test_command(
             self.contract, AffectedTests(tuple(named), not named, "new tests")
         )
+        copy = red_copy_path(wt)
         try:
-            # blocking on purpose: cancellation can only land at the command await
-            _revert_source(wt, base, sources)
-            result = await self._exec(command, wt)
+            result = await self._red_in_copy(wt, copy, base, sources, command)
         finally:
-            await _restore_shielded(wt)
+            await asyncio.to_thread(_clear, copy)
+        if isinstance(result, CheckResult):
+            return result
         if result.exit_code in (TIMEOUT_EXIT, NOT_FOUND_EXIT):
             return CheckResult(
                 "red",
@@ -401,3 +482,33 @@ class Preflight:
         return CheckResult(
             "red", True, f"new tests fail without the fix (exit {result.exit_code})"
         )
+
+    async def _red_in_copy(
+        self, wt: Worktree, copy: Path, base: str, sources: list[str], command: str
+    ) -> CommandResult | CheckResult:
+        """Run `command` on a copy of HEAD with the sources reverted to base.
+
+        The copy is built first, as QA's snapshot is: it has none of the
+        worktree's installed dependencies.
+        """
+        cannot = "could not {} a copy to run the new tests without the fix"
+        try:
+            await asyncio.to_thread(_fresh_copy, wt, copy)
+        except GitError as e:
+            return CheckResult("red", False, f"{cannot.format('make')}: {e}")
+        error = await self._prepare_path(copy)
+        if error is not None:
+            return CheckResult("red", False, f"{cannot.format('prepare')}: {error}")
+        build = await self._exec(self.contract.build, copy)
+        if build.exit_code != 0:
+            return CheckResult(
+                "red",
+                False,
+                f"{cannot.format('build')} (exit {build.exit_code})\n"
+                f"{self._failure_detail(build)}",
+            )
+        try:
+            await asyncio.to_thread(_revert_source, wt, copy, base, sources)
+        except (GitError, OSError) as e:
+            return CheckResult("red", False, f"{cannot.format('revert')}: {e}")
+        return await self._exec(command, copy)
