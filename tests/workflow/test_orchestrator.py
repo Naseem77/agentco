@@ -218,7 +218,7 @@ async def test_three_junior_rounds_reassign_senior_then_escalate(make_rig):
         {
             "from_state": "triage",
             "category": "stuck",
-            "reason": "round limit reached (3)",
+            "reason": "round limit reached (3); last QA failed: 1 failure(s)",
             "options": ["answer: one more round", "reject"],
             "question": "",
             "stop": "rounds",
@@ -265,6 +265,30 @@ async def test_preflight_exhausted_counts_as_a_round(make_rig):
     assert rig.calls(Role.QA) == [] and rig.calls(Role.LEAD) == []
     assert len(rig.store.artifacts(rig.task_id, ArtifactKind.PREFLIGHT)) == 4
     assert rig.escalations()[0]["stop"] == "rounds"
+
+
+async def test_round_limit_escalation_reports_red_branch(make_rig):
+    script = {
+        Role.PM: [PM_JSON],
+        Role.TRIAGE: [triage_json()] * 2,
+        Role.JUNIOR: [engineer(1), engineer(2)],
+        Role.SENIOR: [engineer(3), engineer(4)],
+        Role.REVIEWER: [RULES_OK] * 4,
+    }
+    rig = await make_rig(
+        script,
+        max_rounds=1,
+        runner=ScriptRunner(codes={RED_CMD: 1, LINT: 1, FULL: 1}),
+    )
+
+    task = await rig.run()
+
+    assert task.state is TaskState.AWAITING_HUMAN
+    [escalation] = rig.escalations()
+    assert escalation["stop"] == "rounds"
+    assert escalation["reason"] == (
+        "round limit reached (1); last pre-flight failed: lint, tests"
+    )
 
 
 async def test_rebase_conflict_goes_back_to_triage(make_rig):
