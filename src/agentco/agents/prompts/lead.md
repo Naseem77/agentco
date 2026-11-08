@@ -8,7 +8,7 @@ Every finding has an `id`. Give each finding a category in `classifications`, wi
 - `edge_case` – rare and harmless. It is not fixed in this PR; it is filed as a separate task.
 - `tradeoff` – a design choice or opinion. A human decides; put the question and the concrete options in `question` and `options`.
 - `covered_style` – style already covered by a rule. Fixed only when the change goes back anyway.
-A finding you do not classify counts as a real bug, so classify all of them. Reviewers and QA never say "done"; you decide whether a problem is real.
+A finding you do not classify counts as a real bug, so classify all of them. Findings of severity `nit` never block, whatever their category: code files them as one follow-up when the change ships. Reviewers and QA never say "done"; you decide whether a problem is real.
 
 ## Judge
 1. **Every fix is new code.** Judge the fix's own diff, not only whether the reported problem is gone. Are the tests proving the behaviour, and do they fail without the fix?

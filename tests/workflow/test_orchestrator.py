@@ -6,10 +6,12 @@ from pathlib import Path
 import pytest
 from orch_helpers import (
     LEAD_OK,
+    LEAD_STYLE_OK,
     PM_JSON,
     QA_FAIL,
     QA_OK,
     REVIEW_OK,
+    REVIEW_STYLE,
     RULES_OK,
     STUCK,
     CountingRuntime,
@@ -101,12 +103,14 @@ async def test_preflight_runs_before_review_and_cost_is_recorded(make_rig):
 
     roles = [c.role for c in rig.runtime.calls]
     assert roles[:4] == [Role.PM, Role.TRIAGE, Role.JUNIOR, Role.REVIEWER]
-    # the final pre-flight reuses the round's rules check: same tree, same base
-    assert set(roles[4:6]) == {Role.REVIEWER, Role.QA} and roles[6:] == [Role.LEAD]
+    # Clean checks are approved without a lead call, and the final pre-flight
+    # reuses the round's rules check: same tree, same base.
+    assert set(roles[4:6]) == {Role.REVIEWER, Role.QA} and len(roles) == 6
     first_reviewer = rig.calls(Role.REVIEWER)[0]
     assert first_reviewer.system.startswith(load_prompt(Role.REVIEWER, "rules"))
-    assert len(roles) == 7
-    assert rig.task().cost_usd == pytest.approx(0.04 * 7)
+    assert rig.task().cost_usd == pytest.approx(0.04 * 6)
+    lead = rig.store.latest_artifact(rig.task_id, ArtifactKind.LEAD)
+    assert lead is not None and lead.body["reason"] == "auto: clean checks, only nits"
 
 
 async def test_send_back_never_opens_pr_and_reruns_with_scoped_findings(make_rig):
@@ -216,7 +220,7 @@ async def test_three_junior_rounds_reassign_senior_then_escalate(make_rig):
         {
             "from_state": "triage",
             "category": "stuck",
-            "reason": "round limit reached (3)",
+            "reason": "round limit reached (3); last QA failed: 1 failure(s)",
             "options": ["answer: one more round", "reject"],
             "question": "",
             "stop": "rounds",
@@ -263,6 +267,30 @@ async def test_preflight_exhausted_counts_as_a_round(make_rig):
     assert rig.calls(Role.QA) == [] and rig.calls(Role.LEAD) == []
     assert len(rig.store.artifacts(rig.task_id, ArtifactKind.PREFLIGHT)) == 4
     assert rig.escalations()[0]["stop"] == "rounds"
+
+
+async def test_round_limit_escalation_reports_red_branch(make_rig):
+    script = {
+        Role.PM: [PM_JSON],
+        Role.TRIAGE: [triage_json()] * 2,
+        Role.JUNIOR: [engineer(1), engineer(2)],
+        Role.SENIOR: [engineer(3), engineer(4)],
+        Role.REVIEWER: [RULES_OK] * 4,
+    }
+    rig = await make_rig(
+        script,
+        max_rounds=1,
+        runner=ScriptRunner(codes={RED_CMD: 1, LINT: 1, FULL: 1}),
+    )
+
+    task = await rig.run()
+
+    assert task.state is TaskState.AWAITING_HUMAN
+    [escalation] = rig.escalations()
+    assert escalation["stop"] == "rounds"
+    assert escalation["reason"] == (
+        "round limit reached (1); last pre-flight failed: lint, tests"
+    )
 
 
 async def test_rebase_conflict_goes_back_to_triage(make_rig):
@@ -476,6 +504,7 @@ async def test_preflight_rules_failure_fails_the_round_not_the_loop(make_rig, st
 )
 async def test_lead_failure_escalates_stuck(make_rig, steps):
     script = happy()
+    script[Role.REVIEWER] = [RULES_OK, REVIEW_STYLE, RULES_OK]
     script[Role.LEAD] = steps
     rig = await make_rig(script)
 
@@ -582,7 +611,7 @@ class FinalGateRunner(ScriptRunner):
 def approve_after_main_moved(repo: list[Path], n: int):
     def step(call):
         advance_main(repo[0], {f"docs/upstream{n}.md": "moved\n"})
-        return LEAD_OK
+        return LEAD_STYLE_OK
 
     return step
 
@@ -599,9 +628,13 @@ async def test_final_preflight_only_runs_full_suite_when_unchanged(
 
     def approve(call):
         before_approval.extend(runner.calls)
-        return LEAD_OK
+        return LEAD_STYLE_OK
 
-    script = happy() | {Role.LEAD: [approve]}
+    # a minor finding keeps the lead in the loop, so the approval is observable
+    script = happy() | {
+        Role.REVIEWER: [RULES_OK, REVIEW_STYLE, RULES_OK],
+        Role.LEAD: [approve],
+    }
     rig = await make_rig(script, runner=runner)
 
     task = await rig.run()
@@ -620,7 +653,8 @@ async def test_final_preflight_failure_sends_the_round_back_without_a_push(make_
         Role.TRIAGE: [triage_json()] * 2,
         Role.JUNIOR: [engineer(1)],
         Role.SENIOR: [engineer(2), engineer(3)],
-        Role.REVIEWER: [RULES_OK, REVIEW_OK, RULES_OK] * 2,
+        # a minor finding keeps the lead (which moves main) in the loop
+        Role.REVIEWER: [RULES_OK, REVIEW_STYLE, RULES_OK] * 2,
         Role.QA: [QA_OK] * 2,
         Role.LEAD: [approve_after_main_moved(repo, i) for i in range(2)],
     }

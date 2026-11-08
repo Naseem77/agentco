@@ -1,10 +1,12 @@
 import pytest
 from orch_helpers import (
     LEAD_OK,
+    LEAD_STYLE_OK,
     PM_JSON,
     QA_FAIL,
     QA_OK,
     REVIEW_OK,
+    REVIEW_STYLE,
     RULES_OK,
     STUCK,
     engineer,
@@ -248,7 +250,13 @@ async def test_approve_on_a_budget_stop_before_the_lead_does_not_open_a_pr(make_
 
 
 async def test_a_budget_top_up_lets_the_stopped_task_through_to_the_lead(make_rig):
-    script = calls_after_an_approval({Role.QA: [AgentResult(QA_OK, 200.0), QA_OK]})
+    script = calls_after_an_approval(
+        {
+            Role.QA: [AgentResult(QA_OK, 200.0), QA_OK],
+            Role.REVIEWER: [RULES_OK, REVIEW_STYLE, RULES_OK, REVIEW_STYLE, RULES_OK],
+            Role.LEAD: [LEAD_STYLE_OK],
+        }
+    )
     rig = await make_rig(script)
     await rig.run()
     assert len(rig.calls(Role.LEAD)) == 0
@@ -282,7 +290,12 @@ async def test_a_budget_top_up_resumes_an_engineering_stop(make_rig):
 async def test_a_failed_lead_is_asked_again_never_skipped_by_an_approval(
     make_rig, decision
 ):
-    script = calls_after_an_approval({Role.LEAD: [STUCK, LEAD_OK]})
+    script = calls_after_an_approval(
+        {
+            Role.REVIEWER: [RULES_OK, REVIEW_STYLE, RULES_OK, REVIEW_STYLE, RULES_OK],
+            Role.LEAD: [STUCK, LEAD_STYLE_OK],
+        }
+    )
     rig = await make_rig(script)
     await rig.run()
     assert rig.escalations()[-1]["reason"].startswith("lead failed")

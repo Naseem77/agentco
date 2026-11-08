@@ -1,7 +1,7 @@
 """Team lead: classifies findings, then code applies the decision order (spec §6)."""
 
 import re
-from collections.abc import Sequence
+from collections.abc import Iterable, Sequence
 from dataclasses import asdict, dataclass, replace
 from typing import Literal
 
@@ -34,6 +34,7 @@ CRITICAL_PATTERNS: dict[str, tuple[str, ...]] = {
     "money": (r"payment|billing|license",),
 }
 FAST_LANE_SUMMARY = "fast lane: rule-based approval"
+AUTO_APPROVE_REASON = "auto: clean checks, only nits"
 ROOT_CAUSE_QUESTION = (
     "Root cause required: does the invariant remove the cause, not just this symptom?"
 )
@@ -141,6 +142,22 @@ def _qa_findings(qa: QAReply) -> list[Finding]:
     ]
 
 
+def _nits_follow_up(
+    task_id: int | None, nits: Sequence[Finding]
+) -> tuple[Finding, ...]:
+    if not nits:
+        return ()
+    return (
+        Finding(
+            id="nits",
+            severity="nit",
+            kind="style",
+            title=f"Nits from task {task_id}",
+            detail="\n".join(finding_line(nit) for nit in nits),
+        ),
+    )
+
+
 def decide(
     reply: LeadReply | None,
     review: ReviewReply | None,
@@ -149,11 +166,15 @@ def decide(
     critical: list[str],
     new: list[str],
     min_confidence: float,
+    *,
+    task_id: int | None = None,
 ) -> LeadDecision:
     categories = (
         {c.finding_id: c.category for c in reply.classifications} if reply else {}
     )
-    findings = review.findings if review else []
+    # Nits never block: they ride along as one follow-up when the change ships.
+    nits = [f for f in review.findings if f.severity == "nit"] if review else []
+    findings = [f for f in review.findings if f.severity != "nit"] if review else []
     # A finding the lead did not classify counts as a real bug.
     by_category = {
         category: [f for f in findings if categories.get(f.id, "real_bug") == category]
@@ -168,11 +189,12 @@ def decide(
         reason: str,
         **fields,
     ) -> LeadDecision:
+        nit_follow_ups = _nits_follow_up(task_id, nits) if kind == "approve" else ()
         return LeadDecision(
             outcome=kind,
             category=category,
             findings_to_fix=fields.get("findings_to_fix", ()),
-            follow_ups=follow_ups,
+            follow_ups=(*follow_ups, *nit_follow_ups),
             reason=reason,
             summary=summary,
             comments=tuple(reply.comments) if reply and kind == "send_back" else (),
@@ -329,19 +351,57 @@ def _fast_lane_eligible(
     )
 
 
-def _file_follow_ups(
-    store: TaskStore, task: TaskRecord, follow_ups: tuple[Finding, ...]
-) -> None:
+_CHORES = (
+    re.compile(r"^(run|re-?run|execute)\b.*\b(tests?|lint|linter|build|ci|suite)\b"),
+    re.compile(r"^(add|write) (more )?tests?$"),
+)
+
+
+def _normalized_title(title: str) -> str:
+    return " ".join(re.sub(r"[^\w\s]", "", title.casefold()).split())
+
+
+def _is_chore(title: str) -> bool:
+    normalized = _normalized_title(title)
+    return any(chore.search(normalized) for chore in _CHORES)
+
+
+def _auto_approve_eligible(
+    preflight: PreflightReport,
+    checks: CheckOutcome,
+    critical: list[str],
+    new: list[str],
+    require_invariant: bool,
+) -> bool:
+    return (
+        not require_invariant
+        and not critical
+        and not new
+        and not checks.errors
+        and preflight.ok
+        and checks.qa is not None
+        and checks.qa.passed
+        and bool(checks.qa.tests_run)
+        and checks.review is not None
+        and all(f.severity == "nit" for f in checks.review.findings)
+    )
+
+
+def _file_follow_ups(store: TaskStore, task: TaskRecord, titles: Iterable[str]) -> None:
+    """File each new, non-chore title once per task; titles match loosely."""
     source_ref = f"task:{task.id}"
     filed = {
-        t.title
+        _normalized_title(t.title)
         for t in store.list_tasks(task.tenant)
         if t.source == "followup" and t.source_ref == source_ref
     }
-    for finding in follow_ups:
-        if finding.title not in filed:
-            store.create_task(task.tenant, finding.title, "followup", source_ref)
-            filed.add(finding.title)
+    for title in titles:
+        title = title.strip()
+        key = _normalized_title(title)
+        if not key or key in filed or _is_chore(title):
+            continue
+        store.create_task(task.tenant, title, "followup", source_ref)
+        filed.add(key)
 
 
 async def run_lead(
@@ -363,6 +423,12 @@ async def run_lead(
     paths = sorted({*diff_paths(diff_text), *engineer.files_touched})
     critical = critical_hits(paths, checks.qa)
     new = await new_hits(gate, paths, engineer.new_dependencies)
+    nits = _nits_follow_up(
+        task.id,
+        [f for f in checks.review.findings if f.severity == "nit"]
+        if checks.review
+        else [],
+    )
 
     if require_invariant and not engineer.invariant.strip():
         decision = LeadDecision(
@@ -385,9 +451,21 @@ async def run_lead(
             outcome="approve",
             category="",
             findings_to_fix=(),
-            follow_ups=(),
+            follow_ups=nits,
             reason="fast lane: no critical or new changes, checks passed",
             summary=FAST_LANE_SUMMARY,
+            comments=(),
+            question="",
+            options=(),
+        )
+    elif _auto_approve_eligible(preflight, checks, critical, new, require_invariant):
+        decision = LeadDecision(
+            outcome="approve",
+            category="",
+            findings_to_fix=(),
+            follow_ups=nits,
+            reason=AUTO_APPROVE_REASON,
+            summary=checks.review.summary if checks.review else "",
             comments=(),
             question="",
             options=(),
@@ -426,10 +504,20 @@ async def run_lead(
             critical,
             new,
             cfg.thresholds.lead_min_confidence,
+            task_id=task.id,
         )
         if reply is None:
             decision = replace(decision, reason="lead unavailable")
-        _file_follow_ups(store, task, decision.follow_ups)
+
+    if decision.outcome == "approve":
+        _file_follow_ups(
+            store,
+            task,
+            [
+                *(f.title for f in decision.follow_ups),
+                *(f.title for f in engineer.follow_ups),
+            ],
+        )
 
     body = asdict(decision)
     body["findings_to_fix"] = [f.model_dump() for f in decision.findings_to_fix]

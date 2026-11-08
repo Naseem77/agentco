@@ -315,10 +315,28 @@ class _Run:
             else:
                 await self._escalate(
                     "stuck",
-                    f"round limit reached ({budgets.max_rounds})",
+                    f"round limit reached ({budgets.max_rounds})"
+                    + self._red_branch_note(),
                     options=_ROUND_OPTIONS,
                     stop="rounds",
                 )
+
+    def _red_branch_note(self) -> str:
+        """Tell the human when the branch they are handed is red."""
+        notes: list[str] = []
+        pre = self._latest(ArtifactKind.PREFLIGHT)
+        if pre is not None:
+            report = _report_from(pre.body)
+            failed = [check.name for check in report.failures()]
+            if report.conflict and "rebase" not in failed:
+                failed.insert(0, "rebase")
+            if failed:
+                notes.append("last pre-flight failed: " + ", ".join(failed))
+        qa = self._latest(ArtifactKind.QA)
+        if qa is not None and qa.id > _id(pre) and qa.body.get("passed") is False:
+            failures = len(qa.body.get("failures") or [])
+            notes.append(f"last QA failed: {failures} failure(s)")
+        return "".join(f"; {note}" for note in notes)
 
     async def _worktree(self) -> Worktree:
         base = self._meta("base")
