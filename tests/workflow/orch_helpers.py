@@ -55,6 +55,30 @@ QA_FAIL = json.dumps(
     }
 )
 LEAD_OK = json.dumps({"confidence": 0.9, "classifications": [], "summary": "ship it"})
+# A minor style finding keeps a clean round off the auto-approve path.
+REVIEW_STYLE = json.dumps(
+    {
+        "findings": [
+            {
+                "id": "s1",
+                "severity": "minor",
+                "kind": "style",
+                "title": "Long line",
+                "detail": "wrap it",
+            }
+        ],
+        "summary": "one style note",
+    }
+)
+LEAD_STYLE_OK = json.dumps(
+    {
+        "confidence": 0.9,
+        "classifications": [
+            {"finding_id": "s1", "category": "covered_style", "note": "fine"}
+        ],
+        "summary": "ship it",
+    }
+)
 
 
 def triage_json(route: str = "junior", size: str = "m") -> str:

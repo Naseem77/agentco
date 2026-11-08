@@ -10,6 +10,7 @@ from orch_helpers import (
     QA_FAIL,
     QA_OK,
     REVIEW_OK,
+    REVIEW_STYLE,
     RULES_OK,
     STUCK,
     CountingRuntime,
@@ -100,14 +101,14 @@ async def test_preflight_runs_before_review_and_cost_is_recorded(make_rig):
 
     roles = [c.role for c in rig.runtime.calls]
     assert roles[:4] == [Role.PM, Role.TRIAGE, Role.JUNIOR, Role.REVIEWER]
-    assert set(roles[4:6]) == {Role.REVIEWER, Role.QA} and roles[6:] == [
-        Role.LEAD,
-        Role.REVIEWER,
-    ]
+    # Clean checks are approved without a lead call.
+    assert set(roles[4:6]) == {Role.REVIEWER, Role.QA} and roles[6:] == [Role.REVIEWER]
     first_reviewer = rig.calls(Role.REVIEWER)[0]
     assert first_reviewer.system.startswith(load_prompt(Role.REVIEWER, "rules"))
-    assert len(roles) == 8
-    assert rig.task().cost_usd == pytest.approx(0.04 * 8)
+    assert len(roles) == 7
+    assert rig.task().cost_usd == pytest.approx(0.04 * 7)
+    lead = rig.store.latest_artifact(rig.task_id, ArtifactKind.LEAD)
+    assert lead is not None and lead.body["reason"] == "auto: clean checks, only nits"
 
 
 async def test_send_back_never_opens_pr_and_reruns_with_scoped_findings(make_rig):
@@ -477,6 +478,7 @@ async def test_preflight_rules_failure_fails_the_round_not_the_loop(make_rig, st
 )
 async def test_lead_failure_escalates_stuck(make_rig, steps):
     script = happy()
+    script[Role.REVIEWER] = [RULES_OK, REVIEW_STYLE, RULES_OK]
     script[Role.LEAD] = steps
     rig = await make_rig(script)
 

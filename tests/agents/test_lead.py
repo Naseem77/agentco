@@ -1,8 +1,8 @@
 import json
-from dataclasses import asdict
 from datetime import UTC, datetime
 
 import pytest
+from pydantic import TypeAdapter
 
 from agentco.agents.checks import CheckOutcome
 from agentco.agents.engineer import EngineerReply, FollowUp
@@ -114,7 +114,7 @@ def test_new_beats_send_back():
 def test_real_bug_sends_back_with_style_riding_along():
     d = decide(
         L(("a", "real_bug"), ("b", "covered_style")),
-        REVIEW(F("a"), F("b", "style", "nit")),
+        REVIEW(F("a"), F("b", "style", "minor")),
         QA_OK,
         (),
         [],
@@ -374,7 +374,15 @@ async def test_fast_lane_approves_without_llm(store, loop_cfg):
         outcome="approve",
         category="",
         findings_to_fix=(),
-        follow_ups=(),
+        follow_ups=(
+            Finding(
+                id="nits",
+                severity="nit",
+                kind="style",
+                title=f"Nits from task {env.task.id}",
+                detail="- [nit/style] n: n\n  d",
+            ),
+        ),
         reason="fast lane: no critical or new changes, checks passed",
         summary="fast lane: rule-based approval",
         comments=(),
@@ -384,13 +392,12 @@ async def test_fast_lane_approves_without_llm(store, loop_cfg):
     assert env.runtime.calls == []
     [artifact] = store.artifacts(env.task.id, ArtifactKind.LEAD)
     assert artifact.role is Role.LEAD
-    assert artifact.body == json.loads(json.dumps(asdict(d)))
+    assert artifact.body == TypeAdapter(LeadDecision).dump_python(d, mode="json")
 
 
 @pytest.mark.parametrize(
     "overrides",
     [
-        {"changed_lines": 61},
         {"checks": CheckOutcome(REVIEW(F("a", sev="minor")), QA_OK, ())},
         {"checks": CheckOutcome(REVIEW(), QA_FAIL, ())},
         {"checks": CheckOutcome(None, QA_OK, ("review: X: y",))},
@@ -405,6 +412,15 @@ async def test_fast_lane_still_calls_llm_when_a_condition_fails(
     await env.run(fast_lane=True, **overrides)
 
     assert len(env.runtime.calls) == 1
+
+
+async def test_fast_lane_over_size_limit_still_auto_approves(store, loop_cfg):
+    env = Env(store, loop_cfg, [], await gate_with("src/calc.py arithmetic"))
+
+    d = await env.run(fast_lane=True, changed_lines=61)
+
+    assert env.runtime.calls == []
+    assert (d.outcome, d.reason) == ("approve", "auto: clean checks, only nits")
 
 
 async def test_fast_lane_with_new_dependency_calls_llm(store, loop_cfg):
@@ -628,11 +644,12 @@ async def test_threshold_comes_from_config(store, loop_cfg):
     env = Env(
         store,
         loop_cfg,
-        [lead_json(conf=0.6)],
+        [lead_json(("e", "edge_case"), conf=0.6)],
         await gate_with("src/calc.py arithmetic"),
     )
+    review = REVIEW(F("e", "edge_case", "minor"))
 
-    d = await env.run()
+    d = await env.run(checks=CheckOutcome(review, QA_OK, ()))
 
     assert (d.outcome, d.category) == ("escalate", "not_confident")
 
@@ -725,7 +742,7 @@ async def test_lead_failure_without_hits_still_raises(store, loop_cfg):
     env = Env(store, loop_cfg, ["not json"] * 3, await gate_with("src/calc.py x"))
 
     with pytest.raises(ReplyInvalid):
-        await env.run()
+        await env.run(checks=CheckOutcome(REVIEW(F("a", sev="minor")), QA_OK, ()))
 
 
 def test_qa_failed_without_details_gets_a_synthetic_finding():
@@ -799,7 +816,7 @@ async def test_root_cause_turns_the_fast_lane_off(store, loop_cfg):
 async def test_lead_prompt_is_unchanged_without_root_cause(store, loop_cfg):
     env = Env(store, loop_cfg, [lead_json()], await gate_with("src/calc.py arithmetic"))
 
-    await env.run()
+    await env.run(checks=CheckOutcome(REVIEW(F("a", sev="minor")), QA_OK, ()))
 
     assert "Root cause required" not in env.runtime.calls[0].prompt
 
@@ -891,3 +908,99 @@ async def test_review_parent_human_note_in_prompt(store, loop_cfg):
 async def test_review_parent_rejects_out_of_range_confidence(store, loop_cfg):
     with pytest.raises(ReplyInvalid):
         await _review_parent(store, loop_cfg, parent_reply(confidence=1.5), repeat=2)
+
+
+def test_nits_never_sent_back():
+    nits = (F("n1", "style", "nit"), F("n2", "bug", "nit", path="src/calc.py"))
+    d = decide(
+        L(("a", "real_bug"), ("n1", "real_bug"), ("n2", "covered_style")),
+        REVIEW(F("a"), *nits),
+        QA_OK,
+        (),
+        [],
+        [],
+        0.7,
+        task_id=7,
+    )
+
+    assert d.outcome == "send_back"
+    assert ids(d.findings_to_fix) == ["a"]
+    assert d.reason == "real bugs: a"
+    assert d.follow_ups == ()
+
+
+def test_only_nits_approve_and_become_one_follow_up():
+    nits = (F("n1", "style", "nit"), F("n2", "bug", "nit", path="src/calc.py"))
+    d = decide(L(("n1", "real_bug")), REVIEW(*nits), QA_OK, (), [], [], 0.7, task_id=7)
+
+    assert (d.outcome, d.findings_to_fix) == ("approve", ())
+    [bundle] = d.follow_ups
+    assert bundle.title == "Nits from task 7"
+    assert bundle.severity == "nit"
+    assert "n1" in bundle.detail and "n2 src/calc.py" in bundle.detail
+
+
+async def test_auto_approve_without_llm(store, loop_cfg):
+    env = Env(store, loop_cfg, [], await gate_with("src/calc.py arithmetic"))
+    review = ReviewReply(findings=[F("n", "style", "nit")], summary="tidy change")
+
+    d = await env.run(checks=CheckOutcome(review, QA_OK, ()), changed_lines=500)
+
+    assert env.runtime.calls == []
+    assert (d.outcome, d.reason, d.summary) == (
+        "approve",
+        "auto: clean checks, only nits",
+        "tidy change",
+    )
+    assert [f.title for f in d.follow_ups] == [f"Nits from task {env.task.id}"]
+    assert followups(store, env) == [f"Nits from task {env.task.id}", "later"]
+    [artifact] = store.artifacts(env.task.id, ArtifactKind.LEAD)
+    assert artifact.body["reason"] == "auto: clean checks, only nits"
+
+
+QA_NO_TESTS = QA_OK.model_copy(update={"tests_run": []})
+PREFLIGHT_FAILED = PreflightReport(
+    ok=False, checks=(CheckResult("tests", False, "1 failed"),), conflict=False
+)
+
+
+@pytest.mark.parametrize(
+    "overrides",
+    [
+        pytest.param(
+            {"checks": CheckOutcome(REVIEW(F("a", sev="minor")), QA_OK, ())},
+            id="minor-finding",
+        ),
+        pytest.param({"checks": CheckOutcome(REVIEW(), QA_FAIL, ())}, id="qa-failed"),
+        pytest.param({"checks": CheckOutcome(REVIEW(), None, ())}, id="qa-missing"),
+        pytest.param(
+            {"checks": CheckOutcome(REVIEW(), QA_NO_TESTS, ())}, id="qa-no-tests-run"
+        ),
+        pytest.param(
+            {"checks": CheckOutcome(REVIEW(), QA_OK, ("qa: Timeout: slow",))},
+            id="check-error",
+        ),
+        pytest.param({"checks": CheckOutcome(None, QA_OK, ())}, id="review-missing"),
+        pytest.param(
+            {"diff_text": DIFF.replace("src/calc.py", "src/auth.py")},
+            id="critical-path",
+        ),
+        pytest.param(
+            {
+                "engineer": ENGINEER.model_copy(
+                    update={"new_dependencies": ["left-pad"]}
+                )
+            },
+            id="new-dependency",
+        ),
+        pytest.param({"require_invariant": True}, id="require-invariant"),
+        pytest.param({"preflight": PREFLIGHT_FAILED}, id="preflight-not-ok"),
+    ],
+)
+async def test_auto_approve_blocked_by(store, loop_cfg, overrides):
+    env = Env(store, loop_cfg, [lead_json()], await gate_with("src/calc.py arithmetic"))
+
+    d = await env.run(**overrides)
+
+    assert len(env.runtime.calls) == 1
+    assert d.reason != "auto: clean checks, only nits"
