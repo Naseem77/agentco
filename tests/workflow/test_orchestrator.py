@@ -28,6 +28,7 @@ from agentco.llm.runtime import AgentResult
 from agentco.memory.backend import MemoryItem
 from agentco.memory.scopes import Scope
 from agentco.roles import Role
+from agentco.sandbox.affected import AffectedTests
 from agentco.sandbox.runner import CommandResult
 from agentco.store.models import ArtifactKind
 from agentco.workflow.orchestrator import StepFailed, run_many
@@ -584,6 +585,32 @@ def approve_after_main_moved(repo: list[Path], n: int):
         return LEAD_OK
 
     return step
+
+
+async def test_final_preflight_only_runs_full_suite_when_unchanged(
+    make_rig, monkeypatch
+):
+    async def subset(repo, wt, base):
+        return AffectedTests(("tests/test_add.py",), False, "graph")
+
+    monkeypatch.setattr("agentco.workflow.preflight.affected_tests", subset)
+    runner = ScriptRunner(codes={RED_CMD: 1})
+    before_approval: list[str] = []
+
+    def approve(call):
+        before_approval.extend(runner.calls)
+        return LEAD_OK
+
+    script = happy() | {Role.LEAD: [approve]}
+    rig = await make_rig(script, runner=runner)
+
+    task = await rig.run()
+
+    assert task.state is TaskState.PR_OPEN
+    assert "pytest tests/test_add.py" in before_approval  # the round ran a subset
+    assert runner.calls[len(before_approval) :] == [FULL]
+    roles = [c.role for c in rig.runtime.calls]
+    assert roles[-1] is Role.LEAD  # no rules call after the approval
 
 
 async def test_final_preflight_failure_sends_the_round_back_without_a_push(make_rig):
