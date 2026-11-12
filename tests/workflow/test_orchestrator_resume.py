@@ -31,7 +31,7 @@ def critical_script(rounds: int = 1) -> dict:
             engineer(
                 i,
                 files={
-                    "src/auth.py": AUTH + f"# v{i}\n",
+                    "src/auth.py": AUTH + f"VERSION = {i}\n",
                     "tests/test_new.py": NEW_TEST,
                 },
             )

@@ -105,6 +105,50 @@ def _inside_functions(spans: list[tuple[int, int]], hunk: tuple[int, int]) -> bo
     return any(start <= hunk[0] and hunk[1] <= end for start, end in spans)
 
 
+def _is_code(line: str) -> bool:
+    text = line.strip()
+    return bool(text) and not text.startswith("#")
+
+
+def _module_code_changed(
+    wt: Worktree, base: str, path: str, spans: list[tuple[int, int]]
+) -> bool:
+    """True when a hunk adds or removes code outside every function.
+
+    Blank lines and comments between functions are not code under test.
+    """
+    out = _git(wt.path, *_DIFF, "--no-renames", "-U0", f"{base}...HEAD", "--", path)
+    start = count = 0
+    added: list[str] = []
+    removed: list[str] = []
+
+    def outside() -> bool:
+        end = start if count == 0 else start + count - 1
+        for i, line in enumerate(added):
+            if _is_code(line) and not _inside_functions(spans, (start + i, start + i)):
+                return True
+        return any(map(_is_code, removed)) and not _inside_functions(
+            spans, (start, end)
+        )
+
+    in_hunk = False
+    for line in out.splitlines():
+        if line.startswith("@@"):
+            if in_hunk and outside():
+                return True
+            match = _HUNK.match(line)
+            if match is None:
+                return True
+            start = int(match.group(1))
+            count = 1 if match.group(2) is None else int(match.group(2))
+            added, removed, in_hunk = [], [], True
+        elif in_hunk and line.startswith("+"):
+            added.append(line[1:])
+        elif in_hunk and line.startswith("-"):
+            removed.append(line[1:])
+    return in_hunk and outside()
+
+
 def _removed_symbols(
     wt: Worktree, merge_base: str, path: str, head: list[Symbol]
 ) -> list[str]:
@@ -218,8 +262,12 @@ async def affected_tests(
         spans = _function_spans(symbols.get(path, []))
         # a test file is run itself, so its module-level code is not code under test;
         # elsewhere an import or constant may reach any function of the module
-        whole_module = not _is_test_name(path) and any(
-            not _inside_functions(spans, hunk) for hunk in file_ranges
+        whole_module = (
+            not _is_test_name(path)
+            and any(not _inside_functions(spans, hunk) for hunk in file_ranges)
+            and await asyncio.to_thread(
+                _module_code_changed, wt, merge_base, path, spans
+            )
         )
         if whole_module:
             by_import.add(path)

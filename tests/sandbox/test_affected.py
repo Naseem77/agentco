@@ -162,6 +162,34 @@ async def test_module_level_change_selects_tests_of_every_function_in_the_module
     assert (got.paths, got.full) == (("tests/test_add.py", "tests/test_mul.py"), False)
 
 
+async def test_new_function_with_blank_separators_is_not_a_module_level_change(
+    make_repo,
+):
+    root = make_repo(FILES)
+    wt = create_worktree(root, 1, "main")
+    edit(
+        wt.path / "src/calc.py",
+        "    return a + b\n\n",
+        "    return a + b\n\n\n# subtraction\ndef sub(a, b):\n    return a - b\n\n",
+    )
+    (wt.path / "tests/test_sub.py").write_text(
+        "from src.calc import sub\n\ndef test_sub():\n    assert sub(3, 1) == 2\n"
+    )
+    commit_all(wt, "x")
+    got = await affected_tests("acme/app", wt, "main")
+    assert (got.paths, got.full) == (("tests/test_sub.py",), False)
+
+
+async def test_deleted_module_constant_is_a_module_level_change(make_repo):
+    files = {**FILES, "src/calc.py": "RATE = 1\n\n" + FILES["src/calc.py"]}
+    root = make_repo(files)
+    wt = create_worktree(root, 1, "main")
+    edit(wt.path / "src/calc.py", "RATE = 1\n", "")
+    commit_all(wt, "x")
+    got = await affected_tests("acme/app", wt, "main")
+    assert (got.paths, got.full) == (("tests/test_add.py", "tests/test_mul.py"), False)
+
+
 async def test_docs_change_alongside_code_change_is_not_full(make_repo):
     files = {**FILES, "README.md": "# app\n", "docs/guide.rst": "Guide\n"}
     root = make_repo(files)
