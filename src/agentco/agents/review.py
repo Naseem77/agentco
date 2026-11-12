@@ -68,3 +68,57 @@ async def run_review(
         timeout_s=cfg.loop.agent_timeout_s,
     )
     return await asker.ask(call, ReviewReply)
+
+
+def fast_review_input(
+    issue: PMReply,
+    diff_text: str,
+    *,
+    impact: str,
+    lessons: list[str],
+    prior: list[Finding],
+) -> str:
+    sections = [issue_text(issue)]
+    if lessons:
+        listed = "\n".join(f"- {lesson}" for lesson in lessons)
+        sections.append(f"Review lessons from past PR comments:\n{listed}")
+    if prior:
+        lines = "\n".join(finding_line(f) for f in prior)
+        sections.append(
+            "Earlier findings the engineer was asked to fix. Verify each is fixed; "
+            f"report any that is not again with the same id:\n{lines}"
+        )
+    if impact:
+        sections.append(impact)
+    sections.append(f"Whole diff against the base branch:\n{diff_text}")
+    return "\n\n".join(sections)
+
+
+async def run_fast_review(
+    asker: Asker,
+    cfg: TenantConfig,
+    gate: MemoryGate,
+    wt: Worktree,
+    base: str,
+    issue: PMReply,
+    *,
+    impact: str,
+    lessons: list[str],
+    prior: list[Finding],
+) -> ReviewReply:
+    """Fast mode: one review of the whole diff that reports every finding at once."""
+    diff_text = await asyncio.to_thread(diff, wt, base)
+    call = AgentCall(
+        role=Role.REVIEWER,
+        model=role_model(cfg, Role.REVIEWER).model,
+        system=load_prompt(Role.REVIEWER, "fast"),
+        prompt=fast_review_input(
+            issue, diff_text, impact=impact, lessons=lessons, prior=prior
+        ),
+        workdir=wt.path,
+        edits=False,
+        tools=memory_tools(gate.for_role(Role.REVIEWER)),
+        max_turns=cfg.loop.agent_max_turns,
+        timeout_s=cfg.loop.agent_timeout_s,
+    )
+    return await asker.ask(call, ReviewReply)

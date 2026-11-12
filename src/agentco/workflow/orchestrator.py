@@ -11,7 +11,7 @@ import asyncio
 import json
 import weakref
 from collections.abc import Sequence
-from dataclasses import dataclass, field
+from dataclasses import asdict, dataclass, field
 from pathlib import Path
 
 from pydantic import TypeAdapter
@@ -22,6 +22,7 @@ from agentco.agents.engineer import (
     EngineerBrief,
     EngineerFailed,
     EngineerReply,
+    review_rules,
     run_engineer,
 )
 from agentco.agents.lead import ChildSummary, LeadDecision, review_parent, run_lead
@@ -29,8 +30,9 @@ from agentco.agents.models import role_model
 from agentco.agents.pm import run_pm
 from agentco.agents.qa import QAReply, run_qa
 from agentco.agents.replies import Finding, PMReply
-from agentco.agents.review import ReviewReply, run_review
+from agentco.agents.review import ReviewReply, run_fast_review, run_review
 from agentco.agents.triage import run_triage
+from agentco.code.impact import impact_report
 from agentco.config import Budgets, TenantConfig
 from agentco.github.client import GitHubWriter
 from agentco.github.errors import GitHubError
@@ -63,6 +65,7 @@ from agentco.sandbox.worktree import (
 from agentco.store.models import Artifact, ArtifactKind, TaskRecord
 from agentco.store.task_store import TaskStore
 from agentco.workflow.escalation import effective_budgets, write_escalation
+from agentco.workflow.fast import fast_lead, issue_from_request
 from agentco.workflow.onboard import ONBOARD_SOURCE
 from agentco.workflow.pr import pr_body, pr_title
 from agentco.workflow.preflight import CheckResult, Preflight, PreflightReport
@@ -443,9 +446,20 @@ class _Run:
             raise StepFailed(_S.INTAKE, "sub-task has no request yet; run its parent")
         self._go(_S.PM, Role.PM, "intake")
 
+    @property
+    def _fast(self) -> bool:
+        return self.ctx.cfg.loop.pipeline == "fast"
+
     async def _pm(self, task: TaskRecord) -> None:
         request = self._latest(ArtifactKind.REQUEST)
         text = str(request.body.get("body", "")) if request else ""
+        if self._fast:
+            issue = issue_from_request(task.title, text)
+            self.store.put_artifact(
+                self.task_id, ArtifactKind.ISSUE, Role.PM, issue.model_dump()
+            )
+            self._go(_S.TRIAGE, Role.PM, "fast pipeline: issue taken as written")
+            return
         try:
             await run_pm(
                 self.asker,
@@ -481,6 +495,12 @@ class _Run:
 
     async def _triage(self, task: TaskRecord) -> None:
         if await self._escalate_if_over_budget(task):
+            return
+        if self._fast:
+            if task.assignee is not Role.SENIOR:
+                self.store.assign(self.task_id, Role.SENIOR)
+            self._set("fast_lane", "0")
+            self._go(_S.ENGINEERING, Role.TRIAGE, "fast pipeline: senior engineer")
             return
         try:
             decision = await run_triage(
@@ -721,6 +741,8 @@ class _Run:
             human_note=human_note,
             untrusted_finding_ids=untrusted,
             playbooks=tuple(triage.body.get("playbooks") or ()) if triage else (),
+            impact=(self._meta("impact") or "") if self._fast else "",
+            pre_pr=self._fast,
             tests_precommitted=(
                 task.source == FOLLOWUP_SOURCE
                 and task.round == 0
@@ -756,7 +778,10 @@ class _Run:
             else:
                 await self._escalate("stuck", exc.reason, actor=role)
             return
-        self._go(_S.PREFLIGHT, role, "engineer committed")
+        if self._fast:
+            self._go(_S.INTERNAL_REVIEW, role, "engineer committed")
+        else:
+            self._go(_S.PREFLIGHT, role, "engineer committed")
 
     async def _seed_qa_tests(self, task: TaskRecord, wt: Worktree, role: Role) -> bool:
         """Commit QA's tests into the follow-up task's branch, once, before the engineer."""
@@ -851,6 +876,9 @@ class _Run:
             self._go(_S.ENGINEERING, role, "pre-flight failed: fix and retry")
 
     async def _review(self, task: TaskRecord) -> None:
+        if self._fast:
+            await self._fast_review(task)
+            return
         wt = await self._worktree()
         base = self._meta("base") or wt.base
         issue = self._issue()
@@ -897,6 +925,47 @@ class _Run:
         self._go(_S.LEAD_DECISION, Role.LEAD, "checks done")
         self._set("fix_since", await asyncio.to_thread(head_sha, wt))
 
+    async def _fast_review(self, task: TaskRecord) -> None:
+        """One whole-diff review with the live impact report and past review lessons."""
+        wt = await self._worktree()
+        base = self._meta("base") or wt.base
+        impact = await impact_report(self.ctx.repo, wt, base)
+        self._set("impact", impact)
+        prior = [
+            Finding(**f) for f in json.loads(self._meta("findings_addressed") or "[]")
+        ]
+        lessons = await review_rules(self.ctx.gate, Role.REVIEWER, task)
+        try:
+            reply = await run_fast_review(
+                self.asker,
+                self.ctx.cfg,
+                self.ctx.gate,
+                wt,
+                base,
+                self._issue(),
+                impact=impact,
+                lessons=list(lessons),
+                prior=prior,
+            )
+            body = reply.model_dump()
+        except (ReplyInvalid, AgentStuck) as exc:
+            body = {"error": f"review: {_agent_error(exc)}"}
+        self.store.put_artifact(self.task_id, ArtifactKind.REVIEW, Role.REVIEWER, body)
+        self._go(_S.LEAD_DECISION, Role.LEAD, "pre-PR review done")
+
+    def _fast_decision(self) -> LeadDecision:
+        artifact = self._latest(ArtifactKind.REVIEW)
+        if artifact is None or "error" in artifact.body:
+            error = artifact.body["error"] if artifact else "review: missing"
+            decision = fast_lead(None, error)
+        else:
+            decision = fast_lead(ReviewReply.model_validate(artifact.body), None)
+        body = asdict(decision)
+        body["findings_to_fix"] = [f.model_dump() for f in decision.findings_to_fix]
+        body["follow_ups"] = [f.model_dump() for f in decision.follow_ups]
+        self.store.put_artifact(self.task_id, ArtifactKind.LEAD, Role.LEAD, body)
+        return decision
+
     def _checks(self) -> CheckOutcome:
         errors: list[str] = []
         parsed: dict[ArtifactKind, ReviewReply | QAReply | None] = {}
@@ -934,10 +1003,33 @@ class _Run:
         wt = await self._worktree()
         base = self._meta("base") or wt.base
         pre = self._latest(ArtifactKind.PREFLIGHT)
-        if pre is None:
+        if self._fast:
+            decision = self._fast_decision()
+        elif pre is None:
             raise StepFailed(_S.LEAD_DECISION, "no pre-flight artifact")
+        else:
+            decision = await self._company_lead(task, wt, base, pre)
+            if decision is None:
+                return
+        if decision.outcome == "approve":
+            await self._open_pr()
+        elif decision.outcome == "send_back":
+            self._go(_S.TRIAGE, Role.LEAD, decision.reason)
+            await self._stop_rules()
+        else:
+            await self._escalate(
+                decision.category,
+                decision.reason,
+                options=decision.options,
+                question=decision.question,
+                open_pr=True,
+            )
+
+    async def _company_lead(
+        self, task: TaskRecord, wt: Worktree, base: str, pre: Artifact
+    ) -> LeadDecision | None:
         try:
-            decision = await run_lead(
+            return await run_lead(
                 self.asker,
                 self.ctx.cfg,
                 self.ctx.gate,
@@ -954,20 +1046,7 @@ class _Run:
             )
         except (ReplyInvalid, AgentStuck) as exc:
             await self._escalate("stuck", f"lead failed: {_agent_error(exc)}")
-            return
-        if decision.outcome == "approve":
-            await self._open_pr()
-        elif decision.outcome == "send_back":
-            self._go(_S.TRIAGE, Role.LEAD, decision.reason)
-            await self._stop_rules()
-        else:
-            await self._escalate(
-                decision.category,
-                decision.reason,
-                options=decision.options,
-                question=decision.question,
-                open_pr=True,
-            )
+            return None
 
     async def _open_pr(self) -> None:
         """Push and open (or update) the PR. Only reached from an approval."""

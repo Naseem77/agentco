@@ -6,7 +6,12 @@ import pytest
 
 from agentco.agents.prompts import load_prompt
 from agentco.agents.replies import Finding, PMReply
-from agentco.agents.review import ReviewReply, review_input, run_review
+from agentco.agents.review import (
+    ReviewReply,
+    review_input,
+    run_fast_review,
+    run_review,
+)
 from agentco.llm.copilot import permission_allowed
 from agentco.llm.fake import FakeRuntime
 from agentco.llm.replies import Asker
@@ -162,10 +167,39 @@ async def test_review_call_is_read_only_with_worktree(
     assert permission_allowed("write", call, path="a.py")[0] is False
 
 
-@pytest.mark.parametrize("variant", [None, "light"])
+@pytest.mark.parametrize("variant", [None, "light", "fast"])
 def test_reviewer_prompts_say_verify_in_the_code(variant):
     text = load_prompt(Role.REVIEWER, variant)
     assert (
         "You can read any file in the repository to confirm a finding before you "
         "report it; report only findings you verified in the code."
     ) in text
+
+
+async def test_fast_review_sees_whole_diff_impact_lessons_and_prior(
+    make_repo, store, loop_cfg
+):
+    env = Env(make_repo, store, loop_cfg, [REPLY])
+    env.commit("x = 2\n")
+    env.commit("x = 3\n")
+
+    result = await run_fast_review(
+        env.asker,
+        env.cfg,
+        env.gate,
+        env.wt,
+        "main",
+        ISSUE,
+        impact="Impact of the diff: a.py::f callers b.py::g",
+        lessons=["Close temp files on error"],
+        prior=[FINDING],
+    )
+
+    assert result == ReviewReply(findings=[FINDING], summary="one bug")
+    [call] = env.runtime.calls
+    assert call.system.startswith(load_prompt(Role.REVIEWER, "fast"))
+    assert "-x = 1\n+x = 3\n" in call.prompt
+    assert "a.py::f callers b.py::g" in call.prompt
+    assert "- Close temp files on error" in call.prompt
+    assert "F1" in call.prompt and "Tab dropped" in call.prompt
+    assert call.edits is False

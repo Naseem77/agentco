@@ -38,6 +38,10 @@ class EngineerBrief:
     """Findings quoted from PR comments or checks: rendered as fenced data."""
     tests_precommitted: bool = False
     playbooks: tuple[str, ...] = ()
+    impact: str = ""
+    """Callers and tests the current diff touches, from the live code graph."""
+    pre_pr: bool = False
+    """Fast mode: a whole-diff reviewer acting like CodeRabbit / Copilot comes next."""
 
 
 class FollowUp(BaseModel):
@@ -86,6 +90,16 @@ def _untrusted_lines(finding: Finding) -> str:
 
 
 MAX_REVIEW_RULES = 15
+_PRE_PR = (
+    "## Get it right the first time\n"
+    "Next, a reviewer that acts like CodeRabbit and GitHub Copilot reviews your whole "
+    "diff, and the PR opens only when it finds nothing blocking. Before you finish, "
+    "check what they flag: every acceptance criterion; empty / None / huge input; "
+    "error paths and cleanup of partial work; races and atomic writes (temp files "
+    "beside the target); closed files and processes; cross-platform paths; tests "
+    "that fail without your change; docs and config examples for changed behaviour; "
+    "every caller of a function you change."
+)
 
 
 def _prompt(
@@ -118,6 +132,10 @@ def _prompt(
             "Fix exactly these findings and nothing else; keep the fix small.\n"
             + findings
         )
+    if brief.impact:
+        sections.append(
+            brief.impact + "\nCheck every caller listed still works with your change."
+        )
     if brief.preflight_failures:
         failures = "\n".join(f"- {failure}" for failure in brief.preflight_failures)
         sections.append(f"Pre-flight failures to make pass:\n{failures}")
@@ -128,6 +146,8 @@ def _prompt(
         )
     if brief.human_note:
         sections.append(f"Note from the human: {brief.human_note}")
+    if brief.pre_pr:
+        sections.append(_PRE_PR)
     if rules:
         listed = "\n".join(f"- {rule}" for rule in rules)
         sections.append(f"## Review rules the reviewer will apply\n{listed}")
@@ -149,7 +169,7 @@ def _prefixes(contract: RepoContract) -> tuple[str, ...]:
     return (contract.test_files.split("{files}")[0],) if contract.test_files else ()
 
 
-async def _review_rules(
+async def review_rules(
     gate: MemoryGate, role: Role, task: TaskRecord
 ) -> tuple[str, ...]:
     facts = await gate.for_role(role).search(
@@ -186,7 +206,7 @@ async def run_engineer(
     contract: RepoContract,
     brief: EngineerBrief,
 ) -> EngineerReply:
-    rules = await _review_rules(gate, role, task)
+    rules = await review_rules(gate, role, task)
     call = AgentCall(
         role=role,
         model=role_model(cfg, role).model,

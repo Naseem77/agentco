@@ -392,6 +392,9 @@ class Preflight:
         stamp: tuple[str, str],
         lead_comments: list[str],
     ) -> CheckResult:
+        if self.limits.pipeline == "fast":
+            # the pre-PR reviewer already applied the review rules
+            return CheckResult("rules", True, "skipped: fast pipeline")
         files = await asyncio.to_thread(changed_files, wt, base)
         rules: dict[str, None] = {}
         for path in files:
