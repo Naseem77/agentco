@@ -2,8 +2,11 @@
 
 The graph is a fresh per-task in-memory overlay built from the worktree's
 committed HEAD; the shared `rnd` graph is keyed to main and is never written
-for a task branch. Whenever the selection is unsure, the answer is the full
-suite.
+for a task branch. Where the call graph cannot trace a change (module-level
+code, a function name it cannot tell apart), the tests that import the changed
+module run; when the selection is still unsure, the answer is the full suite.
+Prose files (Markdown, reStructuredText, AsciiDoc) select no tests. The final
+pre-flight before a PR always runs the full suite.
 """
 
 import asyncio
@@ -25,6 +28,8 @@ _TEST_NAME = re.compile(
     r"test_.*\.py|.*_test\.py|.*_test\.go|.*\.(?:test|spec)\.(?:ts|tsx|js|jsx)",
     re.DOTALL,
 )
+# prose no test reads; .txt is left out because it may be requirements.txt
+_DOC_SUFFIXES = (".md", ".rst", ".adoc")
 _HUNK = re.compile(r"@@ -\d+(?:,\d+)? \+(\d+)(?:,(\d+))? @@")
 _OVERLAY_TENANT = "overlay"
 
@@ -117,6 +122,48 @@ def _removed_symbols(
     return [s.qualname for s in gone]
 
 
+def _module_names(path: str) -> list[str]:
+    """Dotted names `path` can be imported as, with and without a `src.` root."""
+    parts = path.removesuffix(".py").split("/")
+    if parts[-1] == "__init__":
+        parts = parts[:-1]
+    names = [".".join(parts)]
+    if parts[0] == "src" and len(parts) > 1:
+        names.append(".".join(parts[1:]))
+    return names
+
+
+def _imports_module(text: str, module: str) -> bool:
+    if re.search(rf"(?<![\w.]){re.escape(module)}(?![\w])", text):
+        return True
+    if "." not in module:
+        return False
+    package, name = module.rsplit(".", 1)
+    for match in re.finditer(
+        rf"^\s*from\s+{re.escape(package)}\s+import\s+(\([^)]*\)|[^\n]*)",
+        text,
+        re.MULTILINE,
+    ):
+        if re.search(rf"\b{re.escape(name)}\b", match.group(1)):
+            return True
+    return False
+
+
+def _tests_importing(wt: Worktree, path: str, test_files: list[str]) -> set[str]:
+    if not path.endswith(".py"):
+        return set()
+    names = _module_names(path)
+    found: set[str] = set()
+    for test in test_files:
+        try:
+            text = (wt.path / test).read_text(encoding="utf-8")
+        except (OSError, UnicodeDecodeError):
+            continue
+        if any(_imports_module(text, name) for name in names):
+            found.add(test)
+    return found
+
+
 def _overlaps(symbol: Symbol, hunk: tuple[int, int]) -> bool:
     return symbol.start_line <= hunk[1] and hunk[0] <= symbol.end_line
 
@@ -153,22 +200,29 @@ async def affected_tests(
 
     tests: set[str] = set()
     seeds: set[tuple[str, str]] = set()
+    # source files the graph cannot fully trace: run the tests that import them
+    by_import: set[str] = set()
     for path in sorted(files):
         if is_test_path(path):
             if not _is_test_name(path):
                 return _full(f"{path} is test support, not a test file")
             if (wt.path / path).is_file():  # a deleted test has nothing to run
                 tests.add(path)
+        elif path.lower().endswith(_DOC_SUFFIXES):
+            continue
         elif not symbols.get(path):
             return _full(f"{path} has no symbols in the code graph")
         elif path not in ranges:
             return _full(f"{path} changed without a line range")
         file_ranges = ranges.get(path, [])
         spans = _function_spans(symbols.get(path, []))
-        for hunk in file_ranges:
-            # a test file is run itself, so its module-level code is not code under test
-            if not _is_test_name(path) and not _inside_functions(spans, hunk):
-                return _full(f"{path}:{hunk[0]} changes code outside any function")
+        # a test file is run itself, so its module-level code is not code under test;
+        # elsewhere an import or constant may reach any function of the module
+        whole_module = not _is_test_name(path) and any(
+            not _inside_functions(spans, hunk) for hunk in file_ranges
+        )
+        if whole_module:
+            by_import.add(path)
         if (wt.path / path).is_file():
             removed = await asyncio.to_thread(
                 _removed_symbols, wt, merge_base, path, symbols.get(path, [])
@@ -176,15 +230,17 @@ async def affected_tests(
             if removed:
                 return _full(f"{path} removes or renames {removed[0]}")
         for symbol in symbols.get(path, []):
-            if symbol.kind != "Function" or not any(
-                _overlaps(symbol, h) for h in file_ranges
+            if symbol.kind != "Function" or not (
+                whole_module or any(_overlaps(symbol, h) for h in file_ranges)
             ):
                 continue
             name = symbol.qualname.rsplit(".", 1)[-1]
             if name_count[name] > 1 and not (
                 is_test_path(path) and name.startswith("test")
             ):
-                return _full(f"function name {name} is ambiguous in the code graph")
+                if not _is_test_name(path):  # a test file already runs itself
+                    by_import.add(path)  # its call edges cannot be told apart by name
+                continue
             seeds.add((path, symbol.qualname))
 
     callers: dict[tuple[str, str], list[tuple[str, str]]] = defaultdict(list)
@@ -196,6 +252,14 @@ async def affected_tests(
         frontier = {c for node in frontier for c in callers[node]} - seen
         seen |= frontier
     tests |= {path for path, _ in seen if is_test_path(path) and _is_test_name(path)}
+    if by_import:
+        listed = await asyncio.to_thread(_git, wt.path, "ls-files")
+        test_files = [p for p in listed.splitlines() if _is_test_name(p)]
+        for path in sorted(by_import):
+            importing = await asyncio.to_thread(_tests_importing, wt, path, test_files)
+            if not importing:
+                return _full(f"no test imports {path}, which the graph cannot trace")
+            tests |= importing
 
     if not tests:
         return _full("no test file reaches the changed code")

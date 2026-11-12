@@ -164,10 +164,10 @@ def _prompt(
     return "\n\n".join(sections)
 
 
-def commands_section(contract: RepoContract) -> str:
+def commands_section(contract: RepoContract, *, full_suite: bool = True) -> str:
     """The commands an agent may run, as the permission gate matches them."""
     allowed = [
-        *contract_commands(contract),
+        *contract_commands(contract, full_suite=full_suite),
         *(f"{p}<test files>" for p in test_file_prefixes(contract)),
     ]
     if not allowed:
@@ -179,10 +179,14 @@ def commands_section(contract: RepoContract) -> str:
     )
 
 
-def contract_commands(contract: RepoContract) -> tuple[str, ...]:
+def contract_commands(
+    contract: RepoContract, *, full_suite: bool = True
+) -> tuple[str, ...]:
+    """Without `full_suite`, the whole test suite is left out when targeted
+    test files can be run instead."""
     commands = (
         contract.build,
-        contract.test,
+        contract.test if full_suite or not contract.test_files else None,
         contract.lint,
         contract.format,
         contract.e2e,

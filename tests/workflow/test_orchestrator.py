@@ -20,7 +20,16 @@ from orch_helpers import (
     issue_of,
     triage_json,
 )
-from script_runner import FIXED, FULL, LINT, NEW_TEST, RED_CMD, ScriptRunner, git
+from script_runner import (
+    FIXED,
+    FULL,
+    LINT,
+    NEW_TEST,
+    RED_CMD,
+    TESTS_CMD,
+    ScriptRunner,
+    git,
+)
 
 from agentco.agents.prompts import load_prompt
 from agentco.github.client import FakeGitHub
@@ -280,7 +289,7 @@ async def test_round_limit_escalation_reports_red_branch(make_rig):
     rig = await make_rig(
         script,
         max_rounds=1,
-        runner=ScriptRunner(codes={RED_CMD: 1, LINT: 1, FULL: 1}),
+        runner=ScriptRunner(codes={RED_CMD: 1, LINT: 1, TESTS_CMD: 1}),
     )
 
     task = await rig.run()

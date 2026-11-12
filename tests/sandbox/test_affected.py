@@ -145,20 +145,70 @@ async def test_no_changes_means_full_suite(make_repo):
     assert (got.paths, got.full) == ((), True)
 
 
-async def test_module_level_change_is_full(make_repo):
-    files = {**FILES, "src/calc.py": "RATE = 1\n\n" + FILES["src/calc.py"]}
+async def test_module_level_change_selects_tests_of_every_function_in_the_module(
+    make_repo,
+):
+    files = {
+        **FILES,
+        "src/calc.py": "RATE = 1\n\n" + FILES["src/calc.py"],
+        "src/other.py": "def neg(a):\n    return -a\n",
+        "tests/test_neg.py": "def test_neg():\n    assert neg(1) == -1\n",
+    }
     root = make_repo(files)
     wt = create_worktree(root, 1, "main")
     edit(wt.path / "src/calc.py", "RATE = 1", "RATE = 2")
     commit_all(wt, "x")
     got = await affected_tests("acme/app", wt, "main")
+    assert (got.paths, got.full) == (("tests/test_add.py", "tests/test_mul.py"), False)
+
+
+async def test_docs_change_alongside_code_change_is_not_full(make_repo):
+    files = {**FILES, "README.md": "# app\n", "docs/guide.rst": "Guide\n"}
+    root = make_repo(files)
+    wt = create_worktree(root, 1, "main")
+    edit(wt.path / "src/calc.py", "return a * b", "return b * a")
+    edit(wt.path / "README.md", "# app", "# app\nmul is commutative")
+    edit(wt.path / "docs/guide.rst", "Guide", "Guide v2")
+    commit_all(wt, "x")
+    got = await affected_tests("acme/app", wt, "main")
+    assert (got.paths, got.full) == (("tests/test_mul.py",), False)
+
+
+async def test_docs_only_change_is_full(make_repo):
+    root = make_repo({**FILES, "README.md": "# app\n"})
+    wt = create_worktree(root, 1, "main")
+    edit(wt.path / "README.md", "# app", "# app v2")
+    commit_all(wt, "x")
+    got = await affected_tests("acme/app", wt, "main")
     assert (got.paths, got.full) == ((), True)
 
 
-async def test_ambiguous_function_name_is_full(make_repo):
+async def test_ambiguous_function_name_selects_tests_importing_its_module(make_repo):
     files = {
         **FILES,
         "src/other.py": "def add(a, b):\n    return a - b\n",
+        "tests/test_other.py": "from src.other import add\n\n"
+        "def test_sub():\n    assert add(3, 1) == 2\n",
+        "tests/test_pkg.py": "from src import (\n    calc,\n)\n\n"
+        "def test_pkg():\n    assert calc.add(1, 1) == 2\n",
+    }
+    root = make_repo(files)
+    wt = create_worktree(root, 1, "main")
+    edit(wt.path / "src/calc.py", "return a + b", "return b + a")
+    commit_all(wt, "x")
+    got = await affected_tests("acme/app", wt, "main")
+    assert (got.paths, got.full) == (
+        ("tests/test_add.py", "tests/test_mul.py", "tests/test_pkg.py"),
+        False,
+    )
+
+
+async def test_ambiguous_function_name_no_test_imports_its_module_is_full(make_repo):
+    files = {
+        "src/calc.py": "def add(a, b):\n    return a + b\n",
+        "src/other.py": "def add(a, b):\n    return a - b\n",
+        "tests/test_other.py": "from src.other import add\n\n"
+        "def test_sub():\n    assert add(3, 1) == 2\n",
     }
     root = make_repo(files)
     wt = create_worktree(root, 1, "main")
@@ -402,3 +452,17 @@ def test_command_root_level_dash_path_is_not_an_option():
     assert test_command(contract("pytest {files}"), got) == (
         "pytest ./-x_test.py tests/b.py"
     )
+
+
+async def test_ambiguous_helper_in_a_changed_test_file_runs_that_file(make_repo):
+    files = {
+        **FILES,
+        "tests/test_add.py": FILES["tests/test_add.py"]
+        + "\ndef mul(a, b):\n    return 0\n",
+    }
+    root = make_repo(files)
+    wt = create_worktree(root, 1, "main")
+    edit(wt.path / "tests/test_add.py", "return 0", "return 1")
+    commit_all(wt, "x")
+    got = await affected_tests("acme/app", wt, "main")
+    assert (got.paths, got.full) == (("tests/test_add.py",), False)

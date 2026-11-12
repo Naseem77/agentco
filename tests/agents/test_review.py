@@ -214,7 +214,9 @@ async def test_fast_review_sees_whole_diff_impact_lessons_and_prior(
     assert "F1" in call.prompt and "Tab dropped" in call.prompt
     assert call.edits is False
     assert "uv run ruff format --check" in call.commands
-    assert "uv run pytest" in call.commands
+    # pre-flight has just run the tests: the reviewer runs only targeted ones
+    assert "uv run pytest" not in call.commands
+    assert "- uv run pytest\n" not in call.prompt
     assert call.command_prefixes == ("uv run pytest ",)
     assert "Commands you may run" in call.prompt
     assert "- uv run ruff format --check\n" in call.prompt
