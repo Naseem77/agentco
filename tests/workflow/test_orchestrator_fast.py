@@ -2,11 +2,10 @@ import json
 
 import pytest
 from orch_helpers import REVIEW_OK, STUCK, build_rig, engineer, issue_of
-from script_runner import FULL, RED_CMD, ScriptRunner
+from script_runner import LINT, RED_CMD, ScriptRunner
 
 from agentco.agents.prompts import load_prompt
 from agentco.roles import Role
-from agentco.sandbox.runner import CommandResult
 from agentco.store.models import ArtifactKind
 from agentco.workflow.states import TaskState
 
@@ -43,6 +42,7 @@ async def test_fast_happy_path_uses_only_senior_and_one_review(make_fast):
         "pm",
         "triage",
         "engineering",
+        "preflight",
         "internal_review",
         "lead_decision",
         "pr_open",
@@ -54,7 +54,7 @@ async def test_fast_happy_path_uses_only_senior_and_one_review(make_fast):
     assert issue_of(rig).summary == "Make add commutative-safe"
     assert len(rig.github.created) == 1
     pre = rig.store.latest_artifact(rig.task_id, ArtifactKind.PREFLIGHT)
-    assert pre is None  # the final pre-flight passed, so nothing was stored
+    assert pre is not None and pre.body["ok"] is True  # checked before the review
 
 
 async def test_fast_blocker_goes_back_once_with_the_findings(make_fast):
@@ -99,24 +99,23 @@ async def test_fast_review_failure_escalates_stuck(make_fast):
     assert escalation["category"] == "stuck"
 
 
-class FullFails(ScriptRunner):
-    def run(self, command, cwd, timeout_s):
-        if command == FULL:
-            self.calls.append(command)
-            return CommandResult(command, 1, "full suite failed", 0.0, False)
-        return super().run(command, cwd, timeout_s)
-
-
-async def test_fast_final_preflight_failure_returns_to_the_engineer(make_fast):
+async def test_fast_preflight_failure_goes_back_before_the_review(make_fast):
     script = {
         Role.SENIOR: [engineer(1), engineer(2)],
-        Role.REVIEWER: [REVIEW_OK] * 2,
+        Role.REVIEWER: [REVIEW_OK],
     }
-    runner = FullFails(codes={RED_CMD: 1})
-    rig = await make_fast(script, max_rounds=2, runner=runner)
+    runner = ScriptRunner(codes={RED_CMD: 1, LINT: 1})
+    rig = await make_fast(script, max_rounds=1, runner=runner)
 
     task = await rig.run()
 
     assert task.state is TaskState.AWAITING_HUMAN
-    assert rig.github.created == []
+    assert rig.transitions()[:5] == [
+        "pm",
+        "triage",
+        "engineering",
+        "preflight",
+        "engineering",
+    ]
     assert "Pre-flight failures to make pass" in rig.calls(Role.SENIOR)[1].prompt
+    assert rig.calls(Role.REVIEWER) == []

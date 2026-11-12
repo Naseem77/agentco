@@ -3,8 +3,8 @@ from agentco.agents.review import ReviewReply
 from agentco.workflow.fast import fast_lead, issue_from_request
 
 
-def _f(id_: str, severity: str) -> Finding:
-    return Finding(id=id_, severity=severity, kind="bug", title=id_, detail="d")
+def _f(id_: str, severity: str, kind: str = "bug") -> Finding:
+    return Finding(id=id_, severity=severity, kind=kind, title=id_, detail="d")
 
 
 def test_issue_bullets_become_acceptance_criteria():
@@ -36,8 +36,17 @@ def test_blocking_sends_back_every_non_nit():
     assert [f.id for f in d.findings_to_fix] == ["F1", "F2"]
 
 
-def test_only_minor_and_nit_is_approved():
+def test_minor_bug_alone_is_sent_back():
     review = ReviewReply(findings=[_f("F1", "minor"), _f("F2", "nit")], summary="s")
+    d = fast_lead(review, None)
+    assert d.outcome == "send_back"
+    assert [f.id for f in d.findings_to_fix] == ["F1"]
+
+
+def test_minor_tradeoff_and_nit_are_approved():
+    review = ReviewReply(
+        findings=[_f("F1", "minor", "tradeoff"), _f("F2", "nit")], summary="s"
+    )
     d = fast_lead(review, None)
     assert d.outcome == "approve"
     assert [f.id for f in d.follow_ups] == ["F1", "F2"]

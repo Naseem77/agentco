@@ -778,10 +778,7 @@ class _Run:
             else:
                 await self._escalate("stuck", exc.reason, actor=role)
             return
-        if self._fast:
-            self._go(_S.INTERNAL_REVIEW, role, "engineer committed")
-        else:
-            self._go(_S.PREFLIGHT, role, "engineer committed")
+        self._go(_S.PREFLIGHT, role, "engineer committed")
 
     async def _seed_qa_tests(self, task: TaskRecord, wt: Worktree, role: Role) -> bool:
         """Commit QA's tests into the follow-up task's branch, once, before the engineer."""
@@ -946,6 +943,7 @@ class _Run:
                 impact=impact,
                 lessons=list(lessons),
                 prior=prior,
+                contract=self.ctx.contract,
             )
             body = reply.model_dump()
         except (ReplyInvalid, AgentStuck) as exc:

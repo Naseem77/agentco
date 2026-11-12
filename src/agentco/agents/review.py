@@ -2,6 +2,7 @@
 
 import asyncio
 
+from agentco.agents.engineer import contract_commands, test_file_prefixes
 from agentco.agents.models import role_model
 from agentco.agents.prompts import load_prompt
 from agentco.agents.replies import Finding, PMReply, issue_text
@@ -10,6 +11,7 @@ from agentco.llm.replies import Asker, Reply
 from agentco.llm.runtime import AgentCall
 from agentco.llm.tools import memory_tools
 from agentco.memory.gate import MemoryGate
+from agentco.repo_contract import RepoContract
 from agentco.roles import Role
 from agentco.sandbox.worktree import Worktree, diff
 
@@ -105,8 +107,12 @@ async def run_fast_review(
     impact: str,
     lessons: list[str],
     prior: list[Finding],
+    contract: RepoContract | None = None,
 ) -> ReviewReply:
-    """Fast mode: one review of the whole diff that reports every finding at once."""
+    """Fast mode: one review of the whole diff that reports every finding at once.
+
+    With a repo contract the reviewer may run the tests, lint and format check.
+    """
     diff_text = await asyncio.to_thread(diff, wt, base)
     call = AgentCall(
         role=Role.REVIEWER,
@@ -117,6 +123,8 @@ async def run_fast_review(
         ),
         workdir=wt.path,
         edits=False,
+        commands=contract_commands(contract) if contract else (),
+        command_prefixes=test_file_prefixes(contract) if contract else (),
         tools=memory_tools(gate.for_role(Role.REVIEWER)),
         max_turns=cfg.loop.agent_max_turns,
         timeout_s=cfg.loop.agent_timeout_s,

@@ -41,26 +41,31 @@ def _decision(outcome: str, category: str, reason: str, **kw) -> LeadDecision:
     )
 
 
+def _must_fix(finding: Finding) -> bool:
+    if finding.severity in BLOCKING:
+        return True
+    # a bot comments on a minor bug too, so it is fixed now rather than after the PR
+    return finding.severity == "minor" and finding.kind != "tradeoff"
+
+
 def fast_lead(review: ReviewReply | None, error: str | None) -> LeadDecision:
-    """Blocker/major findings go back in one batch; otherwise the work is approved."""
+    """Every finding a PR bot would comment on goes back in one batch; nits and
+    minor trade-offs become follow-ups."""
     if review is None:
         return _decision("escalate", "stuck", f"review failed: {error or 'no result'}")
-    blocking = [f for f in review.findings if f.severity in BLOCKING]
-    if blocking:
-        fix: tuple[Finding, ...] = tuple(
-            f for f in review.findings if f.severity != "nit"
-        )
+    fix = tuple(f for f in review.findings if _must_fix(f))
+    if fix:
         return _decision(
             "send_back",
             "fix",
-            f"{len(blocking)} blocking finding(s)",
+            f"{len(fix)} finding(s) to fix before the PR",
             fix=fix,
             summary=review.summary,
         )
     return _decision(
         "approve",
         "approved",
-        "pre-PR review found nothing blocking",
+        "pre-PR review found nothing to fix",
         follow_ups=tuple(review.findings),
         summary=review.summary,
     )

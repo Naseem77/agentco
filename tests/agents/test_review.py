@@ -17,6 +17,7 @@ from agentco.llm.fake import FakeRuntime
 from agentco.llm.replies import Asker
 from agentco.memory.backend import InMemoryBackend
 from agentco.memory.gate import MemoryGate
+from agentco.repo_contract import RepoContract, Sandbox
 from agentco.roles import Role
 from agentco.sandbox.worktree import commit_all, create_worktree, head_sha
 
@@ -193,6 +194,15 @@ async def test_fast_review_sees_whole_diff_impact_lessons_and_prior(
         impact="Impact of the diff: a.py::f callers b.py::g",
         lessons=["Close temp files on error"],
         prior=[FINDING],
+        contract=RepoContract(
+            build="uv build",
+            test="uv run pytest",
+            e2e=None,
+            lint="uv run ruff check",
+            format="uv run ruff format --check",
+            sandbox=Sandbox(devcontainer=".devcontainer"),
+            test_files="uv run pytest {files}",
+        ),
     )
 
     assert result == ReviewReply(findings=[FINDING], summary="one bug")
@@ -203,3 +213,6 @@ async def test_fast_review_sees_whole_diff_impact_lessons_and_prior(
     assert "- Close temp files on error" in call.prompt
     assert "F1" in call.prompt and "Tab dropped" in call.prompt
     assert call.edits is False
+    assert "uv run ruff format --check" in call.commands
+    assert "uv run pytest" in call.commands
+    assert call.command_prefixes == ("uv run pytest ",)

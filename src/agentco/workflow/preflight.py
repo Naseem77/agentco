@@ -333,9 +333,11 @@ class Preflight:
             prepared: list[CheckResult] = []
             if not await self._prepare(wt, prepared):
                 return prepared
+            steps = [self._command("lint", self.contract.lint, wt, stamp)]
+            if self.contract.format:
+                steps.append(self._command("format", self.contract.format, wt, stamp))
             return await _all(
-                self._command("lint", self.contract.lint, wt, stamp),
-                self._command("build", self.contract.build, wt, stamp),
+                *steps, self._command("build", self.contract.build, wt, stamp)
             )
 
         rules, commands = await _all(

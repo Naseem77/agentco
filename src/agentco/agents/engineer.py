@@ -93,12 +93,20 @@ MAX_REVIEW_RULES = 15
 _PRE_PR = (
     "## Get it right the first time\n"
     "Next, a reviewer that acts like CodeRabbit and GitHub Copilot reviews your whole "
-    "diff, and the PR opens only when it finds nothing blocking. Before you finish, "
-    "check what they flag: every acceptance criterion; empty / None / huge input; "
-    "error paths and cleanup of partial work; races and atomic writes (temp files "
-    "beside the target); closed files and processes; cross-platform paths; tests "
-    "that fail without your change; docs and config examples for changed behaviour; "
-    "every caller of a function you change."
+    "diff, and the PR opens only when it finds nothing worth a comment. Before you "
+    "finish:\n"
+    "- list every case, input and failure the issue names, and make sure each one "
+    "has code that handles it and a test that fails without your change;\n"
+    "- run the targeted tests, the lint and the format check, and fix what they "
+    "report;\n"
+    "- check what reviewers flag: empty / None / huge input; error paths and cleanup "
+    "of partial work (no stray temp files); races and atomic writes (temp files "
+    "beside the target, original file permissions kept); closed files and processes; "
+    "new exceptions handled by every caller, including the CLI; cross-platform "
+    "paths; docs and config examples for changed behaviour; every caller of a "
+    "function you change;\n"
+    "- make each test assert the behaviour it names: a glob or mock that can never "
+    "match proves nothing."
 )
 
 
@@ -151,7 +159,10 @@ def _prompt(
     if rules:
         listed = "\n".join(f"- {rule}" for rule in rules)
         sections.append(f"## Review rules the reviewer will apply\n{listed}")
-    allowed = [*_commands(contract), *(f"{p}<test files>" for p in _prefixes(contract))]
+    allowed = [
+        *contract_commands(contract),
+        *(f"{p}<test files>" for p in test_file_prefixes(contract)),
+    ]
     if allowed:
         listed = "\n".join(f"- {command}" for command in allowed)
         sections.append(
@@ -160,12 +171,18 @@ def _prompt(
     return "\n\n".join(sections)
 
 
-def _commands(contract: RepoContract) -> tuple[str, ...]:
-    commands = (contract.build, contract.test, contract.lint, contract.e2e)
+def contract_commands(contract: RepoContract) -> tuple[str, ...]:
+    commands = (
+        contract.build,
+        contract.test,
+        contract.lint,
+        contract.format,
+        contract.e2e,
+    )
     return tuple(command for command in commands if command)
 
 
-def _prefixes(contract: RepoContract) -> tuple[str, ...]:
+def test_file_prefixes(contract: RepoContract) -> tuple[str, ...]:
     return (contract.test_files.split("{files}")[0],) if contract.test_files else ()
 
 
@@ -214,8 +231,8 @@ async def run_engineer(
         prompt=_prompt(task, brief, contract, rules),
         workdir=wt.path,
         edits=True,
-        commands=_commands(contract),
-        command_prefixes=_prefixes(contract),
+        commands=contract_commands(contract),
+        command_prefixes=test_file_prefixes(contract),
         tools=memory_tools(gate.for_role(role)),
         max_turns=cfg.loop.agent_max_turns,
         timeout_s=cfg.loop.agent_timeout_s,
