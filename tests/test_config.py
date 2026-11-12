@@ -70,6 +70,7 @@ def test_loop_defaults(tmp_path):
         "agent_timeout_s": 1200,
         "fast_lane": True,
         "fast_lane_max_changed_lines": 60,
+        "pipeline": "company",
     }
 
 
@@ -92,7 +93,11 @@ def test_loop_overrides(tmp_path):
 
 def test_intake_defaults(tmp_path):
     cfg = load_config(write(tmp_path, EXAMPLE))
-    assert cfg.intake.review_bots == ["copilot-pull-request-reviewer[bot]", "Copilot"]
+    assert cfg.intake.review_bots == [
+        "copilot-pull-request-reviewer[bot]",
+        "Copilot",
+        "coderabbitai[bot]",
+    ]
     assert cfg.intake.failing_conclusions == [
         "failure",
         "timed_out",

@@ -41,7 +41,7 @@
     {
       "id": 103,
       "pull_request_url": "https://api.github.com/repos/acme-org/web/pulls/3",
-      "user": {"login": "copilot-pull-request-reviewer[bot]", "type": "Bot"},
+      "user": {"login": "lint-checker[bot]", "type": "Bot"},
       "author_association": "NONE",
       "body": "Consider extracting this into a helper.",
       "path": "src/app/graph.py",

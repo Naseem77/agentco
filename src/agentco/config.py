@@ -1,4 +1,5 @@
 from pathlib import Path
+from typing import Literal
 
 import yaml
 from pydantic import BaseModel, ConfigDict, Field, ValidationError, field_validator
@@ -49,6 +50,9 @@ class LoopLimits(BaseModel):
     agent_timeout_s: float = Field(1200, gt=0, allow_inf_nan=False)
     fast_lane: bool = True
     fast_lane_max_changed_lines: int = Field(60, gt=0)
+    # "fast": senior engineer + one pre-PR reviewer, rule-based PM/triage/lead,
+    # pre-flight only before the PR. "company": every role, every round.
+    pipeline: Literal["company", "fast"] = "company"
 
 
 class IntakeConfig(BaseModel):
@@ -57,6 +61,7 @@ class IntakeConfig(BaseModel):
     review_bots: list[str] = [
         "copilot-pull-request-reviewer[bot]",
         "Copilot",
+        "coderabbitai[bot]",
     ]
     failing_conclusions: list[str] = [
         "failure",
