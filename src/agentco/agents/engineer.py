@@ -159,16 +159,24 @@ def _prompt(
     if rules:
         listed = "\n".join(f"- {rule}" for rule in rules)
         sections.append(f"## Review rules the reviewer will apply\n{listed}")
+    if allowed := commands_section(contract):
+        sections.append(allowed)
+    return "\n\n".join(sections)
+
+
+def commands_section(contract: RepoContract) -> str:
+    """The commands an agent may run, as the permission gate matches them."""
     allowed = [
         *contract_commands(contract),
         *(f"{p}<test files>" for p in test_file_prefixes(contract)),
     ]
-    if allowed:
-        listed = "\n".join(f"- {command}" for command in allowed)
-        sections.append(
-            "Commands you may run (exactly as written, no shell operators):\n" + listed
-        )
-    return "\n\n".join(sections)
+    if not allowed:
+        return ""
+    listed = "\n".join(f"- {command}" for command in allowed)
+    return (
+        "Commands you may run (exactly as written, from the repository root; no "
+        "`cd`, no shell operators such as `&&`, `|`, `2>&1` or `;`):\n" + listed
+    )
 
 
 def contract_commands(contract: RepoContract) -> tuple[str, ...]:

@@ -216,3 +216,5 @@ async def test_fast_review_sees_whole_diff_impact_lessons_and_prior(
     assert "uv run ruff format --check" in call.commands
     assert "uv run pytest" in call.commands
     assert call.command_prefixes == ("uv run pytest ",)
+    assert "Commands you may run" in call.prompt
+    assert "- uv run ruff format --check\n" in call.prompt

@@ -2,7 +2,11 @@
 
 import asyncio
 
-from agentco.agents.engineer import contract_commands, test_file_prefixes
+from agentco.agents.engineer import (
+    commands_section,
+    contract_commands,
+    test_file_prefixes,
+)
 from agentco.agents.models import role_model
 from agentco.agents.prompts import load_prompt
 from agentco.agents.replies import Finding, PMReply, issue_text
@@ -79,6 +83,7 @@ def fast_review_input(
     impact: str,
     lessons: list[str],
     prior: list[Finding],
+    commands: str = "",
 ) -> str:
     sections = [issue_text(issue)]
     if lessons:
@@ -92,6 +97,8 @@ def fast_review_input(
         )
     if impact:
         sections.append(impact)
+    if commands:
+        sections.append(commands)
     sections.append(f"Whole diff against the base branch:\n{diff_text}")
     return "\n\n".join(sections)
 
@@ -119,7 +126,12 @@ async def run_fast_review(
         model=role_model(cfg, Role.REVIEWER).model,
         system=load_prompt(Role.REVIEWER, "fast"),
         prompt=fast_review_input(
-            issue, diff_text, impact=impact, lessons=lessons, prior=prior
+            issue,
+            diff_text,
+            impact=impact,
+            lessons=lessons,
+            prior=prior,
+            commands=commands_section(contract) if contract else "",
         ),
         workdir=wt.path,
         edits=False,
