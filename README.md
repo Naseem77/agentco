@@ -253,8 +253,8 @@ Every command takes `--config PATH` (default `agentco.config.yml`).
 ## Configuration
 
 `agentco.config.yml` rejects unknown keys. Every role is required, and the reviewer, QA and
-lead must use a different model from the engineers. The full option list is in the
-[design spec §10](docs/superpowers/specs/2026-11-04-agent-company-design.md).
+lead must use a different model from the engineers. Every option, with its type and limits,
+is defined in [`src/agentco/config.py`](src/agentco/config.py).
 
 | Key | Default | Meaning |
 |---|---|---|
@@ -578,9 +578,7 @@ AGENTCO_IT_COPILOT=1 uv run pytest tests/test_task_loop_integration.py -m integr
 uv run ruff check src tests
 ```
 
-Format check: `uv run ruff format --check src tests`. Design specs and implementation plans
-live in [`docs/superpowers`](docs/superpowers); the fast-mode design is
-[`2026-11-12-agentco-fast-mode-design.md`](docs/superpowers/specs/2026-11-12-agentco-fast-mode-design.md).
+Format check: `uv run ruff format --check src tests`.
 
 ## Status
 
