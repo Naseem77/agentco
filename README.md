@@ -13,7 +13,7 @@
 [![Tests](https://img.shields.io/badge/tests-1616%20passing-2EA44F)](#development)
 [![Status](https://img.shields.io/badge/status-beta-orange)](#status)
 
-[Why](#why-agentco) · [Results](#results) · [How it works](#how-it-works) · [Quick start](#quick-start) · [Commands](#command-reference) · [Configuration](#configuration) · [Guides](#guides)
+[Why](#why-agentco) · [Results](#results) · [How it works](#how-it-works) · [Quick start](#quick-start) · [Agent skill](#use-it-from-your-coding-agent) · [Commands](#command-reference) · [Configuration](#configuration) · [Guides](#guides)
 
 </div>
 
@@ -227,6 +227,31 @@ uv run agentco import --repo owner/name --repo-path /path/to/repo --limit 200
 
 `import` turns past issues, PRs and review comments, including CodeRabbit and Copilot
 comments, into review lessons, so the reviewer starts with what your reviewers usually ask for.
+
+## Use it from your coding agent
+
+agentco ships an agent skill in [`skills/agentco`](skills/agentco). With it, you hand work to the
+team from any Copilot CLI or Claude Code chat, in any repository:
+
+> Use agentco to fix this bug in ~/code/shop: checkout fails when the cart is empty
+
+The agent creates the task, runs it in the background, and comes back with the PR link or a
+question for you. It onboards the repo first if it has no `.agentco.yml`, and asks you before
+approving anything.
+
+**Install** (once, after the [quick start](#quick-start)):
+
+```bash
+mkdir -p ~/.agentco && cp skills/agentco/agentco.config.example.yml ~/.agentco/agentco.config.yml
+echo 'export OPENAI_API_KEY=sk-...' > ~/.agentco.env && chmod 600 ~/.agentco.env
+ln -s "$PWD/skills/agentco" ~/.copilot/skills/agentco    # GitHub Copilot CLI
+ln -s "$PWD/skills/agentco" ~/.claude/skills/agentco     # Claude Code
+```
+
+Edit `tenant` (and `falkordb_port`, if needed) in `~/.agentco/agentco.config.yml`, then run
+`bash skills/agentco/agentco.sh init` once. The skill calls agentco through
+`skills/agentco/agentco.sh`, which uses this checkout, `~/.agentco/agentco.config.yml` and
+`~/.agentco.env`; override them with `AGENTCO_HOME`, `AGENTCO_CONFIG` and `AGENTCO_ENV`.
 
 ## Command reference
 
