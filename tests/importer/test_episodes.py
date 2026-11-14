@@ -366,3 +366,37 @@ def test_hostile_reply_and_comment_have_no_column_zero_forgeries(sep):
 
 def test_module_of_is_one_line():
     assert module_of("a\u2028b/c.py") == "a b"
+
+
+_BOTS = frozenset({"coderabbitai[bot]", "Copilot"})
+
+
+def test_review_bot_root_is_kept():
+    comments = {c.id: c for c in _gh().review_comments(REPO)}
+    rabbit = replace(
+        comments[101],
+        id=300,
+        author=GhUser("coderabbitai[bot]", True),
+        association="NONE",
+    )
+    sel = review_threads([rabbit], {3: pr3()}, review_bots=_BOTS)
+    assert [t.root.id for t in sel.threads] == [300]
+    assert sel.skipped == Counter()
+
+
+def test_other_bot_root_still_skipped():
+    comments = {c.id: c for c in _gh().review_comments(REPO)}
+    dependabot = replace(comments[101], id=301, author=GhUser("dependabot[bot]", True))
+    sel = review_threads([dependabot], {3: pr3()}, review_bots=_BOTS)
+    assert sel.threads == []
+    assert sel.skipped == Counter(bot=1)
+
+
+def test_bot_reply_under_review_bot_root_dropped():
+    comments = {c.id: c for c in _gh().review_comments(REPO)}
+    rabbit = replace(comments[101], id=302, author=GhUser("coderabbitai[bot]", True))
+    reply = replace(
+        comments[102], id=303, in_reply_to=302, author=GhUser("coderabbitai[bot]", True)
+    )
+    sel = review_threads([rabbit, reply], {3: pr3()}, review_bots=_BOTS)
+    assert sel.threads[0].replies == ()

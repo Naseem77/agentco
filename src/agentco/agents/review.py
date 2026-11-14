@@ -2,6 +2,11 @@
 
 import asyncio
 
+from agentco.agents.engineer import (
+    commands_section,
+    contract_commands,
+    test_file_prefixes,
+)
 from agentco.agents.models import role_model
 from agentco.agents.prompts import load_prompt
 from agentco.agents.replies import Finding, PMReply, issue_text
@@ -10,6 +15,7 @@ from agentco.llm.replies import Asker, Reply
 from agentco.llm.runtime import AgentCall
 from agentco.llm.tools import memory_tools
 from agentco.memory.gate import MemoryGate
+from agentco.repo_contract import RepoContract
 from agentco.roles import Role
 from agentco.sandbox.worktree import Worktree, diff
 
@@ -63,6 +69,75 @@ async def run_review(
         prompt=review_input(issue, diff_text, findings_addressed),
         workdir=wt.path,  # read-only: no edits, no commands beyond read-only git
         edits=False,
+        tools=memory_tools(gate.for_role(Role.REVIEWER)),
+        max_turns=cfg.loop.agent_max_turns,
+        timeout_s=cfg.loop.agent_timeout_s,
+    )
+    return await asker.ask(call, ReviewReply)
+
+
+def fast_review_input(
+    issue: PMReply,
+    diff_text: str,
+    *,
+    impact: str,
+    lessons: list[str],
+    prior: list[Finding],
+    commands: str = "",
+) -> str:
+    sections = [issue_text(issue)]
+    if lessons:
+        listed = "\n".join(f"- {lesson}" for lesson in lessons)
+        sections.append(f"Review lessons from past PR comments:\n{listed}")
+    if prior:
+        lines = "\n".join(finding_line(f) for f in prior)
+        sections.append(
+            "Earlier findings the engineer was asked to fix. Verify each is fixed; "
+            f"report any that is not again with the same id:\n{lines}"
+        )
+    if impact:
+        sections.append(impact)
+    if commands:
+        sections.append(commands)
+    sections.append(f"Whole diff against the base branch:\n{diff_text}")
+    return "\n\n".join(sections)
+
+
+async def run_fast_review(
+    asker: Asker,
+    cfg: TenantConfig,
+    gate: MemoryGate,
+    wt: Worktree,
+    base: str,
+    issue: PMReply,
+    *,
+    impact: str,
+    lessons: list[str],
+    prior: list[Finding],
+    contract: RepoContract | None = None,
+) -> ReviewReply:
+    """Fast mode: one review of the whole diff that reports every finding at once.
+
+    With a repo contract the reviewer may run the tests, lint and format check.
+    """
+    diff_text = await asyncio.to_thread(diff, wt, base)
+    call = AgentCall(
+        role=Role.REVIEWER,
+        model=role_model(cfg, Role.REVIEWER).model,
+        system=load_prompt(Role.REVIEWER, "fast"),
+        prompt=fast_review_input(
+            issue,
+            diff_text,
+            impact=impact,
+            lessons=lessons,
+            prior=prior,
+            # pre-flight has just run the tests, so only targeted runs are allowed
+            commands=commands_section(contract, full_suite=False) if contract else "",
+        ),
+        workdir=wt.path,
+        edits=False,
+        commands=contract_commands(contract, full_suite=False) if contract else (),
+        command_prefixes=test_file_prefixes(contract) if contract else (),
         tools=memory_tools(gate.for_role(Role.REVIEWER)),
         max_turns=cfg.loop.agent_max_turns,
         timeout_s=cfg.loop.agent_timeout_s,

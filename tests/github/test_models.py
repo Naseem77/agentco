@@ -138,7 +138,7 @@ def test_review_comment_fields():
     assert parse_review_comment(comment(102)).in_reply_to == 101
     assert parse_review_comment(comment(107)).in_reply_to == 999
     assert parse_review_comment(comment(103)).author == GhUser(
-        "copilot-pull-request-reviewer[bot]", True
+        "lint-checker[bot]", True
     )
 
 

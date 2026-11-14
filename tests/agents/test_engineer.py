@@ -387,7 +387,8 @@ async def test_prompt_contains_only_scoped_findings(make_repo, store, loop_cfg):
         "Pre-flight failures to make pass:\n"
         "- tests/test_a.py::test_tab FAILED\n\n"
         "Note from the human: Prefer the small fix\n\n"
-        "Commands you may run (exactly as written, no shell operators):\n"
+        "Commands you may run (exactly as written, from the repository root; no "
+        "`cd`, no shell operators such as `&&`, `|`, `2>&1` or `;`):\n"
         "- uv build\n"
         "- uv run pytest\n"
         "- uv run ruff check"
@@ -405,7 +406,8 @@ async def test_first_round_prompt_has_no_fix_sections(make_repo, store, loop_cfg
         "Why: Users paste tab-separated data\n\n"
         "Acceptance criteria:\n"
         "- Given a tab, when parsed, then no error\n\n"
-        "Commands you may run (exactly as written, no shell operators):\n"
+        "Commands you may run (exactly as written, from the repository root; no "
+        "`cd`, no shell operators such as `&&`, `|`, `2>&1` or `;`):\n"
         "- uv build\n"
         "- uv run pytest\n"
         "- uv run ruff check"
@@ -600,7 +602,8 @@ async def test_engineer_prompt_lists_commands(make_repo, store, loop_cfg):
     await env.run(repo_contract=repo_contract)
 
     assert env.runtime.calls[0].prompt.endswith(
-        "Commands you may run (exactly as written, no shell operators):\n"
+        "Commands you may run (exactly as written, from the repository root; no "
+        "`cd`, no shell operators such as `&&`, `|`, `2>&1` or `;`):\n"
         "- uv build\n"
         "- uv run pytest\n"
         "- uv run ruff check\n"

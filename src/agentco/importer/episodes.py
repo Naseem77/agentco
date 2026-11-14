@@ -48,9 +48,15 @@ class ThreadSelection:
 
 
 def review_threads(
-    comments: Iterable[GhReviewComment], pulls: Mapping[int, GhPull]
+    comments: Iterable[GhReviewComment],
+    pulls: Mapping[int, GhPull],
+    review_bots: frozenset[str] = frozenset(),
 ) -> ThreadSelection:
-    """Human team-member review threads; counts why everything else was left out."""
+    """Team-member and review-bot threads; counts why everything else was left out.
+
+    Comments from `review_bots` (CodeRabbit, Copilot) are the review ping-pong
+    agentco wants to learn from, so their thread roots are kept.
+    """
     by_id = {c.id: c for c in comments}
     skipped: Counter[str] = Counter()
     roots: dict[int, GhReviewComment] = {}
@@ -61,6 +67,9 @@ def review_threads(
         pr = pulls.get(c.pr_number)
         if pr is None:
             reason = "unknown_pr"
+        elif c.author.login in review_bots and c.author.login != pr.author.login:
+            roots[c.id] = c
+            continue
         elif c.author.is_bot:
             reason = "bot"
         elif c.author.login == pr.author.login:

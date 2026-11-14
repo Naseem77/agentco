@@ -58,6 +58,7 @@ def make_preflight(
     replies: list[str] | None = None,
     e2e: str | None = None,
     limits: LoopLimits | None = None,
+    fmt: str | None = None,
 ) -> Rig:
     runtime = FakeRuntime({Role.REVIEWER: replies or []})
     task = store.create_task("acme/app", "t", "")
@@ -65,7 +66,7 @@ def make_preflight(
     return Rig(
         Preflight(
             repo="acme/app",
-            contract=contract(e2e),
+            contract=contract(e2e).model_copy(update={"format": fmt}),
             runner=runner,
             limits=limits or LoopLimits(),
             memory=MemoryGate("acme", backend).for_role(Role.REVIEWER),
@@ -123,6 +124,14 @@ async def test_all_checks_run_and_failures_collected(make_repo, store):
     assert sorted(runner.calls) == sorted([LINT, BUILD, BUILD, TESTS_CMD, RED_CMD])
     lint = rep.checks[3]
     assert lint.detail == "\n".join(f"line {i}" for i in range(40, 100))
+
+
+async def test_format_check_runs_when_the_contract_has_one(make_repo, store):
+    _, wt = fixed_worktree(make_repo)
+    runner = ScriptRunner(codes={RED_CMD: 1, "fmt-check": 1})
+    rep = await go(make_preflight(runner, store, fmt="fmt-check"), wt)
+    assert ("format", False) in names(rep)
+    assert [c.name for c in rep.failures()] == ["format"]
 
 
 async def test_all_green_report(make_repo, store):

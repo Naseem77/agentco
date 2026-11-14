@@ -333,9 +333,11 @@ class Preflight:
             prepared: list[CheckResult] = []
             if not await self._prepare(wt, prepared):
                 return prepared
+            steps = [self._command("lint", self.contract.lint, wt, stamp)]
+            if self.contract.format:
+                steps.append(self._command("format", self.contract.format, wt, stamp))
             return await _all(
-                self._command("lint", self.contract.lint, wt, stamp),
-                self._command("build", self.contract.build, wt, stamp),
+                *steps, self._command("build", self.contract.build, wt, stamp)
             )
 
         rules, commands = await _all(
@@ -392,6 +394,9 @@ class Preflight:
         stamp: tuple[str, str],
         lead_comments: list[str],
     ) -> CheckResult:
+        if self.limits.pipeline == "fast":
+            # the pre-PR reviewer already applied the review rules
+            return CheckResult("rules", True, "skipped: fast pipeline")
         files = await asyncio.to_thread(changed_files, wt, base)
         rules: dict[str, None] = {}
         for path in files:

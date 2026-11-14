@@ -361,7 +361,12 @@ def import_(
             gate.for_role(Role.PM),
             SymbolLocator(repo, code, checkout),
             code,
-            ImportOptions(since=since_at, limit=max_items, dry_run=dry_run),
+            ImportOptions(
+                since=since_at,
+                limit=max_items,
+                dry_run=dry_run,
+                review_bots=frozenset(cfg.intake.review_bots),
+            ),
             started_at,
         )
 

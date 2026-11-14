@@ -37,6 +37,7 @@ class ImportOptions:
     since: datetime | None = None
     limit: int | None = None
     dry_run: bool = False
+    review_bots: frozenset[str] = frozenset()
 
 
 @dataclass
@@ -232,7 +233,7 @@ async def run_import(
         plan(pr.created_at, _PR, "pr", pr.number, write_pr)
 
     pulls_by_number = {p.number: p for p in pulls}
-    selection = review_threads(comments, pulls_by_number)
+    selection = review_threads(comments, pulls_by_number, opts.review_bots)
     report.skipped.update(selection.skipped)
     for thread in selection.threads:
         if not created_ok(thread.root.created_at):
